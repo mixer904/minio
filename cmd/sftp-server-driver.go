@@ -48,16 +48,16 @@ type sftpDriver struct {
 
 type CustomTransport struct {
 	Transport http.RoundTripper
-	Header    http.Header
+	port      string
+	ip        string
 }
 
 // RoundTrip implementiert die RoundTripper-Schnittstelle.
-func (c *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (c *CustomTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// Füge die Header aus CustomTransport hinzu.
-	req.Header = c.Header
-
-	// Aufruf des ursprünglichen RoundTrippers (globalRemoteFTPClientTransport).
-	return c.Transport.RoundTrip(req)
+	r.Header.Add("X-Real-Port", c.port)
+	r.Header.Add("X-Real-IP", c.ip)
+	return c.Transport.RoundTrip(r)
 }
 
 //msgp:ignore sftpMetrics
@@ -112,20 +112,22 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 	}
 
 	// Setze den gewünschten Header-Wert in der main-Funktion.
-	header := make(http.Header)
+	var port = ""
+	var ip = ""
 	switch addr := f.connection.RemoteAddr().(type) {
 	case *net.UDPAddr:
-		header.Set("X-Real-Port", strconv.Itoa(addr.Port))
-		header.Set("X-Real-IP", addr.IP.String())
+		port = strconv.Itoa(addr.Port)
+		ip = addr.IP.String()
 	case *net.TCPAddr:
-		header.Set("X-Real-Port", strconv.Itoa(addr.Port))
-		header.Set("X-Real-IP", addr.IP.String())
+		port = strconv.Itoa(addr.Port)
+		ip = addr.IP.String()
 	}
 
 	// Erstelle ein neues CustomTransport, das den vorhandenen globalRemoteFTPClientTransport einbettet.
 	customTransport := &CustomTransport{
 		Transport: globalRemoteFTPClientTransport,
-		Header:    header,
+		ip:        ip,
+		port:      port,
 	}
 
 	if !ok && globalIAMSys.LDAPConfig.Enabled() {
