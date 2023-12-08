@@ -23,7 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +43,21 @@ import (
 type sftpDriver struct {
 	permissions *ssh.Permissions
 	endpoint    string
+	connection  *ssh.ServerConn
+}
+
+type CustomTransport struct {
+	Transport http.RoundTripper
+	Header    http.Header
+}
+
+// RoundTrip implementiert die RoundTripper-Schnittstelle.
+func (c *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Füge die Header aus CustomTransport hinzu.
+	req.Header = c.Header
+
+	// Aufruf des ursprünglichen RoundTrippers (globalRemoteFTPClientTransport).
+	return c.Transport.RoundTrip(req)
 }
 
 //msgp:ignore sftpMetrics
@@ -77,8 +95,8 @@ func (m *sftpMetrics) log(s *sftp.Request, user string) func(err error) {
 // - sftp.Filewrite
 // - sftp.Filelist
 // - sftp.Filecmd
-func NewSFTPDriver(perms *ssh.Permissions) sftp.Handlers {
-	handler := &sftpDriver{endpoint: fmt.Sprintf("127.0.0.1:%s", globalMinioPort), permissions: perms}
+func NewSFTPDriver(perms *ssh.Permissions, conn *ssh.ServerConn) sftp.Handlers {
+	handler := &sftpDriver{endpoint: fmt.Sprintf("127.0.0.1:%s", globalMinioPort), permissions: perms, connection: conn}
 	return sftp.Handlers{
 		FileGet:  handler,
 		FilePut:  handler,
@@ -92,6 +110,24 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 	if !ok && !globalIAMSys.LDAPConfig.Enabled() {
 		return nil, errNoSuchUser
 	}
+
+	// Setze den gewünschten Header-Wert in der main-Funktion.
+	header := make(http.Header)
+	switch addr := f.connection.RemoteAddr().(type) {
+	case *net.UDPAddr:
+		header.Set("X-Real-Port", strconv.Itoa(addr.Port))
+		header.Set("X-Real-IP", addr.IP.String())
+	case *net.TCPAddr:
+		header.Set("X-Real-Port", strconv.Itoa(addr.Port))
+		header.Set("X-Real-IP", addr.IP.String())
+	}
+
+	// Erstelle ein neues CustomTransport, das den vorhandenen globalRemoteFTPClientTransport einbettet.
+	customTransport := &CustomTransport{
+		Transport: globalRemoteFTPClientTransport,
+		Header:    header,
+	}
+
 	if !ok && globalIAMSys.LDAPConfig.Enabled() {
 		sa, _, err := globalIAMSys.getServiceAccount(context.Background(), f.AccessKey())
 		if err != nil && !errors.Is(err, errNoSuchServiceAccount) {
@@ -154,7 +190,7 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 		return minio.New(f.endpoint, &minio.Options{
 			Creds:     mcreds,
 			Secure:    globalIsTLS,
-			Transport: globalRemoteFTPClientTransport,
+			Transport: customTransport,
 		})
 	}
 
@@ -168,7 +204,7 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 	return minio.New(f.endpoint, &minio.Options{
 		Creds:     credentials.NewStaticV4(ui.Credentials.AccessKey, ui.Credentials.SecretKey, ""),
 		Secure:    globalIsTLS,
-		Transport: globalRemoteFTPClientTransport,
+		Transport: customTransport,
 	})
 }
 
