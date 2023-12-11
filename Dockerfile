@@ -8,5 +8,4 @@ RUN chmod +x /usr/local/bin/minio
 
 USER minio
 EXPOSE 9000
-VOLUME /data
 CMD minio
