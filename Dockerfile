@@ -5,6 +5,8 @@ RUN adduser -u 1000 minio -s /bin/sh -D minio
 
 USER minio
 COPY ./dist/minio /usr/bin/minio
-COPY ./dockerscripts/docker-entrypoint.sh /docker-entrypoint.sh
-ENTRYPOINT /docker-entrypoint.sh
+COPY ./dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+ENTRYPOINT /usr/bin/docker-entrypoint.sh
+EXPOSE 9000
+VOLUME /data
 CMD minio
