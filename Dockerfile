@@ -5,5 +5,5 @@ RUN adduser -u 1000 minio -s /bin/sh -D minio
 
 USER minio
 COPY ./dist/minio /usr/bin/minio
-
+ENTRYPOINT /usr/bin/minio
 CMD minio
