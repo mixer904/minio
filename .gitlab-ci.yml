@@ -3,7 +3,7 @@ stages:
   - build-image
 
 build-go:
-  image: golang
+  image: golang:alpine
   stage: build-go
   before_script:
     - go get
