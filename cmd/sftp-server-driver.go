@@ -111,7 +111,6 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 		return nil, errNoSuchUser
 	}
 
-	// Setze den gewünschten Header-Wert in der main-Funktion.
 	var port = ""
 	var ip = ""
 	switch addr := f.connection.RemoteAddr().(type) {
@@ -122,8 +121,6 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 		port = strconv.Itoa(addr.Port)
 		ip = addr.IP.String()
 	}
-
-	// Erstelle ein neues CustomTransport, das den vorhandenen globalRemoteFTPClientTransport einbettet.
 	customTransport := &CustomTransport{
 		Transport: globalRemoteFTPClientTransport,
 		ip:        ip,
