@@ -1,6 +1,9 @@
 FROM alpine:3.18
 VOLUME ["/data"]
 RUN apk update && apk upgrade
+RUN cat /etc/passwd
+RUN userdel 1000
+RUN groupdel 1000
 RUN addgroup -g 1000 minio\
     && adduser -u 1000 minio -s /bin/sh -D minio
 
