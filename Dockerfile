@@ -3,10 +3,9 @@ VOLUME ["/data"]
 RUN apk update && apk upgrade
 RUN adduser -u 1000 minio -s /bin/sh -D minio
 
+USER minio
 COPY ./dist/minio /usr/bin/minio
 RUN chmod +x /usr/bin/minio
-
-USER minio
 EXPOSE 9000
 EXPOSE 9001
 
