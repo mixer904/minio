@@ -1,4 +1,4 @@
-FROM alpine:latest
+FROM alpine:3.18
 VOLUME ["/data"]
 RUN apk update && apk upgrade
 RUN addgroup -g 1000 minio\
