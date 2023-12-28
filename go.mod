@@ -60,6 +60,7 @@ require (
 	github.com/minio/xxml v0.0.3
 	github.com/minio/zipindex v0.3.0
 	github.com/mitchellh/go-homedir v1.1.0
+	github.com/mixer904/minio-pkg v0.1.3
 	github.com/nats-io/nats-server/v2 v2.9.23
 	github.com/nats-io/nats.go v1.31.0
 	github.com/nats-io/stan.go v0.10.4
@@ -68,7 +69,7 @@ require (
 	github.com/philhofer/fwd v1.1.2
 	github.com/pierrec/lz4 v2.6.1+incompatible
 	github.com/pkg/errors v0.9.1
-	github.com/pkg/sftp v1.13.6
+	github.com/pkg/sftp v1.13.4
 	github.com/prometheus/client_golang v1.17.0
 	github.com/prometheus/client_model v0.5.0
 	github.com/prometheus/common v0.45.0
@@ -88,7 +89,7 @@ require (
 	go.uber.org/atomic v1.11.0
 	go.uber.org/zap v1.26.0
 	goftp.io/server/v2 v2.0.1
-	golang.org/x/crypto v0.16.0
+	golang.org/x/crypto v0.17.0
 	golang.org/x/exp v0.0.0-20231127185646-65229373498e
 	golang.org/x/oauth2 v0.15.0
 	golang.org/x/sys v0.15.0
@@ -171,7 +172,7 @@ require (
 	github.com/lestrrat-go/blackmagic v1.0.2 // indirect
 	github.com/lestrrat-go/httpcc v1.0.1 // indirect
 	github.com/lestrrat-go/iter v1.0.2 // indirect
-	github.com/lestrrat-go/jwx v1.2.26 // indirect
+	github.com/lestrrat-go/jwx v1.2.27 // indirect
 	github.com/lestrrat-go/option v1.0.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20231016141302-07b5767bb0ed // indirect
@@ -205,6 +206,7 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/pierrec/lz4/v4 v4.1.18 // indirect
+	github.com/pires/go-proxyproto v0.7.0 // indirect
 	github.com/pkg/xattr v0.4.9 // indirect
 	github.com/posener/complete v1.2.3 // indirect
 	github.com/power-devops/perfstat v0.0.0-20221212215047-62379fc7944b // indirect

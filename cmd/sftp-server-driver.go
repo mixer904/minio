@@ -23,10 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,16 +109,16 @@ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 		return nil, errNoSuchUser
 	}
 
-	var port = ""
-	var ip = ""
-	switch addr := f.connection.RemoteAddr().(type) {
+	var port = f.connection.RemoteAddr().Network()
+	var ip = f.connection.RemoteAddr().String()
+	/*switch addr := f.connection.RemoteAddr().(type) {
 	case *net.UDPAddr:
 		port = strconv.Itoa(addr.Port)
 		ip = addr.IP.String()
 	case *net.TCPAddr:
 		port = strconv.Itoa(addr.Port)
 		ip = addr.IP.String()
-	}
+	}*/
 	customTransport := &CustomTransport{
 		Transport: globalRemoteFTPClientTransport,
 		ip:        ip,

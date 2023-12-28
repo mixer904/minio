@@ -22,6 +22,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"github.com/pkg/sftp"
 	"net"
 	"os"
 	"strconv"
@@ -29,8 +30,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/logger"
-	xsftp "github.com/minio/pkg/v2/sftp"
-	"github.com/pkg/sftp"
+	xsftp "github.com/mixer904/minio-pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
