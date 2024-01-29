@@ -209,7 +209,7 @@ func logAuthError(c ssh.ConnMetadata, error error) {
 		Version:      "1",
 	}
 	entry.API.Name = "Login"
-	entry.API.StatusCode = 400
+	entry.API.StatusCode = 401
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, logger.GetContextAuditKey(), entry)
 	defer logger.AuditLog(ctx, nil, nil, nil)
