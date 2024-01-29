@@ -22,6 +22,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"github.com/minio/pkg/v2/logger/message/audit"
 	"github.com/pkg/sftp"
 	"net"
 	"os"
@@ -115,10 +116,12 @@ func startSFTPServer(args []string) {
 				if errors.Is(err, errNoSuchServiceAccount) {
 					targetUser, targetGroups, err := globalIAMSys.LDAPConfig.Bind(c.User(), string(pass))
 					if err != nil {
+						logAuthError(c, err)
 						return nil, err
 					}
 					ldapPolicies, _ := globalIAMSys.PolicyDBGet(targetUser, targetGroups...)
 					if len(ldapPolicies) == 0 {
+						logAuthError(c, errAuthentication)
 						return nil, errAuthentication
 					}
 					return &ssh.Permissions{
@@ -137,11 +140,13 @@ func startSFTPServer(args []string) {
 						Extensions: make(map[string]string),
 					}, nil
 				}
+				logAuthError(c, errAuthentication)
 				return nil, errAuthentication
 			}
 
 			ui, ok := globalIAMSys.GetUser(context.Background(), c.User())
 			if !ok {
+				logAuthError(c, errNoSuchUser)
 				return nil, errNoSuchUser
 			}
 
@@ -153,6 +158,7 @@ func startSFTPServer(args []string) {
 					Extensions: make(map[string]string),
 				}, nil
 			}
+			logAuthError(c, errAuthentication)
 			return nil, errAuthentication
 		},
 	}
@@ -182,4 +188,22 @@ func startSFTPServer(args []string) {
 	if err != nil {
 		logger.Fatal(err, "SFTP Server had an unrecoverable error while accepting connections")
 	}
+}
+
+func logAuthError(c ssh.ConnMetadata, error error) {
+	entry := &audit.Entry{
+		AccessKey:    c.User(),
+		RemoteHost:   c.RemoteAddr().String(),
+		DeploymentID: globalDeploymentID(),
+		UserAgent:    "sftp",
+		Time:         time.Now(),
+		Event:        error.Error(),
+		Trigger:      "incoming",
+		Version:      "1",
+	}
+	entry.API.Name = "Login"
+	entry.API.StatusCode = 400
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, logger.GetContextAuditKey(), entry)
+	defer logger.AuditLog(ctx, nil, nil, nil)
 }

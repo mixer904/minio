@@ -33,6 +33,10 @@ import (
 
 const contextAuditKey = contextKeyType("audit-entry")
 
+func GetContextAuditKey() contextKeyType {
+	return contextAuditKey
+}
+
 // SetAuditEntry sets Audit info in the context.
 func SetAuditEntry(ctx context.Context, audit *audit.Entry) context.Context {
 	if ctx == nil {
