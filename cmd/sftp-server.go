@@ -191,9 +191,16 @@ func startSFTPServer(args []string) {
 }
 
 func logAuthError(c ssh.ConnMetadata, error error) {
+	var ip = ""
+	switch addr := c.RemoteAddr().(type) {
+	case *net.UDPAddr:
+		ip = addr.IP.String()
+	case *net.TCPAddr:
+		ip = addr.IP.String()
+	}
 	entry := &audit.Entry{
 		AccessKey:    c.User(),
-		RemoteHost:   c.RemoteAddr().String(),
+		RemoteHost:   ip,
 		DeploymentID: globalDeploymentID(),
 		UserAgent:    "sftp",
 		Time:         time.Now(),
