@@ -72,7 +72,7 @@ type ManagerOptions struct {
 	Hosts        []string                    // All hosts, including local in the grid.
 	AddAuth      AuthFn                      // Add authentication to the given audience.
 	AuthRequest  func(r *http.Request) error // Validate incoming requests.
-	TLSConfig    *tls.Config                 // TLS to apply to the connnections.
+	TLSConfig    *tls.Config                 // TLS to apply to the connections.
 	Incoming     func(n int64)               // Record incoming bytes.
 	Outgoing     func(n int64)               // Record outgoing bytes.
 	BlockConnect chan struct{}               // If set, incoming and outgoing connections will be blocked until closed.
@@ -105,16 +105,18 @@ func NewManager(ctx context.Context, o ManagerOptions) (*Manager, error) {
 			continue
 		}
 		m.targets[host] = newConnection(connectionParams{
-			ctx:          ctx,
-			id:           m.ID,
-			local:        o.Local,
-			remote:       host,
-			dial:         o.Dialer,
-			handlers:     &m.handlers,
-			auth:         o.AddAuth,
-			blockConnect: o.BlockConnect,
-			tlsConfig:    o.TLSConfig,
-			publisher:    o.TraceTo,
+			ctx:           ctx,
+			id:            m.ID,
+			local:         o.Local,
+			remote:        host,
+			dial:          o.Dialer,
+			handlers:      &m.handlers,
+			auth:          o.AddAuth,
+			blockConnect:  o.BlockConnect,
+			tlsConfig:     o.TLSConfig,
+			publisher:     o.TraceTo,
+			incomingBytes: o.Incoming,
+			outgoingBytes: o.Outgoing,
 		})
 	}
 	if !found {
@@ -161,6 +163,27 @@ func (m *Manager) Handler() http.HandlerFunc {
 			w.WriteHeader(http.StatusUpgradeRequired)
 			return
 		}
+		// will write an OpConnectResponse message to the remote and log it once locally.
+		writeErr := func(err error) {
+			if err == nil {
+				return
+			}
+			logger.LogOnceIf(ctx, err, err.Error())
+			resp := connectResp{
+				ID:             m.ID,
+				Accepted:       false,
+				RejectedReason: err.Error(),
+			}
+			if b, err := resp.MarshalMsg(nil); err == nil {
+				msg := message{
+					Op:      OpConnectResponse,
+					Payload: b,
+				}
+				if b, err := msg.MarshalMsg(nil); err == nil {
+					wsutil.WriteMessage(conn, ws.StateServerSide, ws.OpBinary, b)
+				}
+			}
+		}
 		defer conn.Close()
 		if debugPrint {
 			fmt.Printf("grid: Upgraded request: %v\n", req.URL)
@@ -168,7 +191,8 @@ func (m *Manager) Handler() http.HandlerFunc {
 
 		msg, _, err := wsutil.ReadClientData(conn)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("grid: reading connect: %w", err))
+			writeErr(fmt.Errorf("reading connect: %w", err))
+			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 		if debugPrint {
@@ -178,41 +202,28 @@ func (m *Manager) Handler() http.HandlerFunc {
 		var message message
 		_, _, err = message.parse(msg)
 		if err != nil {
-			if debugPrint {
-				fmt.Println("parse err:", err)
-			}
-			logger.LogIf(ctx, fmt.Errorf("handleMessages: parsing connect: %w", err))
+			writeErr(fmt.Errorf("error parsing grid connect: %w", err))
 			return
 		}
 		if message.Op != OpConnect {
-			if debugPrint {
-				fmt.Println("op err:", message.Op)
-			}
-			logger.LogIf(ctx, fmt.Errorf("handler: unexpected op: %v", message.Op))
+			writeErr(fmt.Errorf("unexpected connect op: %v", message.Op))
 			return
 		}
 		var cReq connectReq
 		_, err = cReq.UnmarshalMsg(message.Payload)
 		if err != nil {
-			if debugPrint {
-				fmt.Println("handler: creq err:", err)
-			}
-			logger.LogIf(ctx, fmt.Errorf("handleMessages: parsing ConnectReq: %w", err))
+			writeErr(fmt.Errorf("error parsing connectReq: %w", err))
 			return
 		}
 		remote := m.targets[cReq.Host]
 		if remote == nil {
-			if debugPrint {
-				fmt.Printf("%s: handler: unknown host: %v. Have %v\n", m.local, cReq.Host, m.targets)
-			}
-			logger.LogIf(ctx, fmt.Errorf("handler: unknown host: %v", cReq.Host))
+			writeErr(fmt.Errorf("unknown incoming host: %v", cReq.Host))
 			return
 		}
 		if debugPrint {
 			fmt.Printf("handler: Got Connect Req %+v\n", cReq)
 		}
-
-		logger.LogIf(ctx, remote.handleIncoming(ctx, conn, cReq))
+		writeErr(remote.handleIncoming(ctx, conn, cReq))
 	}
 }
 

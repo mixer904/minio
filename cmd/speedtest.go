@@ -27,6 +27,7 @@ import (
 
 	"github.com/minio/dperf/pkg/dperf"
 	"github.com/minio/madmin-go/v3"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
 const speedTest = "speedtest"
@@ -39,13 +40,14 @@ type speedTestOpts struct {
 	autotune         bool
 	storageClass     string
 	bucketName       string
+	enableSha256     bool
 }
 
 // Get the max throughput and iops numbers.
 func objectSpeedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedTestResult {
 	ch := make(chan madmin.SpeedTestResult, 1)
 	go func() {
-		defer close(ch)
+		defer xioutil.SafeClose(ch)
 
 		concurrency := opts.concurrencyStart
 
@@ -163,6 +165,7 @@ func objectSpeedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedT
 				duration:     opts.duration,
 				storageClass: opts.storageClass,
 				bucketName:   opts.bucketName,
+				enableSha256: opts.enableSha256,
 			}
 
 			results := globalNotificationSys.SpeedTest(ctx, sopts)

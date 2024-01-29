@@ -46,6 +46,7 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/ioutil"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/trie"
 	"github.com/minio/pkg/v2/wildcard"
@@ -533,6 +534,14 @@ func (o ObjectInfo) GetActualSize() (int64, error) {
 		return size, nil
 	}
 	if _, ok := crypto.IsEncrypted(o.UserDefined); ok {
+		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
+		if ok {
+			size, err := strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return -1, errObjectTampered
+			}
+			return size, nil
+		}
 		return o.DecryptedSize()
 	}
 
@@ -632,16 +641,14 @@ func getCompressedOffsets(oi ObjectInfo, offset int64, decrypt func([]byte) ([]b
 	var skipLength int64
 	var cumulativeActualSize int64
 	var firstPartIdx int
-	if len(oi.Parts) > 0 {
-		for i, part := range oi.Parts {
-			cumulativeActualSize += part.ActualSize
-			if cumulativeActualSize <= offset {
-				compressedOffset += part.Size
-			} else {
-				firstPartIdx = i
-				skipLength = cumulativeActualSize - part.ActualSize
-				break
-			}
+	for i, part := range oi.Parts {
+		cumulativeActualSize += part.ActualSize
+		if cumulativeActualSize <= offset {
+			compressedOffset += part.Size
+		} else {
+			firstPartIdx = i
+			skipLength = cumulativeActualSize - part.ActualSize
+			break
 		}
 	}
 	partSkip = offset - skipLength
@@ -1075,7 +1082,7 @@ func newS2CompressReader(r io.Reader, on int64, encrypted bool) (rc io.ReadClose
 	comp := s2.NewWriter(pw, opts...)
 	indexCh := make(chan []byte, 1)
 	go func() {
-		defer close(indexCh)
+		defer xioutil.SafeClose(indexCh)
 		cn, err := io.Copy(comp, r)
 		if err != nil {
 			comp.Close()
@@ -1151,11 +1158,12 @@ func compressSelfTest() {
 // If a disk is nil or an error is returned the result will be nil as well.
 func getDiskInfos(ctx context.Context, disks ...StorageAPI) []*DiskInfo {
 	res := make([]*DiskInfo, len(disks))
+	opts := DiskInfoOptions{}
 	for i, disk := range disks {
 		if disk == nil {
 			continue
 		}
-		if di, err := disk.DiskInfo(ctx, false); err == nil {
+		if di, err := disk.DiskInfo(ctx, opts); err == nil {
 			res[i] = &di
 		}
 	}

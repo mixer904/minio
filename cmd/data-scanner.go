@@ -40,6 +40,7 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config/heal"
 	"github.com/minio/minio/internal/event"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/console"
 	uatomic "go.uber.org/atomic"
@@ -65,8 +66,9 @@ var (
 	globalHealConfig heal.Config
 
 	// Sleeper values are updated when config is loaded.
-	scannerSleeper = newDynamicSleeper(2, time.Second, true) // Keep defaults same as config defaults
-	scannerCycle   = uatomic.NewDuration(dataScannerStartDelay)
+	scannerSleeper  = newDynamicSleeper(2, time.Second, true) // Keep defaults same as config defaults
+	scannerCycle    = uatomic.NewDuration(dataScannerStartDelay)
+	scannerIdleMode = uatomic.NewInt32(0) // default is throttled when idle
 )
 
 // initDataScanner will start the scanner in the background.
@@ -78,7 +80,7 @@ func initDataScanner(ctx context.Context, objAPI ObjectLayer) {
 			runDataScanner(ctx, objAPI)
 			duration := time.Duration(r.Float64() * float64(scannerCycle.Load()))
 			if duration < time.Second {
-				// Make sure to sleep atleast a second to avoid high CPU ticks.
+				// Make sure to sleep at least a second to avoid high CPU ticks.
 				duration = time.Second
 			}
 			time.Sleep(duration)
@@ -121,13 +123,13 @@ func readBackgroundHealInfo(ctx context.Context, objAPI ObjectLayer) backgroundH
 	buf, err := readConfig(ctx, objAPI, backgroundHealInfoPath)
 	if err != nil {
 		if !errors.Is(err, errConfigNotFound) {
-			logger.LogIf(ctx, err)
+			logger.LogOnceIf(ctx, err, backgroundHealInfoPath)
 		}
 		return backgroundHealInfo{}
 	}
 	var info backgroundHealInfo
 	if err = json.Unmarshal(buf, &info); err != nil {
-		logger.LogIf(ctx, err)
+		logger.LogOnceIf(ctx, err, backgroundHealInfoPath)
 	}
 	return info
 }
@@ -203,7 +205,7 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 			results := make(chan DataUsageInfo, 1)
 			go storeDataUsageInBackend(ctx, objAPI, results)
 			err := objAPI.NSScanner(ctx, results, uint32(cycleInfo.current), scanMode)
-			logger.LogIf(ctx, err)
+			logger.LogOnceIf(ctx, err, "ns-scanner")
 			res := map[string]string{"cycle": strconv.FormatUint(cycleInfo.current, 10)}
 			if err != nil {
 				res["error"] = err.Error()
@@ -223,7 +225,7 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 				binary.LittleEndian.PutUint64(tmp, cycleInfo.next)
 				tmp, _ = cycleInfo.MarshalMsg(tmp)
 				err = saveConfig(ctx, objAPI, dataUsageBloomNamePath, tmp)
-				logger.LogIf(ctx, err)
+				logger.LogOnceIf(ctx, err, dataUsageBloomNamePath)
 			}
 		}
 	}
@@ -245,6 +247,8 @@ type folderScanner struct {
 	dataUsageScannerDebug bool
 	healObjectSelect      uint32 // Do a heal check on an object once every n cycles. Must divide into healFolderInclude
 	scanMode              madmin.HealScanMode
+
+	weSleep func() bool
 
 	disks       []StorageAPI
 	disksQuorum int
@@ -299,7 +303,7 @@ type folderScanner struct {
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
 // If the supplied context is canceled the function will return at the first chance.
-func scanDataFolder(ctx context.Context, disks []StorageAPI, basePath string, cache dataUsageCache, getSize getSizeFn, scanMode madmin.HealScanMode) (dataUsageCache, error) {
+func scanDataFolder(ctx context.Context, disks []StorageAPI, basePath string, cache dataUsageCache, getSize getSizeFn, scanMode madmin.HealScanMode, weSleep func() bool) (dataUsageCache, error) {
 	switch cache.Info.Name {
 	case "", dataUsageRoot:
 		return cache, errors.New("internal error: root scan attempted")
@@ -316,6 +320,7 @@ func scanDataFolder(ctx context.Context, disks []StorageAPI, basePath string, ca
 		dataUsageScannerDebug: false,
 		healObjectSelect:      0,
 		scanMode:              scanMode,
+		weSleep:               weSleep,
 		updates:               cache.Info.updates,
 		updateCurrentPath:     updatePath,
 		disks:                 disks,
@@ -372,6 +377,8 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 	done := ctx.Done()
 	scannerLogPrefix := color.Green("folder-scanner:")
 
+	noWait := func() {}
+
 	thisHash := hashPath(folder.name)
 	// Store initial compaction state.
 	wasCompacted := into.Compacted
@@ -401,8 +408,10 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		if !f.oldCache.Info.replication.Empty() && f.oldCache.Info.replication.Config.HasActiveRules(prefix, true) {
 			replicationCfg = f.oldCache.Info.replication
 		}
-		// Check if we can skip it due to bloom filter...
-		scannerSleeper.Sleep(ctx, dataScannerSleepPerFolder)
+
+		if f.weSleep() {
+			scannerSleeper.Sleep(ctx, dataScannerSleepPerFolder)
+		}
 
 		var existingFolders, newFolders []cachedFolder
 		var foundObjects bool
@@ -453,8 +462,11 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				return nil
 			}
 
-			// Dynamic time delay.
-			wait := scannerSleeper.Timer(ctx)
+			wait := noWait
+			if f.weSleep() {
+				// Dynamic time delay.
+				wait = scannerSleeper.Timer(ctx)
+			}
 
 			// Get file size, ignore errors.
 			item := scannerItem{
@@ -699,13 +711,16 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				partial: func(entries metaCacheEntries, errs []error) {
 					entry, ok := entries.resolve(&resolver)
 					if !ok {
-						// check if we can get one entry atleast
+						// check if we can get one entry at least
 						// proceed to heal nonetheless, since
 						// this object might be dangling.
 						entry, _ = entries.firstFound()
 					}
-					// wait timer per object.
-					wait := scannerSleeper.Timer(ctx)
+					wait := noWait
+					if f.weSleep() {
+						// wait timer per object.
+						wait = scannerSleeper.Timer(ctx)
+					}
 					defer wait()
 					f.updateCurrentPath(entry.name)
 					stopFn := globalScannerMetrics.log(scannerMetricHealAbandonedObject, f.root, entry.name)
@@ -729,7 +744,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 							versionID: "",
 						}, madmin.HealItemObject)
 						if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-							logger.LogIf(ctx, err)
+							logger.LogOnceIf(ctx, err, entry.name)
 						}
 						foundObjs = foundObjs || err == nil
 						return
@@ -746,7 +761,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 						}, madmin.HealItemObject)
 						stopFn(int(ver.Size))
 						if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-							logger.LogIf(ctx, err)
+							logger.LogOnceIf(ctx, err, fiv.Name)
 						}
 						if err == nil {
 							successVersions++
@@ -1133,7 +1148,7 @@ func (i *scannerItem) applyActions(ctx context.Context, o ObjectLayer, oi Object
 				err := o.CheckAbandonedParts(ctx, i.bucket, i.objectPath(), madmin.HealOpts{Remove: healDeleteDangling})
 				done()
 				if err != nil {
-					logger.LogIf(ctx, fmt.Errorf("unable to check object %s/%s for abandoned data: %w", i.bucket, i.objectPath(), err))
+					logger.LogOnceIf(ctx, fmt.Errorf("unable to check object %s/%s for abandoned data: %w", i.bucket, i.objectPath(), err), i.objectPath())
 				}
 			}
 		}
@@ -1199,7 +1214,7 @@ func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, 
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			return false
 		}
-		logger.LogIf(ctx, err)
+		logger.LogOnceIf(ctx, err, obj.Name)
 		return false
 	}
 	// Notification already sent in *expireTransitionedObject*, just return 'true' here.
@@ -1457,7 +1472,7 @@ func (d *dynamicSleeper) Sleep(ctx context.Context, base time.Duration) {
 }
 
 // Update the current settings and cycle all waiting.
-// Parameters are the same as in the contructor.
+// Parameters are the same as in the constructor.
 func (d *dynamicSleeper) Update(factor float64, maxWait time.Duration) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1465,7 +1480,7 @@ func (d *dynamicSleeper) Update(factor float64, maxWait time.Duration) error {
 		return nil
 	}
 	// Update values and cycle waiting.
-	close(d.cycle)
+	xioutil.SafeClose(d.cycle)
 	d.factor = factor
 	d.maxSleep = maxWait
 	d.cycle = make(chan struct{})

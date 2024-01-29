@@ -252,12 +252,12 @@ func collectDriveMetrics(m madmin.RealtimeMetrics) {
 	}
 
 	globalLocalDrivesMu.RLock()
-	gld := globalLocalDrives
+	localDrives := globalLocalDrives
 	globalLocalDrivesMu.RUnlock()
 
-	for _, d := range gld {
+	for _, d := range localDrives {
 		labels := map[string]string{"drive": d.Endpoint().RawPath}
-		di, err := d.DiskInfo(GlobalContext, false)
+		di, err := d.DiskInfo(GlobalContext, DiskInfoOptions{})
 		if err == nil {
 			updateResourceMetrics(driveSubsystem, usedBytes, float64(di.Used), labels, false)
 			updateResourceMetrics(driveSubsystem, totalBytes, float64(di.Total), labels, false)

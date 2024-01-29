@@ -103,7 +103,7 @@ func (er erasureObjects) checkUploadIDExists(ctx context.Context, bucket, object
 	return fi, partsMetadata, err
 }
 
-// Removes part.meta given by partName belonging to a mulitpart upload from minioMetaBucket
+// Removes part.meta given by partName belonging to a multipart upload from minioMetaBucket
 func (er erasureObjects) removePartMeta(bucket, object, uploadID, dataDir string, partNumber int) {
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
 	curpartPath := pathJoin(uploadIDPath, dataDir, fmt.Sprintf("part.%d", partNumber))
@@ -127,7 +127,7 @@ func (er erasureObjects) removePartMeta(bucket, object, uploadID, dataDir string
 	g.Wait()
 }
 
-// Removes part given by partName belonging to a mulitpart upload from minioMetaBucket
+// Removes part given by partName belonging to a multipart upload from minioMetaBucket
 func (er erasureObjects) removeObjectPart(bucket, object, uploadID, dataDir string, partNumber int) {
 	uploadIDPath := er.getUploadIDDir(bucket, object, uploadID)
 	curpartPath := pathJoin(uploadIDPath, dataDir, fmt.Sprintf("part.%d", partNumber))
@@ -656,18 +656,18 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	var buffer []byte
 	switch size := data.Size(); {
 	case size == 0:
-		buffer = make([]byte, 1) // Allocate atleast a byte to reach EOF
+		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size == -1:
 		if size := data.ActualSize(); size > 0 && size < fi.Erasure.BlockSize {
 			// Account for padding and forced compression overhead and encryption.
 			buffer = make([]byte, data.ActualSize()+256+32+32, data.ActualSize()*2+512)
 		} else {
-			buffer = er.bp.Get()
-			defer er.bp.Put(buffer)
+			buffer = globalBytePoolCap.Get()
+			defer globalBytePoolCap.Put(buffer)
 		}
 	case size >= fi.Erasure.BlockSize:
-		buffer = er.bp.Get()
-		defer er.bp.Put(buffer)
+		buffer = globalBytePoolCap.Get()
+		defer globalBytePoolCap.Put(buffer)
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully fi.Erasure.BlockSize buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -688,10 +688,10 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	if data.Size() > bigFileThreshold {
 		// Add input readahead.
 		// We use 2 buffers, so we always have a full buffer of input.
-		bufA := er.bp.Get()
-		bufB := er.bp.Get()
-		defer er.bp.Put(bufA)
-		defer er.bp.Put(bufB)
+		bufA := globalBytePoolCap.Get()
+		bufB := globalBytePoolCap.Get()
+		defer globalBytePoolCap.Put(bufA)
+		defer globalBytePoolCap.Put(bufB)
 		ra, err := readahead.NewReaderBuffer(data, [][]byte{bufA[:fi.Erasure.BlockSize], bufB[:fi.Erasure.BlockSize]})
 		if err == nil {
 			toEncode = ra

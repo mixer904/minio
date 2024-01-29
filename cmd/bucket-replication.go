@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -48,6 +47,7 @@ import (
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/zeebo/xxh3"
@@ -496,7 +496,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 		}
 		tgtClnt := globalBucketTargetSys.GetRemoteTargetClient(bucket, tgtEntry.Arn)
 		if tgtClnt == nil {
-			// Skip stale targets if any and log them to be missing atleast once.
+			// Skip stale targets if any and log them to be missing at least once.
 			logger.LogOnceIf(ctx, fmt.Errorf("failed to get target for bucket:%s arn:%s", bucket, tgtEntry.Arn), tgtEntry.Arn)
 			sendEvent(eventArgs{
 				EventName:  event.ObjectReplicationNotTracked,
@@ -684,7 +684,7 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 		} else {
 			rinfo.VersionPurgeStatus = Failed
 		}
-		logger.LogIf(ctx, fmt.Errorf("Unable to replicate delete marker to %s/%s(%s): %s", tgt.Bucket, dobj.ObjectName, versionID, rmErr))
+		logger.LogIf(ctx, fmt.Errorf("unable to replicate delete marker to %s: %s/%s(%s): %w", tgt.EndpointURL(), tgt.Bucket, dobj.ObjectName, versionID, rmErr))
 		if rmErr != nil && minio.IsNetworkOrHostDown(rmErr, true) && !globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
 			globalBucketTargetSys.markOffline(tgt.EndpointURL())
 		}
@@ -1205,7 +1205,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	}
 
 	if tgt.Bucket == "" {
-		logger.LogIf(ctx, fmt.Errorf("unable to replicate object %s(%s), bucket is empty", objInfo.Name, objInfo.VersionID))
+		logger.LogIf(ctx, fmt.Errorf("unable to replicate object %s(%s), bucket is empty for target %s", objInfo.Name, objInfo.VersionID, tgt.EndpointURL()))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
 			BucketName: bucket,
@@ -1231,7 +1231,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 
 	putOpts, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s err:%w", bucket, err))
+		logger.LogIf(ctx, fmt.Errorf("failure setting options for replication bucket:%s err:%w", bucket, err))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
 			BucketName: bucket,
@@ -1266,14 +1266,14 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 			r, objInfo, putOpts); rinfo.Err != nil {
 			if minio.ToErrorResponse(rinfo.Err).Code != "PreconditionFailed" {
 				rinfo.ReplicationStatus = replication.Failed
-				logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
+				logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s (target: %s)", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err, tgt.EndpointURL()))
 			}
 		}
 	} else {
 		if _, rinfo.Err = c.PutObject(ctx, tgt.Bucket, object, r, size, "", "", putOpts); rinfo.Err != nil {
 			if minio.ToErrorResponse(rinfo.Err).Code != "PreconditionFailed" {
 				rinfo.ReplicationStatus = replication.Failed
-				logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
+				logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s (target: %s)", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err, tgt.EndpointURL()))
 			}
 		}
 	}
@@ -1337,7 +1337,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				UserAgent:  "Internal: [Replication]",
 				Host:       globalLocalNodeName,
 			})
-			logger.LogIf(ctx, fmt.Errorf("unable to update replicate metadata for %s/%s(%s): %w", bucket, object, objInfo.VersionID, err))
+			logger.LogIf(ctx, fmt.Errorf("unable to replicate to target %s for %s/%s(%s): %w", tgt.EndpointURL(), bucket, object, objInfo.VersionID, err))
 		}
 		return
 	}
@@ -1368,7 +1368,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 	}
 
 	if tgt.Bucket == "" {
-		logger.LogIf(ctx, fmt.Errorf("unable to replicate object %s(%s), bucket is empty", objInfo.Name, objInfo.VersionID))
+		logger.LogIf(ctx, fmt.Errorf("unable to replicate object %s(%s) to %s, target bucket is missing", objInfo.Name, objInfo.VersionID, tgt.EndpointURL()))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
 			BucketName: bucket,
@@ -1398,7 +1398,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 		if rAction == replicateNone {
 			if ri.OpType == replication.ExistingObjectReplicationType &&
 				objInfo.ModTime.Unix() > oi.LastModified.Unix() && objInfo.VersionID == nullVersionID {
-				logger.LogIf(ctx, fmt.Errorf("unable to replicate %s/%s (null). Newer version exists on target", bucket, object))
+				logger.LogIf(ctx, fmt.Errorf("unable to replicate %s/%s (null). Newer version exists on target %s", bucket, object, tgt.EndpointURL()))
 				sendEvent(eventArgs{
 					EventName:  event.ObjectReplicationNotTracked,
 					BucketName: bucket,
@@ -1468,15 +1468,33 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				ReplicationRequest: true, // always set this to distinguish between `mc mirror` replication and serverside
 			},
 		}
+		if tagTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, tagTmStr)
+			if err == nil {
+				dstOpts.Internal.TaggingTimestamp = ondiskTimestamp
+			}
+		}
+		if retTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, retTmStr)
+			if err == nil {
+				dstOpts.Internal.RetentionTimestamp = ondiskTimestamp
+			}
+		}
+		if lholdTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp]; ok {
+			ondiskTimestamp, err := time.Parse(time.RFC3339, lholdTmStr)
+			if err == nil {
+				dstOpts.Internal.LegalholdTimestamp = ondiskTimestamp
+			}
+		}
 		if _, rinfo.Err = c.CopyObject(ctx, tgt.Bucket, object, tgt.Bucket, object, getCopyObjMetadata(objInfo, tgt.StorageClass), srcOpts, dstOpts); rinfo.Err != nil {
 			rinfo.ReplicationStatus = replication.Failed
-			logger.LogIf(ctx, fmt.Errorf("unable to replicate metadata for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
+			logger.LogIf(ctx, fmt.Errorf("unable to replicate metadata for object %s/%s(%s) to target %s: %w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), rinfo.Err))
 		}
 	} else {
 		var putOpts minio.PutObjectOptions
 		putOpts, err = putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("failed to get target for replication bucket:%s err:%w", bucket, err))
+			logger.LogIf(ctx, fmt.Errorf("failed to set replicate options for object %s/%s(%s) (target %s) err:%w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), err))
 			sendEvent(eventArgs{
 				EventName:  event.ObjectReplicationNotTracked,
 				BucketName: bucket,
@@ -1510,7 +1528,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				r, objInfo, putOpts); rinfo.Err != nil {
 				if minio.ToErrorResponse(rinfo.Err).Code != "PreconditionFailed" {
 					rinfo.ReplicationStatus = replication.Failed
-					logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
+					logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s) to target %s: %w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), rinfo.Err))
 				} else {
 					rinfo.ReplicationStatus = replication.Completed
 				}
@@ -1519,7 +1537,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			if _, rinfo.Err = c.PutObject(ctx, tgt.Bucket, object, r, size, "", "", putOpts); rinfo.Err != nil {
 				if minio.ToErrorResponse(rinfo.Err).Code != "PreconditionFailed" {
 					rinfo.ReplicationStatus = replication.Failed
-					logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s): %s", bucket, objInfo.Name, objInfo.VersionID, rinfo.Err))
+					logger.LogIf(ctx, fmt.Errorf("unable to replicate for object %s/%s(%s) to target %s: %w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), rinfo.Err))
 				} else {
 					rinfo.ReplicationStatus = replication.Completed
 				}
@@ -1877,7 +1895,7 @@ func (p *ReplicationPool) AddLargeWorkers() {
 	go func() {
 		<-p.ctx.Done()
 		for i := 0; i < LargeWorkerCount; i++ {
-			close(p.lrgworkers[i])
+			xioutil.SafeClose(p.lrgworkers[i])
 		}
 	}()
 }
@@ -1936,7 +1954,7 @@ func (p *ReplicationPool) ResizeWorkers(n, checkOld int) {
 	for len(p.workers) > n {
 		worker := p.workers[len(p.workers)-1]
 		p.workers = p.workers[:len(p.workers)-1]
-		close(worker)
+		xioutil.SafeClose(worker)
 	}
 }
 
@@ -1955,10 +1973,10 @@ func (p *ReplicationPool) ResizeWorkerPriority(pri string, maxWorkers int) {
 		workers = WorkerAutoDefault
 		mrfWorkers = MRFWorkerAutoDefault
 		if len(p.workers) < WorkerAutoDefault {
-			workers = int(math.Min(float64(len(p.workers)+1), WorkerAutoDefault))
+			workers = min(len(p.workers)+1, WorkerAutoDefault)
 		}
 		if p.mrfWorkerSize < MRFWorkerAutoDefault {
-			mrfWorkers = int(math.Min(float64(p.mrfWorkerSize+1), MRFWorkerAutoDefault))
+			mrfWorkers = min(p.mrfWorkerSize+1, MRFWorkerAutoDefault)
 		}
 	}
 	if maxWorkers > 0 && workers > maxWorkers {
@@ -2051,18 +2069,18 @@ func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
 		case "slow":
 			logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Unable to keep up with incoming traffic - we recommend increasing replication priority with `mc admin config set api replication_priority=auto`"), string(replicationSubsystem))
 		default:
-			maxWorkers = int(math.Min(float64(maxWorkers), WorkerMaxLimit))
+			maxWorkers = min(maxWorkers, WorkerMaxLimit)
 			if p.ActiveWorkers() < maxWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(len(p.workers)+1), float64(maxWorkers)))
+				workers := min(len(p.workers)+1, maxWorkers)
 				existing := len(p.workers)
 				p.mu.RUnlock()
 				p.ResizeWorkers(workers, existing)
 			}
-			maxMRFWorkers := int(math.Min(float64(maxWorkers), MRFWorkerMaxLimit))
+			maxMRFWorkers := min(maxWorkers, MRFWorkerMaxLimit)
 			if p.ActiveMRFWorkers() < maxMRFWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(p.mrfWorkerSize+1), float64(maxMRFWorkers)))
+				workers := min(p.mrfWorkerSize+1, maxMRFWorkers)
 				p.mu.RUnlock()
 				p.ResizeFailedWorkers(workers)
 			}
@@ -2108,10 +2126,10 @@ func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInf
 		case "slow":
 			logger.LogOnceIf(GlobalContext, fmt.Errorf("WARNING: Unable to keep up with incoming deletes - we recommend increasing replication priority with `mc admin config set api replication_priority=auto`"), string(replicationSubsystem))
 		default:
-			maxWorkers = int(math.Min(float64(maxWorkers), WorkerMaxLimit))
+			maxWorkers = min(maxWorkers, WorkerMaxLimit)
 			if p.ActiveWorkers() < maxWorkers {
 				p.mu.RLock()
-				workers := int(math.Min(float64(len(p.workers)+1), float64(maxWorkers)))
+				workers := min(len(p.workers)+1, maxWorkers)
 				existing := len(p.workers)
 				p.mu.RUnlock()
 				p.ResizeWorkers(workers, existing)
@@ -2238,7 +2256,7 @@ func proxyHeadToRepTarget(ctx context.Context, bucket, object string, rs *HTTPRa
 		if rs != nil {
 			h, err := rs.ToHeader()
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Invalid range header for %s/%s(%s) - %w", bucket, object, opts.VersionID, err))
+				logger.LogIf(ctx, fmt.Errorf("invalid range header for %s/%s(%s) - %w", bucket, object, opts.VersionID, err))
 				continue
 			}
 			gopts.Set(xhttp.Range, h)
@@ -2329,6 +2347,127 @@ func scheduleReplication(ctx context.Context, oi ObjectInfo, o ObjectLayer, dsc 
 	} else {
 		globalReplicationPool.queueReplicaTask(ri)
 	}
+}
+
+// proxyTaggingToRepTarget proxies tagging requests to remote targets for
+// active-active replicated setups
+func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *tags.Tags, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (proxy proxyResult) {
+	// this option is set when active-active replication is in place between site A -> B,
+	// and request hits site B that does not have the object yet.
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
+		return proxy
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(proxyTargets.Targets))
+	for idx, t := range proxyTargets.Targets {
+		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
+		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
+			continue
+		}
+		// if proxying explicitly disabled on remote target
+		if tgt.disableProxy {
+			continue
+		}
+		idx := idx
+		wg.Add(1)
+		go func(idx int, tgt *TargetClient) {
+			defer wg.Done()
+			var err error
+			if tags != nil {
+				popts := minio.PutObjectTaggingOptions{
+					VersionID: opts.VersionID,
+					Internal: minio.AdvancedObjectTaggingOptions{
+						ReplicationProxyRequest: "true",
+					},
+				}
+				err = tgt.PutObjectTagging(ctx, tgt.Bucket, object, tags, popts)
+			} else {
+				dopts := minio.RemoveObjectTaggingOptions{
+					VersionID: opts.VersionID,
+					Internal: minio.AdvancedObjectTaggingOptions{
+						ReplicationProxyRequest: "true",
+					},
+				}
+				err = tgt.RemoveObjectTagging(ctx, tgt.Bucket, object, dopts)
+			}
+			if err != nil {
+				errs[idx] = err
+			}
+		}(idx, tgt)
+	}
+	wg.Wait()
+
+	var (
+		terr        error
+		taggedCount int
+	)
+	for _, err := range errs {
+		if err == nil {
+			taggedCount++
+			continue
+		}
+		errCode := minio.ToErrorResponse(err).Code
+		if errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
+			terr = err
+		}
+	}
+	// don't return error if at least one target was tagged successfully
+	if taggedCount == 0 && terr != nil {
+		proxy.Err = terr
+	}
+	return proxy
+}
+
+// proxyGetTaggingToRepTarget proxies get tagging requests to remote targets for
+// active-active replicated setups
+func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (tgs *tags.Tags, proxy proxyResult) {
+	// this option is set when active-active replication is in place between site A -> B,
+	// and request hits site B that does not have the object yet.
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
+		return nil, proxy
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(proxyTargets.Targets))
+	tagSlc := make([]map[string]string, len(proxyTargets.Targets))
+	for idx, t := range proxyTargets.Targets {
+		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
+		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
+			continue
+		}
+		// if proxying explicitly disabled on remote target
+		if tgt.disableProxy {
+			continue
+		}
+		idx := idx
+		wg.Add(1)
+		go func(idx int, tgt *TargetClient) {
+			defer wg.Done()
+			var err error
+			gopts := minio.GetObjectTaggingOptions{
+				VersionID: opts.VersionID,
+				Internal: minio.AdvancedObjectTaggingOptions{
+					ReplicationProxyRequest: "true",
+				},
+			}
+			tgs, err = tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
+			if err != nil {
+				errs[idx] = err
+			} else {
+				tagSlc[idx] = tgs.ToMap()
+			}
+		}(idx, tgt)
+	}
+	wg.Wait()
+	for idx, err := range errs {
+		errCode := minio.ToErrorResponse(err).Code
+		if err != nil && errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
+			return nil, proxyResult{Err: err}
+		}
+		if err == nil {
+			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
+		}
+	}
+	return tgs, proxy
 }
 
 func scheduleReplicationDelete(ctx context.Context, dv DeletedObjectReplicationInfo, o ObjectLayer) {
@@ -2481,7 +2620,7 @@ func (s *replicationResyncer) PersistToDisk(ctx context.Context, objectAPI Objec
 				}
 				if updt {
 					if err := saveResyncStatus(ctx, bucket, brs, objectAPI); err != nil {
-						logger.LogIf(ctx, fmt.Errorf("Could not save resync metadata to drive for %s - %w", bucket, err))
+						logger.LogIf(ctx, fmt.Errorf("could not save resync metadata to drive for %s - %w", bucket, err))
 					} else {
 						lastResyncStatusSave[bucket] = brs.LastUpdate
 					}
@@ -2617,7 +2756,7 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 	}
 	workers := make([]chan ReplicateObjectInfo, resyncParallelRoutines)
 	resultCh := make(chan TargetReplicationResyncStatus, 1)
-	defer close(resultCh)
+	defer xioutil.SafeClose(resultCh)
 	go func() {
 		for r := range resultCh {
 			s.incStats(r, opts)
@@ -2729,7 +2868,7 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 		}
 	}
 	for i := 0; i < resyncParallelRoutines; i++ {
-		close(workers[i])
+		xioutil.SafeClose(workers[i])
 	}
 	wg.Wait()
 	resyncStatus = ResyncCompleted
@@ -2859,7 +2998,7 @@ func (p *ReplicationPool) startResyncRoutine(ctx context.Context, buckets []Buck
 		}
 		duration := time.Duration(r.Float64() * float64(time.Minute))
 		if duration < time.Second {
-			// Make sure to sleep atleast a second to avoid high CPU ticks.
+			// Make sure to sleep at least a second to avoid high CPU ticks.
 			duration = time.Second
 		}
 		time.Sleep(duration)
@@ -2985,7 +3124,7 @@ func getReplicationDiff(ctx context.Context, objAPI ObjectLayer, bucket string, 
 	}
 	diffCh := make(chan madmin.DiffInfo, 4000)
 	go func() {
-		defer close(diffCh)
+		defer xioutil.SafeClose(diffCh)
 		for obj := range objInfoCh {
 			if contextCanceled(ctx) {
 				// Just consume input...
@@ -3178,7 +3317,7 @@ func (p *ReplicationPool) persistMRF() {
 			mTimer.Reset(mrfSaveInterval)
 		case <-p.ctx.Done():
 			p.mrfStopCh <- struct{}{}
-			close(p.mrfSaveCh)
+			xioutil.SafeClose(p.mrfSaveCh)
 			// We try to save if possible, but we don't care beyond that.
 			saveMRFToDisk()
 			return
@@ -3245,7 +3384,11 @@ func (p *ReplicationPool) persistToDrive(ctx context.Context, v MRFReplicateEntr
 		return r
 	}
 
-	for _, localDrive := range globalLocalDrives {
+	globalLocalDrivesMu.RLock()
+	localDrives := globalLocalDrives
+	globalLocalDrivesMu.RUnlock()
+
+	for _, localDrive := range localDrives {
 		r := newReader()
 		err := localDrive.CreateFile(ctx, minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), -1, r)
 		r.Close()
@@ -3307,7 +3450,12 @@ func (p *ReplicationPool) loadMRF() (mrfRec MRFReplicateEntries, err error) {
 
 		return re, nil
 	}
-	for _, localDrive := range globalLocalDrives {
+
+	globalLocalDrivesMu.RLock()
+	localDrives := globalLocalDrives
+	globalLocalDrivesMu.RUnlock()
+
+	for _, localDrive := range localDrives {
 		rc, err := localDrive.ReadFileStream(p.ctx, minioMetaBucket, pathJoin(replicationMRFDir, globalLocalNodeNameHex+".bin"), 0, -1)
 		if err != nil {
 			continue
@@ -3404,7 +3552,7 @@ func (p *ReplicationPool) getMRF(ctx context.Context, bucket string) (ch <-chan 
 
 	mrfCh := make(chan madmin.ReplicationMRF, 100)
 	go func() {
-		defer close(mrfCh)
+		defer xioutil.SafeClose(mrfCh)
 		for vID, e := range mrfRec.Entries {
 			if bucket != "" && e.Bucket != bucket {
 				continue

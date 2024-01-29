@@ -1017,18 +1017,37 @@ func (store *IAMStoreSys) PolicyDBUpdate(ctx context.Context, name string, isGro
 	newPolicyMapping.UpdatedAt = UTCNow()
 	addedOrRemoved = policiesToUpdate.ToSlice()
 
-	if err = store.saveMappedPolicy(ctx, name, userType, isGroup, newPolicyMapping); err != nil {
-		return
-	}
-	if !isGroup {
-		if userType == stsUser {
-			cache.iamSTSPolicyMap[name] = newPolicyMapping
+	// In case of detach operation, it is possible that no policies are mapped -
+	// in this case, we delete the mapping from the store.
+	if len(newPolicies) == 0 {
+		if err = store.deleteMappedPolicy(ctx, name, userType, isGroup); err != nil && !errors.Is(err, errNoSuchPolicy) {
+			return
+		}
+		if !isGroup {
+			if userType == stsUser {
+				delete(cache.iamSTSPolicyMap, name)
+			} else {
+				delete(cache.iamUserPolicyMap, name)
+			}
 		} else {
-			cache.iamUserPolicyMap[name] = newPolicyMapping
+			delete(cache.iamGroupPolicyMap, name)
 		}
 	} else {
-		cache.iamGroupPolicyMap[name] = newPolicyMapping
+
+		if err = store.saveMappedPolicy(ctx, name, userType, isGroup, newPolicyMapping); err != nil {
+			return
+		}
+		if !isGroup {
+			if userType == stsUser {
+				cache.iamSTSPolicyMap[name] = newPolicyMapping
+			} else {
+				cache.iamUserPolicyMap[name] = newPolicyMapping
+			}
+		} else {
+			cache.iamGroupPolicyMap[name] = newPolicyMapping
+		}
 	}
+
 	cache.updatedAt = UTCNow()
 	return cache.updatedAt, addedOrRemoved, newPolicies, nil
 }
@@ -2317,6 +2336,27 @@ func (store *IAMStoreSys) ListServiceAccounts(ctx context.Context, accessKey str
 	}
 
 	return serviceAccounts, nil
+}
+
+// ListSTSAccounts - lists only STS accounts from the cache.
+func (store *IAMStoreSys) ListSTSAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
+	cache := store.rlock()
+	defer store.runlock()
+
+	var stsAccounts []auth.Credentials
+	for _, u := range cache.iamSTSAccountsMap {
+		v := u.Credentials
+		if accessKey != "" && v.ParentUser == accessKey {
+			if v.IsTemp() {
+				// Hide secret key & session key here
+				v.SecretKey = ""
+				v.SessionToken = ""
+				stsAccounts = append(stsAccounts, v)
+			}
+		}
+	}
+
+	return stsAccounts, nil
 }
 
 // AddUser - adds/updates long term user account to storage.

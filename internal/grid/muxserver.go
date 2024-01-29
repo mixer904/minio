@@ -21,10 +21,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -116,7 +118,7 @@ func newMuxStream(ctx context.Context, msg message, c *Connection, handler Strea
 		m.inbound = make(chan []byte, inboundCap)
 		handlerIn = make(chan []byte, 1)
 		go func(inbound <-chan []byte) {
-			defer close(handlerIn)
+			defer xioutil.SafeClose(handlerIn)
 			// Send unblocks when we have delivered the message to the handler.
 			for in := range inbound {
 				handlerIn <- in
@@ -138,13 +140,14 @@ func newMuxStream(ctx context.Context, msg message, c *Connection, handler Strea
 			}
 			if r := recover(); r != nil {
 				logger.LogIf(ctx, fmt.Errorf("grid handler (%v) panic: %v", msg.Handler, r))
-				err := RemoteErr(fmt.Sprintf("panic: %v", r))
+				debug.PrintStack()
+				err := RemoteErr(fmt.Sprintf("remote call panic: %v", r))
 				handlerErr = &err
 			}
 			if debugPrint {
 				fmt.Println("muxServer: Mux", m.ID, "Returned with", handlerErr)
 			}
-			close(send)
+			xioutil.SafeClose(send)
 		}()
 		// handlerErr is guarded by 'send' channel.
 		handlerErr = handler.Handle(ctx, msg.Payload, handlerIn, send)
@@ -202,7 +205,7 @@ func newMuxStream(ctx context.Context, msg message, c *Connection, handler Strea
 				case <-t.C:
 					last := time.Since(time.Unix(atomic.LoadInt64(&m.LastPing), 0))
 					if last > lastPingThreshold {
-						logger.LogIf(m.ctx, fmt.Errorf("canceling remote mux %d not seen for %v", m.ID, last))
+						logger.LogIf(m.ctx, fmt.Errorf("canceling remote connection %s not seen for %v", m.parent, last))
 						m.close()
 						return
 					}
@@ -228,7 +231,7 @@ func (m *muxServer) checkSeq(seq uint32) (ok bool) {
 
 func (m *muxServer) message(msg message) {
 	if debugPrint {
-		fmt.Printf("muxServer: recevied message %d, length %d\n", msg.Seq, len(msg.Payload))
+		fmt.Printf("muxServer: received message %d, length %d\n", msg.Seq, len(msg.Payload))
 	}
 	m.recvMu.Lock()
 	defer m.recvMu.Unlock()
@@ -244,8 +247,10 @@ func (m *muxServer) message(msg message) {
 		if len(msg.Payload) > 0 {
 			logger.LogIf(m.ctx, fmt.Errorf("muxServer: EOF message with payload"))
 		}
-		close(m.inbound)
-		m.inbound = nil
+		if m.inbound != nil {
+			xioutil.SafeClose(m.inbound)
+			m.inbound = nil
+		}
 		return
 	}
 
@@ -320,12 +325,15 @@ func (m *muxServer) close() {
 	m.cancel()
 	m.recvMu.Lock()
 	defer m.recvMu.Unlock()
+
 	if m.inbound != nil {
-		close(m.inbound)
+		xioutil.SafeClose(m.inbound)
 		m.inbound = nil
 	}
+
 	if m.outBlock != nil {
-		close(m.outBlock)
+		xioutil.SafeClose(m.outBlock)
 		m.outBlock = nil
+
 	}
 }

@@ -46,10 +46,10 @@ import (
 	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
+	consoleapi "github.com/minio/console/api"
+	"github.com/minio/console/api/operations"
 	consoleoauth2 "github.com/minio/console/pkg/auth/idp/oauth2"
 	consoleCerts "github.com/minio/console/pkg/certs"
-	"github.com/minio/console/restapi"
-	"github.com/minio/console/restapi/operations"
 	"github.com/minio/kes-go"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
@@ -69,7 +69,7 @@ import (
 // serverDebugLog will enable debug printing
 var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
 
-var shardDiskTimeDelta time.Duration
+var currentReleaseTime time.Time
 
 func init() {
 	if runtime.GOOS == "windows" {
@@ -107,16 +107,12 @@ func init() {
 	gob.Register(madmin.XFSErrorConfigs{})
 	gob.Register(map[string]interface{}{})
 
-	var err error
-	shardDiskTimeDelta, err = time.ParseDuration(env.Get("_MINIO_SHARD_DISKTIME_DELTA", "1m"))
-	if err != nil {
-		shardDiskTimeDelta = 1 * time.Minute
-	}
-
 	// All minio-go and madmin-go API operations shall be performed only once,
 	// another way to look at this is we are turning off retries.
 	minio.MaxRetry = 1
 	madmin.MaxRetry = 1
+
+	currentReleaseTime, _ = GetCurrentReleaseTime()
 }
 
 const consolePrefix = "CONSOLE_"
@@ -178,6 +174,23 @@ func minioConfigToConsoleFeatures() {
 	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
 
+	// This section sets Browser (console) stored config
+	if valueSCP := globalBrowserConfig.GetCSPolicy(); valueSCP != "" {
+		os.Setenv("CONSOLE_SECURE_CONTENT_SECURITY_POLICY", valueSCP)
+	}
+
+	if hstsSeconds := globalBrowserConfig.GetHSTSSeconds(); hstsSeconds > 0 {
+		isubdom := globalBrowserConfig.IsHSTSIncludeSubdomains()
+		isprel := globalBrowserConfig.IsHSTSPreload()
+		os.Setenv("CONSOLE_SECURE_STS_SECONDS", strconv.Itoa(hstsSeconds))
+		os.Setenv("CONSOLE_SECURE_STS_INCLUDE_SUB_DOMAINS", isubdom)
+		os.Setenv("CONSOLE_SECURE_STS_PRELOAD", isprel)
+	}
+
+	if valueRefer := globalBrowserConfig.GetReferPolicy(); valueRefer != "" {
+		os.Setenv("CONSOLE_SECURE_REFERRER_POLICY", valueRefer)
+	}
+
 	globalSubnetConfig.ApplyEnv()
 }
 
@@ -207,7 +220,7 @@ func buildOpenIDConsoleConfig() consoleoauth2.OpenIDPCfg {
 	return m
 }
 
-func initConsoleServer() (*restapi.Server, error) {
+func initConsoleServer() (*consoleapi.Server, error) {
 	// unset all console_ environment variables.
 	for _, cenv := range env.List(consolePrefix) {
 		os.Unsetenv(cenv)
@@ -225,9 +238,9 @@ func initConsoleServer() (*restapi.Server, error) {
 	}
 
 	// set certs before other console initialization
-	restapi.GlobalRootCAs, restapi.GlobalPublicCerts, restapi.GlobalTLSCertsManager = globalRootCAs, globalPublicCerts, globalTLSCerts
+	consoleapi.GlobalRootCAs, consoleapi.GlobalPublicCerts, consoleapi.GlobalTLSCertsManager = globalRootCAs, globalPublicCerts, globalTLSCerts
 
-	swaggerSpec, err := loads.Embedded(restapi.SwaggerJSON, restapi.FlatSwaggerJSON)
+	swaggerSpec, err := loads.Embedded(consoleapi.SwaggerJSON, consoleapi.FlatSwaggerJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -238,18 +251,18 @@ func initConsoleServer() (*restapi.Server, error) {
 		// Disable console logging if server debug log is not enabled
 		noLog := func(string, ...interface{}) {}
 
-		restapi.LogInfo = noLog
-		restapi.LogError = noLog
+		consoleapi.LogInfo = noLog
+		consoleapi.LogError = noLog
 		api.Logger = noLog
 	}
 
 	// Pass in console application config. This needs to happen before the
 	// ConfigureAPI() call.
-	restapi.GlobalMinIOConfig = restapi.MinIOConfig{
+	consoleapi.GlobalMinIOConfig = consoleapi.MinIOConfig{
 		OpenIDProviders: buildOpenIDConsoleConfig(),
 	}
 
-	server := restapi.NewServer(api)
+	server := consoleapi.NewServer(api)
 	// register all APIs
 	server.ConfigureAPI()
 
@@ -257,16 +270,16 @@ func initConsoleServer() (*restapi.Server, error) {
 
 	server.Host = globalMinioConsoleHost
 	server.Port = consolePort
-	restapi.Port = globalMinioConsolePort
-	restapi.Hostname = globalMinioConsoleHost
+	consoleapi.Port = globalMinioConsolePort
+	consoleapi.Hostname = globalMinioConsoleHost
 
 	if globalIsTLS {
 		// If TLS certificates are provided enforce the HTTPS.
 		server.EnabledListeners = []string{"https"}
 		server.TLSPort = consolePort
 		// Need to store tls-port, tls-host un config variables so secure.middleware can read from there
-		restapi.TLSPort = globalMinioConsolePort
-		restapi.Hostname = globalMinioConsoleHost
+		consoleapi.TLSPort = globalMinioConsolePort
+		consoleapi.Hostname = globalMinioConsoleHost
 	}
 
 	return server, nil
@@ -284,9 +297,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	// Its OK to ignore any errors during doUpdate() here.
-	crTime, err := GetCurrentReleaseTime()
-	if err != nil {
+	if currentReleaseTime.IsZero() {
 		return
 	}
 
@@ -297,8 +308,8 @@ func checkUpdate(mode string) {
 
 	var older time.Duration
 	var downloadURL string
-	if lrTime.After(crTime) {
-		older = lrTime.Sub(crTime)
+	if lrTime.After(currentReleaseTime) {
+		older = lrTime.Sub(currentReleaseTime)
 		downloadURL = getDownloadURL(releaseTimeToReleaseTag(lrTime))
 	}
 
@@ -307,7 +318,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	logger.Info(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
+	logger.Info(prepareUpdateMessage("Run `mc admin update ALIAS`", lrTime.Sub(currentReleaseTime)))
 }
 
 func newConfigDir(dir string, dirSet bool, getDefaultDir func() string) (*ConfigDir, error) {
@@ -355,10 +366,7 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	}
 
 	// Check "no-compat" flag from command line argument.
-	ctxt.StrictS3Compat = true
-	if ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat") {
-		ctxt.StrictS3Compat = false
-	}
+	ctxt.StrictS3Compat = !(ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat"))
 
 	switch {
 	case ctx.IsSet("config-dir"):
@@ -832,7 +840,7 @@ func loadRootCredentials() {
 // It depends on KMS env variables and global cli flags.
 func handleKMSConfig() {
 	if env.IsSet(kms.EnvKMSSecretKey) && env.IsSet(kms.EnvKESEndpoint) {
-		logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKMSSecretKey, kms.EnvKESEndpoint))
+		logger.Fatal(errors.New("ambiguous KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKMSSecretKey, kms.EnvKESEndpoint))
 	}
 
 	if env.IsSet(kms.EnvKMSSecretKey) {
@@ -845,10 +853,10 @@ func handleKMSConfig() {
 	if env.IsSet(kms.EnvKESEndpoint) {
 		if env.IsSet(kms.EnvKESAPIKey) {
 			if env.IsSet(kms.EnvKESClientKey) {
-				logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientKey))
+				logger.Fatal(errors.New("ambiguous KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientKey))
 			}
 			if env.IsSet(kms.EnvKESClientCert) {
-				logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientCert))
+				logger.Fatal(errors.New("ambiguous KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientCert))
 			}
 		}
 		if !env.IsSet(kms.EnvKESKeyName) {

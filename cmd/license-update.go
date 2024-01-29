@@ -47,7 +47,7 @@ func initLicenseUpdateJob(ctx context.Context, objAPI ObjectLayer) {
 			// sleep for some time and try again.
 			duration := time.Duration(r.Float64() * float64(time.Hour))
 			if duration < time.Second {
-				// Make sure to sleep atleast a second to avoid high CPU ticks.
+				// Make sure to sleep at least a second to avoid high CPU ticks.
 				duration = time.Second
 			}
 			time.Sleep(duration)
@@ -89,7 +89,7 @@ func performLicenseUpdate(ctx context.Context, objectAPI ObjectLayer) {
 		return
 	}
 
-	r := gjson.Parse(resp).Get("license")
+	r := gjson.Parse(resp).Get("license_v2")
 	if r.Index == 0 {
 		logger.LogIf(ctx, fmt.Errorf("license not found in response from %s", url))
 		return
