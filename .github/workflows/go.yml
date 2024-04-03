@@ -25,7 +25,7 @@ jobs:
       run: go get -v ./...
 
     - name: Build
-      run: go build -o dist -v ./... && ls -al dist
+      run: mkdir dist && go build -o dist -v ./... && ls -al dist
 
     - name: deploy
       uses: wangyoucao577/go-release-action@v1
