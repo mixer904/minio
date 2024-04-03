@@ -3,6 +3,10 @@
 
 name: Go
 
+permissions:
+    contents: write
+    packages: write
+
 on:
   push:
     branches: [ "master" ]
@@ -16,16 +20,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.20'
+    #- name: Set up Go
+    #  uses: actions/setup-go@v4
+    #  with:
+    #    go-version: '1.20'
 
-    - name: Get Deps
-      run: go get -v ./...
+    #- name: Get Deps
+    #  run: go get -v ./...
 
-    - name: Build
-      run: mkdir dist && go build -o dist -v ./... && ls -al dist
+    #- name: Build
+    #  run: mkdir dist && go build -o dist -v ./... && ls -al dist
 
     - name: deploy
       uses: wangyoucao577/go-release-action@v1
