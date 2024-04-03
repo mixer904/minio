@@ -8,10 +8,8 @@ permissions:
     packages: write
 
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+  release: [created]
+    
 
 jobs:
 
