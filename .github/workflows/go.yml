@@ -33,6 +33,7 @@ jobs:
     - name: deploy
       uses: wangyoucao577/go-release-action@v1
       with:
+        asset_name: minio
         github_token: ${{ secrets.GITHUB_TOKEN }}
         pre_command: go get
         goos: linux
