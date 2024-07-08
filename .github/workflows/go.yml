@@ -1,9 +1,10 @@
-name: Functional Tests
+name: Go
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    branches:
-      - master
+    branches: [main]
 
 # This ensures that previous jobs for the PR are canceled when the PR is
 # updated.
@@ -16,26 +17,20 @@ permissions:
 
 jobs:
   build:
-    name: Go ${{ matrix.go-version }} on ${{ matrix.os }} - healing
-    runs-on: ${{ matrix.os }}
+    name: Build Go ${{ matrix.go-version }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         go-version: [1.22.x]
-        os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
-          check-latest: true
-      - name: Build on ${{ matrix.os }}
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          CGO_ENABLED: 0
-          GO111MODULE: on
-          MINIO_KMS_SECRET_KEY: "my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw="
-          MINIO_KMS_AUTO_ENCRYPTION: on
-        run: |
-          sudo sysctl net.ipv6.conf.all.disable_ipv6=0
-          sudo sysctl net.ipv6.conf.default.disable_ipv6=0
-          make verify
+        id: go
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Test
+        run: make test
