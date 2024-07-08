@@ -55,6 +55,7 @@ require (
 	github.com/minio/madmin-go/v3 v3.0.58
 	github.com/minio/minio-go/v7 v7.0.73
 	github.com/minio/mux v1.9.0
+	github.com/minio/pkg/v2 v2.0.19
 	github.com/minio/pkg/v3 v3.0.3
 	github.com/minio/selfupdate v0.6.0
 	github.com/minio/simdjson-go v0.4.5
@@ -207,7 +208,6 @@ require (
 	github.com/minio/filepath v1.0.0 // indirect
 	github.com/minio/mc v0.0.0-20240702213905-74032bc16a3f // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/pkg/v2 v2.0.19 // indirect
 	github.com/minio/websocket v1.6.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
