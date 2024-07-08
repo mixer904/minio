@@ -30,10 +30,7 @@ func registerDistErasureRouters(router *mux.Router, endpointServerPools Endpoint
 	registerStorageRESTHandlers(router, endpointServerPools, globalGrid.Load())
 
 	// Register peer REST router only if its a distributed setup.
-	registerPeerRESTHandlers(router)
-
-	// Register peer S3 router only if its a distributed setup.
-	registerPeerS3Handlers(router)
+	registerPeerRESTHandlers(router, globalGrid.Load())
 
 	// Register bootstrap REST router for distributed setups.
 	registerBootstrapRESTHandlers(globalGrid.Load())

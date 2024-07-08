@@ -30,7 +30,6 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,9 +42,23 @@ import (
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/zeebo/xxh3"
 )
+
+func gridLogIf(ctx context.Context, err error, errKind ...interface{}) {
+	logger.LogIf(ctx, "grid", err, errKind...)
+}
+
+func gridLogIfNot(ctx context.Context, err error, ignored ...error) {
+	logger.LogIfNot(ctx, "grid", err, ignored...)
+}
+
+func gridLogOnceIf(ctx context.Context, err error, id string, errKind ...interface{}) {
+	logger.LogOnceIf(ctx, "grid", err, id, errKind...)
+}
 
 // A Connection is a remote connection.
 // There is no distinction externally whether the connection was initiated from
@@ -76,10 +89,10 @@ type Connection struct {
 	ctx context.Context
 
 	// Active mux connections.
-	outgoing *lockedClientMap
+	outgoing *xsync.MapOf[uint64, *muxClient]
 
 	// Incoming streams
-	inStream *lockedServerMap
+	inStream *xsync.MapOf[uint64, *muxServer]
 
 	// outQueue is the output queue
 	outQueue chan []byte
@@ -109,12 +122,17 @@ type Connection struct {
 	outgoingBytes func(n int64) // Record outgoing bytes.
 	trace         *tracer       // tracer for this connection.
 	baseFlags     Flags
+	outBytes      atomic.Int64
+	inBytes       atomic.Int64
+	inMessages    atomic.Int64
+	outMessages   atomic.Int64
 
 	// For testing only
-	debugInConn  net.Conn
-	debugOutConn net.Conn
-	addDeadline  time.Duration
-	connMu       sync.Mutex
+	debugInConn   net.Conn
+	debugOutConn  net.Conn
+	blockMessages atomic.Pointer[<-chan struct{}]
+	addDeadline   time.Duration
+	connMu        sync.Mutex
 }
 
 // Subroute is a connection subroute that can be used to route to a specific handler with the same handler ID.
@@ -175,11 +193,12 @@ func (c ContextDialer) DialContext(ctx context.Context, network, address string)
 }
 
 const (
-	defaultOutQueue    = 10000
-	readBufferSize     = 16 << 10
-	writeBufferSize    = 16 << 10
+	defaultOutQueue    = 65535    // kind of close to max open fds per user
+	readBufferSize     = 32 << 10 // 32 KiB is the most optimal on Linux
+	writeBufferSize    = 32 << 10 // 32 KiB is the most optimal on Linux
 	defaultDialTimeout = 2 * time.Second
 	connPingInterval   = 10 * time.Second
+	connWriteTimeout   = 3 * time.Second
 )
 
 type connectionParams struct {
@@ -205,8 +224,8 @@ func newConnection(o connectionParams) *Connection {
 		Local:              o.local,
 		id:                 o.id,
 		ctx:                o.ctx,
-		outgoing:           &lockedClientMap{m: make(map[uint64]*muxClient, 1000)},
-		inStream:           &lockedServerMap{m: make(map[uint64]*muxServer, 1000)},
+		outgoing:           xsync.NewMapOfPresized[uint64, *muxClient](1000),
+		inStream:           xsync.NewMapOfPresized[uint64, *muxServer](1000),
 		outQueue:           make(chan []byte, defaultOutQueue),
 		dialer:             o.dial,
 		side:               ws.StateServerSide,
@@ -218,12 +237,24 @@ func newConnection(o connectionParams) *Connection {
 		clientPingInterval: clientPingInterval,
 		connPingInterval:   connPingInterval,
 		tlsConfig:          o.tlsConfig,
-		incomingBytes:      o.incomingBytes,
-		outgoingBytes:      o.outgoingBytes,
 	}
 	if debugPrint {
 		// Random Mux ID
 		c.NextID = rand.Uint64()
+	}
+
+	// Record per connection stats.
+	c.outgoingBytes = func(n int64) {
+		if o.outgoingBytes != nil {
+			o.outgoingBytes(n)
+		}
+		c.outBytes.Add(n)
+	}
+	c.incomingBytes = func(n int64) {
+		if o.incomingBytes != nil {
+			o.incomingBytes(n)
+		}
+		c.inBytes.Add(n)
 	}
 	if !strings.HasPrefix(o.remote, "https://") && !strings.HasPrefix(o.remote, "wss://") {
 		c.baseFlags |= FlagCRCxxh3
@@ -287,6 +318,7 @@ func (c *Connection) newMuxClient(ctx context.Context) (*muxClient, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		client.deadline = getDeadline(time.Until(dl))
 		if client.deadline == 0 {
+			client.cancelFn(context.DeadlineExceeded)
 			return nil, context.DeadlineExceeded
 		}
 	}
@@ -333,6 +365,7 @@ func (c *Connection) Request(ctx context.Context, h HandlerID, req []byte) ([]by
 			_, ok := c.outgoing.Load(client.MuxID)
 			fmt.Println(client.MuxID, c.String(), "Connection.Request: DELETING MUX. Exists:", ok)
 		}
+		client.cancelFn(context.Canceled)
 		c.outgoing.Delete(client.MuxID)
 	}()
 	return client.traceRoundtrip(ctx, c.trace, h, req)
@@ -358,6 +391,7 @@ func (c *Subroute) Request(ctx context.Context, h HandlerID, req []byte) ([]byte
 		if debugReqs {
 			fmt.Println(client.MuxID, c.String(), "Subroute.Request: DELETING MUX")
 		}
+		client.cancelFn(context.Canceled)
 		c.outgoing.Delete(client.MuxID)
 	}()
 	return client.traceRoundtrip(ctx, c.trace, h, req)
@@ -528,10 +562,11 @@ func (c *Connection) shouldConnect() bool {
 	return h0 < h1
 }
 
-func (c *Connection) send(msg []byte) error {
+func (c *Connection) send(ctx context.Context, msg []byte) error {
 	select {
-	case <-c.ctx.Done():
-		return context.Cause(c.ctx)
+	case <-ctx.Done():
+		// Returning error here is too noisy.
+		return nil
 	case c.outQueue <- msg:
 		return nil
 	}
@@ -545,10 +580,9 @@ func (c *Connection) queueMsg(msg message, payload sender) error {
 	// This cannot encode subroute.
 	msg.Flags.Clear(FlagSubroute)
 	if payload != nil {
-		if cap(msg.Payload) < payload.Msgsize() {
-			old := msg.Payload
-			msg.Payload = GetByteBuffer()[:0]
-			PutByteBuffer(old)
+		if sz := payload.Msgsize(); cap(msg.Payload) < sz {
+			PutByteBuffer(msg.Payload)
+			msg.Payload = GetByteBufferCap(sz)
 		}
 		var err error
 		msg.Payload, err = payload.MarshalMsg(msg.Payload[:0])
@@ -558,7 +592,7 @@ func (c *Connection) queueMsg(msg message, payload sender) error {
 		}
 	}
 	defer PutByteBuffer(msg.Payload)
-	dst := GetByteBuffer()[:0]
+	dst := GetByteBufferCap(msg.Msgsize())
 	dst, err := msg.MarshalMsg(dst)
 	if err != nil {
 		return err
@@ -567,15 +601,15 @@ func (c *Connection) queueMsg(msg message, payload sender) error {
 		h := xxh3.Hash(dst)
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(h))
 	}
-	return c.send(dst)
+	return c.send(c.ctx, dst)
 }
 
 // sendMsg will send
 func (c *Connection) sendMsg(conn net.Conn, msg message, payload msgp.MarshalSizer) error {
 	if payload != nil {
-		if cap(msg.Payload) < payload.Msgsize() {
+		if sz := payload.Msgsize(); cap(msg.Payload) < sz {
 			PutByteBuffer(msg.Payload)
-			msg.Payload = GetByteBuffer()[:0]
+			msg.Payload = GetByteBufferCap(sz)[:0]
 		}
 		var err error
 		msg.Payload, err = payload.MarshalMsg(msg.Payload)
@@ -584,7 +618,7 @@ func (c *Connection) sendMsg(conn net.Conn, msg message, payload msgp.MarshalSiz
 		}
 		defer PutByteBuffer(msg.Payload)
 	}
-	dst := GetByteBuffer()[:0]
+	dst := GetByteBufferCap(msg.Msgsize())
 	dst, err := msg.MarshalMsg(dst)
 	if err != nil {
 		return err
@@ -598,6 +632,10 @@ func (c *Connection) sendMsg(conn net.Conn, msg message, payload msgp.MarshalSiz
 	}
 	if c.outgoingBytes != nil {
 		c.outgoingBytes(int64(len(dst)))
+	}
+	err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+	if err != nil {
+		return err
 	}
 	return wsutil.WriteMessage(conn, c.side, ws.OpBinary, dst)
 }
@@ -647,7 +685,7 @@ func (c *Connection) connect() {
 				fmt.Printf("%v Connecting to %v: %v. Retrying.\n", c.Local, toDial, err)
 			}
 			sleep := defaultDialTimeout + time.Duration(rng.Int63n(int64(defaultDialTimeout)))
-			next := dialStarted.Add(sleep)
+			next := dialStarted.Add(sleep / 2)
 			sleep = time.Until(next).Round(time.Millisecond)
 			if sleep < 0 {
 				sleep = 0
@@ -657,10 +695,8 @@ func (c *Connection) connect() {
 				return
 			}
 			if gotState != StateConnecting {
-				// Don't print error on first attempt,
-				// and after that only once per hour.
-				cHour := strconv.FormatInt(time.Now().Unix()/60/60, 10)
-				logger.LogOnceIf(c.ctx, fmt.Errorf("grid: %s connecting to %s: %w (%T) Sleeping %v (%v)", c.Local, toDial, err, err, sleep, gotState), c.Local+toDial+cHour+err.Error())
+				// Don't print error on first attempt, and after that only once per hour.
+				gridLogOnceIf(c.ctx, fmt.Errorf("grid: %s re-connecting to %s: %w (%T) Sleeping %v (%v)", c.Local, toDial, err, err, sleep, gotState), toDial)
 			}
 			c.updateState(StateConnectionError)
 			time.Sleep(sleep)
@@ -818,6 +854,37 @@ func (c *Connection) handleIncoming(ctx context.Context, conn net.Conn, req conn
 // caller *must* hold reconnectMu.
 func (c *Connection) reconnected() {
 	c.updateState(StateConnectionError)
+
+	// Drain the outQueue, so any blocked messages can be sent.
+	// We keep the queue, but start draining it, if it gets full.
+	stopDraining := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer func() {
+		close(stopDraining)
+		wg.Wait()
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopDraining:
+				return
+			default:
+				if cap(c.outQueue)-len(c.outQueue) > 100 {
+					// Queue is not full, wait a bit.
+					time.Sleep(1 * time.Millisecond)
+					continue
+				}
+				select {
+				case v := <-c.outQueue:
+					PutByteBuffer(v)
+				case <-stopDraining:
+					return
+				}
+			}
+		}
+	}()
 	// Close all active requests.
 	if debugReqs {
 		fmt.Println(c.String(), "Reconnected. Clearing outgoing.")
@@ -891,7 +958,7 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				logger.LogIf(ctx, fmt.Errorf("handleMessages: panic recovered: %v", rec))
+				gridLogIf(ctx, fmt.Errorf("handleMessages: panic recovered: %v", rec))
 				debug.PrintStack()
 			}
 			c.connChange.L.Lock()
@@ -944,7 +1011,7 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				cancel(ErrDisconnected)
 				return
 			}
-			if cap(msg) > readBufferSize*8 {
+			if cap(msg) > readBufferSize*4 {
 				// Don't keep too much memory around.
 				msg = nil
 			}
@@ -953,9 +1020,16 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			msg, err = readDataInto(msg, conn, c.side, ws.OpBinary)
 			if err != nil {
 				cancel(ErrDisconnected)
-				logger.LogIfNot(ctx, fmt.Errorf("ws read: %w", err), net.ErrClosed, io.EOF)
+				if !xnet.IsNetworkOrHostDown(err, true) {
+					gridLogIfNot(ctx, fmt.Errorf("ws read: %w", err), net.ErrClosed, io.EOF)
+				}
 				return
 			}
+			block := c.blockMessages.Load()
+			if block != nil && *block != nil {
+				<-*block
+			}
+
 			if c.incomingBytes != nil {
 				c.incomingBytes(int64(len(msg)))
 			}
@@ -964,7 +1038,9 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			var m message
 			subID, remain, err := m.parse(msg)
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("ws parse package: %w", err))
+				if !xnet.IsNetworkOrHostDown(err, true) {
+					gridLogIf(ctx, fmt.Errorf("ws parse package: %w", err))
+				}
 				cancel(ErrDisconnected)
 				return
 			}
@@ -972,11 +1048,13 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				fmt.Printf("%s Got msg: %v\n", c.Local, m)
 			}
 			if m.Op != OpMerged {
+				c.inMessages.Add(1)
 				c.handleMsg(ctx, m, subID)
 				continue
 			}
 			// Handle merged messages.
 			messages := int(m.Seq)
+			c.inMessages.Add(int64(messages))
 			for i := 0; i < messages; i++ {
 				if atomic.LoadUint32((*uint32)(&c.state)) != StateConnected {
 					cancel(ErrDisconnected)
@@ -985,7 +1063,9 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				var next []byte
 				next, remain, err = msgp.ReadBytesZC(remain)
 				if err != nil {
-					logger.LogIf(ctx, fmt.Errorf("ws read merged: %w", err))
+					if !xnet.IsNetworkOrHostDown(err, true) {
+						gridLogIf(ctx, fmt.Errorf("ws read merged: %w", err))
+					}
 					cancel(ErrDisconnected)
 					return
 				}
@@ -993,7 +1073,9 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 				m.Payload = nil
 				subID, _, err = m.parse(next)
 				if err != nil {
-					logger.LogIf(ctx, fmt.Errorf("ws parse merged: %w", err))
+					if !xnet.IsNetworkOrHostDown(err, true) {
+						gridLogIf(ctx, fmt.Errorf("ws parse merged: %w", err))
+					}
 					cancel(ErrDisconnected)
 					return
 				}
@@ -1005,7 +1087,7 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 	// Write function.
 	defer func() {
 		if rec := recover(); rec != nil {
-			logger.LogIf(ctx, fmt.Errorf("handleMessages: panic recovered: %v", rec))
+			gridLogIf(ctx, fmt.Errorf("handleMessages: panic recovered: %v", rec))
 			debug.PrintStack()
 		}
 		if debugPrint {
@@ -1049,18 +1131,18 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			}
 			lastPong := atomic.LoadInt64(&c.LastPong)
 			if lastPong > 0 {
-				lastPongTime := time.Unix(lastPong, 0)
+				lastPongTime := time.Unix(0, lastPong)
 				if d := time.Since(lastPongTime); d > connPingInterval*2 {
-					logger.LogIf(ctx, fmt.Errorf("host %s last pong too old (%v); disconnecting", c.Remote, d.Round(time.Millisecond)))
+					gridLogIf(ctx, fmt.Errorf("host %s last pong too old (%v); disconnecting", c.Remote, d.Round(time.Millisecond)))
 					return
 				}
 			}
 			var err error
 			toSend, err = pingFrame.MarshalMsg(GetByteBuffer()[:0])
 			if err != nil {
-				logger.LogIf(ctx, err)
+				gridLogIf(ctx, err)
 				// Fake it...
-				atomic.StoreInt64(&c.LastPong, time.Now().Unix())
+				atomic.StoreInt64(&c.LastPong, time.Now().UnixNano())
 				continue
 			}
 		case toSend = <-c.outQueue:
@@ -1073,6 +1155,11 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			queueSize += len(toSend)
 			continue
 		}
+		c.outMessages.Add(int64(len(queue) + 1))
+		if c.outgoingBytes != nil {
+			c.outgoingBytes(int64(len(toSend) + queueSize))
+		}
+
 		c.connChange.L.Lock()
 		for {
 			state := c.State()
@@ -1100,13 +1187,24 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 			buf.Reset()
 			err := wsw.writeMessage(&buf, c.side, ws.OpBinary, toSend)
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("ws writeMessage: %w", err))
+				if !xnet.IsNetworkOrHostDown(err, true) {
+					gridLogIf(ctx, fmt.Errorf("ws writeMessage: %w", err))
+				}
 				return
 			}
 			PutByteBuffer(toSend)
+
+			err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+			if err != nil {
+				gridLogIf(ctx, fmt.Errorf("conn.SetWriteDeadline: %w", err))
+				return
+			}
+
 			_, err = buf.WriteTo(conn)
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("ws write: %w", err))
+				if !xnet.IsNetworkOrHostDown(err, true) {
+					gridLogIf(ctx, fmt.Errorf("ws write: %w", err))
+				}
 				return
 			}
 			continue
@@ -1123,7 +1221,7 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 		var err error
 		toSend, err = m.MarshalMsg(toSend)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("msg.MarshalMsg: %w", err))
+			gridLogIf(ctx, fmt.Errorf("msg.MarshalMsg: %w", err))
 			return
 		}
 		// Append as byte slices.
@@ -1139,13 +1237,24 @@ func (c *Connection) handleMessages(ctx context.Context, conn net.Conn) {
 		buf.Reset()
 		err = wsw.writeMessage(&buf, c.side, ws.OpBinary, toSend)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("ws writeMessage: %w", err))
+			if !xnet.IsNetworkOrHostDown(err, true) {
+				gridLogIf(ctx, fmt.Errorf("ws writeMessage: %w", err))
+			}
 			return
 		}
+
+		err = conn.SetWriteDeadline(time.Now().Add(connWriteTimeout))
+		if err != nil {
+			gridLogIf(ctx, fmt.Errorf("conn.SetWriteDeadline: %w", err))
+			return
+		}
+
 		// buf is our local buffer, so we can reuse it.
 		_, err = buf.WriteTo(conn)
 		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("ws write: %w", err))
+			if !xnet.IsNetworkOrHostDown(err, true) {
+				gridLogIf(ctx, fmt.Errorf("ws write: %w", err))
+			}
 			return
 		}
 
@@ -1185,7 +1294,7 @@ func (c *Connection) handleMsg(ctx context.Context, m message, subID *subHandler
 	case OpMuxConnectError:
 		c.handleConnectMuxError(ctx, m)
 	default:
-		logger.LogIf(ctx, fmt.Errorf("unknown message type: %v", m.Op))
+		gridLogIf(ctx, fmt.Errorf("unknown message type: %v", m.Op))
 	}
 }
 
@@ -1194,7 +1303,7 @@ func (c *Connection) handleConnectMux(ctx context.Context, m message, subID *sub
 	if m.Flags&FlagStateless != 0 {
 		// Reject for now, so we can safely add it later.
 		if true {
-			logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Stateless streams not supported"}))
+			gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Stateless streams not supported"}))
 			return
 		}
 
@@ -1205,7 +1314,7 @@ func (c *Connection) handleConnectMux(ctx context.Context, m message, subID *sub
 			handler = c.handlers.subStateless[*subID]
 		}
 		if handler == nil {
-			logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
+			gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
 			return
 		}
 		_, _ = c.inStream.LoadOrCompute(m.MuxID, func() *muxServer {
@@ -1216,7 +1325,7 @@ func (c *Connection) handleConnectMux(ctx context.Context, m message, subID *sub
 		var handler *StreamHandler
 		if subID == nil {
 			if !m.Handler.valid() {
-				logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler"}))
+				gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler"}))
 				return
 			}
 			handler = c.handlers.streams[m.Handler]
@@ -1224,7 +1333,7 @@ func (c *Connection) handleConnectMux(ctx context.Context, m message, subID *sub
 			handler = c.handlers.subStreams[*subID]
 		}
 		if handler == nil {
-			logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
+			gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
 			return
 		}
 
@@ -1240,7 +1349,7 @@ func (c *Connection) handleConnectMuxError(ctx context.Context, m message) {
 	if v, ok := c.outgoing.Load(m.MuxID); ok {
 		var cErr muxConnectError
 		_, err := cErr.UnmarshalMsg(m.Payload)
-		logger.LogIf(ctx, err)
+		gridLogIf(ctx, err)
 		v.error(RemoteErr(cErr.Error))
 		return
 	}
@@ -1252,7 +1361,7 @@ func (c *Connection) handleAckMux(ctx context.Context, m message) {
 	v, ok := c.outgoing.Load(m.MuxID)
 	if !ok {
 		if m.Flags&FlagEOF == 0 {
-			logger.LogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
+			gridLogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
 		}
 		return
 	}
@@ -1264,7 +1373,7 @@ func (c *Connection) handleAckMux(ctx context.Context, m message) {
 
 func (c *Connection) handleRequest(ctx context.Context, m message, subID *subHandlerID) {
 	if !m.Handler.valid() {
-		logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler"}))
+		gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler"}))
 		return
 	}
 	if debugReqs {
@@ -1278,7 +1387,7 @@ func (c *Connection) handleRequest(ctx context.Context, m message, subID *subHan
 		handler = c.handlers.subSingle[*subID]
 	}
 	if handler == nil {
-		logger.LogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
+		gridLogIf(ctx, c.queueMsg(m, muxConnectError{Error: "Invalid Handler for type"}))
 		return
 	}
 
@@ -1296,7 +1405,7 @@ func (c *Connection) handleRequest(ctx context.Context, m message, subID *subHan
 				if rec := recover(); rec != nil {
 					err = NewRemoteErrString(fmt.Sprintf("handleMessages: panic recovered: %v", rec))
 					debug.PrintStack()
-					logger.LogIf(ctx, err)
+					gridLogIf(ctx, err)
 				}
 			}()
 			b, err = handler(m.Payload)
@@ -1329,17 +1438,21 @@ func (c *Connection) handleRequest(ctx context.Context, m message, subID *subHan
 			m.Payload = b
 			m.setZeroPayloadFlag()
 		}
-		logger.LogIf(ctx, c.queueMsg(m, nil))
+		gridLogIf(ctx, c.queueMsg(m, nil))
 	}(m)
 }
 
 func (c *Connection) handlePong(ctx context.Context, m message) {
+	if m.MuxID == 0 && m.Payload == nil {
+		atomic.StoreInt64(&c.LastPong, time.Now().UnixNano())
+		return
+	}
 	var pong pongMsg
 	_, err := pong.UnmarshalMsg(m.Payload)
 	PutByteBuffer(m.Payload)
-	logger.LogIf(ctx, err)
+	gridLogIf(ctx, err)
 	if m.MuxID == 0 {
-		atomic.StoreInt64(&c.LastPong, time.Now().Unix())
+		atomic.StoreInt64(&c.LastPong, time.Now().UnixNano())
 		return
 	}
 	if v, ok := c.outgoing.Load(m.MuxID); ok {
@@ -1347,22 +1460,24 @@ func (c *Connection) handlePong(ctx context.Context, m message) {
 	} else {
 		// We don't care if the client was removed in the meantime,
 		// but we send a disconnect message to the server just in case.
-		logger.LogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
+		gridLogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
 	}
 }
 
 func (c *Connection) handlePing(ctx context.Context, m message) {
 	if m.MuxID == 0 {
-		logger.LogIf(ctx, c.queueMsg(m, &pongMsg{}))
+		m.Flags.Clear(FlagPayloadIsZero)
+		m.Op = OpPong
+		gridLogIf(ctx, c.queueMsg(m, nil))
 		return
 	}
 	// Single calls do not support pinging.
 	if v, ok := c.inStream.Load(m.MuxID); ok {
 		pong := v.ping(m.Seq)
-		logger.LogIf(ctx, c.queueMsg(m, &pong))
+		gridLogIf(ctx, c.queueMsg(m, &pong))
 	} else {
 		pong := pongMsg{NotFound: true}
-		logger.LogIf(ctx, c.queueMsg(m, &pong))
+		gridLogIf(ctx, c.queueMsg(m, &pong))
 	}
 	return
 }
@@ -1372,7 +1487,7 @@ func (c *Connection) handleDisconnectClientMux(m message) {
 		if m.Flags&FlagPayloadIsErr != 0 {
 			v.error(RemoteErr(m.Payload))
 		} else {
-			v.error("remote disconnected")
+			v.error(ErrDisconnected)
 		}
 		return
 	}
@@ -1425,7 +1540,7 @@ func (c *Connection) handleMuxClientMsg(ctx context.Context, m message) {
 		if debugPrint {
 			fmt.Println(c.Local, "OpMuxClientMsg: Unknown Mux:", m.MuxID)
 		}
-		logger.LogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
+		gridLogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
 		PutByteBuffer(m.Payload)
 		return
 	}
@@ -1469,7 +1584,7 @@ func (c *Connection) handleMuxServerMsg(ctx context.Context, m message) {
 	v, ok := c.outgoing.Load(m.MuxID)
 	if !ok {
 		if m.Flags&FlagEOF == 0 {
-			logger.LogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
+			gridLogIf(ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: m.MuxID}, nil))
 		}
 		PutByteBuffer(m.Payload)
 		return
@@ -1487,7 +1602,16 @@ func (c *Connection) handleMuxServerMsg(ctx context.Context, m message) {
 		})
 	}
 	if m.Flags&FlagEOF != 0 {
-		v.close()
+		if v.cancelFn != nil && m.Flags&FlagPayloadIsErr == 0 {
+			// We must obtain the lock before calling cancelFn
+			// Otherwise others may pick up the error before close is called.
+			v.respMu.Lock()
+			v.cancelFn(errStreamEOF)
+			v.closeLocked()
+			v.respMu.Unlock()
+		} else {
+			v.close()
+		}
 		if debugReqs {
 			fmt.Println(m.MuxID, c.String(), "handleMuxServerMsg: DELETING MUX")
 		}
@@ -1502,7 +1626,7 @@ func (c *Connection) deleteMux(incoming bool, muxID uint64) {
 		}
 		v, loaded := c.inStream.LoadAndDelete(muxID)
 		if loaded && v != nil {
-			logger.LogIf(c.ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: muxID}, nil))
+			gridLogIf(c.ctx, c.queueMsg(message{Op: OpDisconnectClientMux, MuxID: muxID}, nil))
 			v.close()
 		}
 	} else {
@@ -1515,7 +1639,7 @@ func (c *Connection) deleteMux(incoming bool, muxID uint64) {
 				fmt.Println(muxID, c.String(), "deleteMux: DELETING MUX")
 			}
 			v.close()
-			logger.LogIf(c.ctx, c.queueMsg(message{Op: OpDisconnectServerMux, MuxID: muxID}, nil))
+			gridLogIf(c.ctx, c.queueMsg(message{Op: OpDisconnectServerMux, MuxID: muxID}, nil))
 		}
 	}
 }
@@ -1526,11 +1650,28 @@ func (c *Connection) State() State {
 }
 
 // Stats returns the current connection stats.
-func (c *Connection) Stats() ConnectionStats {
-	return ConnectionStats{
-		IncomingStreams: c.inStream.Size(),
-		OutgoingStreams: c.outgoing.Size(),
+func (c *Connection) Stats() madmin.RPCMetrics {
+	conn := 0
+	if c.State() == StateConnected {
+		conn++
 	}
+	m := madmin.RPCMetrics{
+		CollectedAt:      time.Now(),
+		Connected:        conn,
+		Disconnected:     1 - conn,
+		IncomingStreams:  c.inStream.Size(),
+		OutgoingStreams:  c.outgoing.Size(),
+		IncomingBytes:    c.inBytes.Load(),
+		OutgoingBytes:    c.outBytes.Load(),
+		IncomingMessages: c.inMessages.Load(),
+		OutgoingMessages: c.outMessages.Load(),
+		OutQueue:         len(c.outQueue),
+		LastPongTime:     time.Unix(0, c.LastPong).UTC(),
+	}
+	m.ByDestination = map[string]madmin.RPCMetrics{
+		c.Remote: m,
+	}
+	return m
 }
 
 func (c *Connection) debugMsg(d debugMsg, args ...any) {
@@ -1567,10 +1708,32 @@ func (c *Connection) debugMsg(d debugMsg, args ...any) {
 		c.connMu.Lock()
 		defer c.connMu.Unlock()
 		c.connPingInterval = args[0].(time.Duration)
+		if c.connPingInterval < time.Second {
+			panic("CONN ping interval too low")
+		}
 	case debugSetClientPingDuration:
+		c.connMu.Lock()
+		defer c.connMu.Unlock()
 		c.clientPingInterval = args[0].(time.Duration)
 	case debugAddToDeadline:
 		c.addDeadline = args[0].(time.Duration)
+	case debugIsOutgoingClosed:
+		// params: muxID uint64, isClosed func(bool)
+		muxID := args[0].(uint64)
+		resp := args[1].(func(b bool))
+		mid, ok := c.outgoing.Load(muxID)
+		if !ok || mid == nil {
+			resp(true)
+			return
+		}
+		mid.respMu.Lock()
+		resp(mid.closed)
+		mid.respMu.Unlock()
+	case debugBlockInboundMessages:
+		c.connMu.Lock()
+		block := (<-chan struct{})(args[0].(chan struct{}))
+		c.blockMessages.Store(&block)
+		c.connMu.Unlock()
 	}
 }
 

@@ -24,11 +24,11 @@ import (
 
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	jwtreq "github.com/golang-jwt/jwt/v4/request"
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/minio/minio/internal/auth"
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -46,38 +46,15 @@ var (
 	errAccessKeyDisabled  = errors.New("The access key you provided is disabled")
 	errAuthentication     = errors.New("Authentication failed, check your access credentials")
 	errNoAuthToken        = errors.New("JWT token missing")
-	errSkewedAuthTime     = errors.New("Skewed authenticationdate/time")
+	errSkewedAuthTime     = errors.New("Skewed authentication date/time")
 	errMalformedAuth      = errors.New("Malformed authentication input")
 )
 
-// cachedAuthenticateNode will cache authenticateNode results for given values up to ttl.
-func cachedAuthenticateNode(ttl time.Duration) func(accessKey, secretKey, audience string) (string, error) {
-	type key struct {
-		accessKey, secretKey, audience string
-	}
-	type value struct {
-		created time.Time
-		res     string
-		err     error
-	}
-	cache, err := lru.NewARC(100)
-	if err != nil {
-		logger.LogIf(GlobalContext, err)
-		return authenticateNode
-	}
-	return func(accessKey, secretKey, audience string) (string, error) {
-		k := key{accessKey: accessKey, secretKey: secretKey, audience: audience}
-		v, ok := cache.Get(k)
-		if ok {
-			if val, ok := v.(*value); ok && time.Since(val.created) < ttl {
-				return val.res, val.err
-			}
-		}
-		s, err := authenticateNode(accessKey, secretKey, audience)
-		cache.Add(k, &value{created: time.Now(), res: s, err: err})
-		return s, err
-	}
+type cacheKey struct {
+	accessKey, secretKey, audience string
 }
+
+var cacheLRU = expirable.NewLRU[cacheKey, string](1000, nil, 15*time.Second)
 
 func authenticateNode(accessKey, secretKey, audience string) (string, error) {
 	claims := xjwt.NewStandardClaims()
@@ -113,6 +90,10 @@ func metricsRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, []string, b
 				return nil, errInvalidAccessKeyID
 			}
 			cred := u.Credentials
+			// Expired credentials return error.
+			if cred.IsTemp() && cred.IsExpired() {
+				return nil, errInvalidAccessKeyID
+			}
 			return []byte(cred.SecretKey), nil
 		} // this means claims.AccessKey == rootAccessKey
 		if !globalAPIConfig.permitRootAccess() {
@@ -163,7 +144,20 @@ func metricsRequestAuthenticate(req *http.Request) (*xjwt.MapClaims, []string, b
 // newCachedAuthToken returns a token that is cached up to 15 seconds.
 // If globalActiveCred is updated it is reflected at once.
 func newCachedAuthToken() func(audience string) string {
-	fn := cachedAuthenticateNode(15 * time.Second)
+	fn := func(accessKey, secretKey, audience string) (s string, err error) {
+		k := cacheKey{accessKey: accessKey, secretKey: secretKey, audience: audience}
+
+		var ok bool
+		s, ok = cacheLRU.Get(k)
+		if !ok {
+			s, err = authenticateNode(accessKey, secretKey, audience)
+			if err != nil {
+				return "", err
+			}
+			cacheLRU.Add(k, s)
+		}
+		return s, nil
+	}
 	return func(audience string) string {
 		cred := globalActiveCred
 		token, err := fn(cred.AccessKey, cred.SecretKey, audience)

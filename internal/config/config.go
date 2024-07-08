@@ -24,11 +24,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // ErrorConfig holds the config error types
@@ -120,6 +121,7 @@ const (
 	DriveSubSys          = madmin.DriveSubSys
 	BatchSubSys          = madmin.BatchSubSys
 	BrowserSubSys        = madmin.BrowserSubSys
+	ILMSubSys            = madmin.ILMSubsys
 
 	// Add new constants here (similar to above) if you add new fields to config.
 )
@@ -159,7 +161,7 @@ var NotifySubSystems = set.CreateStringSet(
 	NotifyWebhookSubSys,
 )
 
-// LambdaSubSystems - all lambda sub-systesm
+// LambdaSubSystems - all lambda sub-systems
 var LambdaSubSystems = set.CreateStringSet(
 	LambdaWebhookSubSys,
 )
@@ -188,6 +190,7 @@ var SubSystemsDynamic = set.CreateStringSet(
 	AuditKafkaSubSys,
 	StorageClassSubSys,
 	CacheSubSys,
+	ILMSubSys,
 	BatchSubSys,
 	BrowserSubSys,
 )
@@ -211,6 +214,7 @@ var SubSystemsSingleTargets = set.CreateStringSet(
 	SubnetSubSys,
 	CallhomeSubSys,
 	DriveSubSys,
+	ILMSubSys,
 	BatchSubSys,
 	BrowserSubSys,
 )
@@ -541,10 +545,36 @@ var (
 	}
 )
 
+var siteLK sync.RWMutex
+
 // Site - holds site info - name and region.
 type Site struct {
-	Name   string
-	Region string
+	name   string
+	region string
+}
+
+// Update safe update the new site name and region
+func (s *Site) Update(n Site) {
+	siteLK.Lock()
+	s.name = n.name
+	s.region = n.region
+	siteLK.Unlock()
+}
+
+// Name returns currently configured site name
+func (s *Site) Name() string {
+	siteLK.RLock()
+	defer siteLK.RUnlock()
+
+	return s.name
+}
+
+// Region returns currently configured site region
+func (s *Site) Region() string {
+	siteLK.RLock()
+	defer siteLK.RUnlock()
+
+	return s.region
 }
 
 var validRegionRegex = regexp.MustCompile("^[a-zA-Z][a-zA-Z0-9-_-]+$")
@@ -587,7 +617,7 @@ func LookupSite(siteKV KVS, regionKV KVS) (s Site, err error) {
 				region)
 			return
 		}
-		s.Region = region
+		s.region = region
 	}
 
 	name := env.Get(EnvSiteName, siteKV.Get(NameKey))
@@ -598,7 +628,7 @@ func LookupSite(siteKV KVS, regionKV KVS) (s Site, err error) {
 				name)
 			return
 		}
-		s.Name = name
+		s.name = name
 	}
 	return
 }

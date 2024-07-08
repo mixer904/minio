@@ -47,20 +47,46 @@ import (
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 var errDiskStale = errors.New("drive stale")
 
 // To abstract a disk over network.
 type storageRESTServer struct {
-	poolIndex, setIndex, diskIndex int
+	endpoint Endpoint
+}
+
+var (
+	storageCheckPartsRPC       = grid.NewSingleHandler[*CheckPartsHandlerParams, *CheckPartsResp](grid.HandlerCheckParts2, func() *CheckPartsHandlerParams { return &CheckPartsHandlerParams{} }, func() *CheckPartsResp { return &CheckPartsResp{} })
+	storageDeleteFileRPC       = grid.NewSingleHandler[*DeleteFileHandlerParams, grid.NoPayload](grid.HandlerDeleteFile, func() *DeleteFileHandlerParams { return &DeleteFileHandlerParams{} }, grid.NewNoPayload).AllowCallRequestPool(true)
+	storageDeleteVersionRPC    = grid.NewSingleHandler[*DeleteVersionHandlerParams, grid.NoPayload](grid.HandlerDeleteVersion, func() *DeleteVersionHandlerParams { return &DeleteVersionHandlerParams{} }, grid.NewNoPayload)
+	storageDiskInfoRPC         = grid.NewSingleHandler[*DiskInfoOptions, *DiskInfo](grid.HandlerDiskInfo, func() *DiskInfoOptions { return &DiskInfoOptions{} }, func() *DiskInfo { return &DiskInfo{} }).WithSharedResponse().AllowCallRequestPool(true)
+	storageNSScannerRPC        = grid.NewStream[*nsScannerOptions, grid.NoPayload, *nsScannerResp](grid.HandlerNSScanner, func() *nsScannerOptions { return &nsScannerOptions{} }, nil, func() *nsScannerResp { return &nsScannerResp{} })
+	storageReadAllRPC          = grid.NewSingleHandler[*ReadAllHandlerParams, *grid.Bytes](grid.HandlerReadAll, func() *ReadAllHandlerParams { return &ReadAllHandlerParams{} }, grid.NewBytes).AllowCallRequestPool(true)
+	storageWriteAllRPC         = grid.NewSingleHandler[*WriteAllHandlerParams, grid.NoPayload](grid.HandlerWriteAll, func() *WriteAllHandlerParams { return &WriteAllHandlerParams{} }, grid.NewNoPayload)
+	storageReadVersionRPC      = grid.NewSingleHandler[*grid.MSS, *FileInfo](grid.HandlerReadVersion, grid.NewMSS, func() *FileInfo { return &FileInfo{} })
+	storageReadXLRPC           = grid.NewSingleHandler[*grid.MSS, *RawFileInfo](grid.HandlerReadXL, grid.NewMSS, func() *RawFileInfo { return &RawFileInfo{} })
+	storageRenameDataRPC       = grid.NewSingleHandler[*RenameDataHandlerParams, *RenameDataResp](grid.HandlerRenameData2, func() *RenameDataHandlerParams { return &RenameDataHandlerParams{} }, func() *RenameDataResp { return &RenameDataResp{} })
+	storageRenameDataInlineRPC = grid.NewSingleHandler[*RenameDataInlineHandlerParams, *RenameDataResp](grid.HandlerRenameDataInline, newRenameDataInlineHandlerParams, func() *RenameDataResp { return &RenameDataResp{} }).AllowCallRequestPool(false)
+	storageRenameFileRPC       = grid.NewSingleHandler[*RenameFileHandlerParams, grid.NoPayload](grid.HandlerRenameFile, func() *RenameFileHandlerParams { return &RenameFileHandlerParams{} }, grid.NewNoPayload).AllowCallRequestPool(true)
+	storageStatVolRPC          = grid.NewSingleHandler[*grid.MSS, *VolInfo](grid.HandlerStatVol, grid.NewMSS, func() *VolInfo { return &VolInfo{} })
+	storageUpdateMetadataRPC   = grid.NewSingleHandler[*MetadataHandlerParams, grid.NoPayload](grid.HandlerUpdateMetadata, func() *MetadataHandlerParams { return &MetadataHandlerParams{} }, grid.NewNoPayload)
+	storageWriteMetadataRPC    = grid.NewSingleHandler[*MetadataHandlerParams, grid.NoPayload](grid.HandlerWriteMetadata, func() *MetadataHandlerParams { return &MetadataHandlerParams{} }, grid.NewNoPayload)
+	storageListDirRPC          = grid.NewStream[*grid.MSS, grid.NoPayload, *ListDirResult](grid.HandlerListDir, grid.NewMSS, nil, func() *ListDirResult { return &ListDirResult{} }).WithOutCapacity(1)
+)
+
+func getStorageViaEndpoint(endpoint Endpoint) StorageAPI {
+	globalLocalDrivesMu.RLock()
+	defer globalLocalDrivesMu.RUnlock()
+	if len(globalLocalSetDrives) == 0 {
+		return globalLocalDrivesMap[endpoint.String()]
+	}
+	return globalLocalSetDrives[endpoint.PoolIdx][endpoint.SetIdx][endpoint.DiskIdx]
 }
 
 func (s *storageRESTServer) getStorage() StorageAPI {
-	globalLocalDrivesMu.RLock()
-	defer globalLocalDrivesMu.RUnlock()
-	return globalLocalSetDrives[s.poolIndex][s.setIndex][s.diskIndex]
+	return getStorageViaEndpoint(s.endpoint)
 }
 
 func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
@@ -198,11 +224,6 @@ func (s *storageRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request
 	s.IsValid(w, r)
 }
 
-// DiskInfo types.
-// DiskInfo.Metrics elements are shared, so we cannot reuse.
-var storageDiskInfoHandler = grid.NewSingleHandler[*DiskInfoOptions, *DiskInfo](grid.HandlerDiskInfo, func() *DiskInfoOptions { return &DiskInfoOptions{} },
-	func() *DiskInfo { return &DiskInfo{} }).WithSharedResponse()
-
 // DiskInfoHandler - returns disk info.
 func (s *storageRESTServer) DiskInfoHandler(opts *DiskInfoOptions) (*DiskInfo, *grid.RemoteErr) {
 	if !s.checkID(opts.DiskID) {
@@ -214,12 +235,6 @@ func (s *storageRESTServer) DiskInfoHandler(opts *DiskInfoOptions) (*DiskInfo, *
 	}
 	return &info, nil
 }
-
-// scanner rpc handler.
-var storageNSScannerHandler = grid.NewStream[*nsScannerOptions, grid.NoPayload, *nsScannerResp](grid.HandlerNSScanner,
-	func() *nsScannerOptions { return &nsScannerOptions{} },
-	nil,
-	func() *nsScannerResp { return &nsScannerResp{} })
 
 func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScannerOptions, out chan<- *nsScannerResp) *grid.RemoteErr {
 	if !s.checkID(params.DiskID) {
@@ -236,7 +251,7 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 	go func() {
 		defer wg.Done()
 		for update := range updates {
-			resp := storageNSScannerHandler.NewResponse()
+			resp := storageNSScannerRPC.NewResponse()
 			resp.Update = &update
 			out <- resp
 		}
@@ -247,7 +262,7 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 		return grid.NewRemoteErr(err)
 	}
 	// Send final response.
-	resp := storageNSScannerHandler.NewResponse()
+	resp := storageNSScannerRPC.NewResponse()
 	resp.Final = &ui
 	out <- resp
 	return nil
@@ -276,22 +291,6 @@ func (s *storageRESTServer) MakeVolBulkHandler(w http.ResponseWriter, r *http.Re
 		s.writeErrorResponse(w, err)
 	}
 }
-
-// ListVolsHandler - list volumes.
-func (s *storageRESTServer) ListVolsHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		return
-	}
-	infos, err := s.getStorage().ListVols(r.Context())
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	logger.LogIf(r.Context(), msgp.Encode(w, VolsInfo(infos)))
-}
-
-// statvol types.
-var storageStatVolHandler = grid.NewSingleHandler[*grid.MSS, *VolInfo](grid.HandlerStatVol, grid.NewMSS, func() *VolInfo { return &VolInfo{} })
 
 // StatVolHandler - stat a volume.
 func (s *storageRESTServer) StatVolHandler(params *grid.MSS) (*VolInfo, *grid.RemoteErr) {
@@ -330,8 +329,10 @@ func (s *storageRESTServer) CreateFileHandler(w http.ResponseWriter, r *http.Req
 	if !s.IsValid(w, r) {
 		return
 	}
+
 	volume := r.Form.Get(storageRESTVolume)
 	filePath := r.Form.Get(storageRESTFilePath)
+	origvolume := r.Form.Get(storageRESTOrigVolume)
 
 	fileSizeStr := r.Form.Get(storageRESTLength)
 	fileSize, err := strconv.Atoi(fileSizeStr)
@@ -341,12 +342,8 @@ func (s *storageRESTServer) CreateFileHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	done, body := keepHTTPReqResponseAlive(w, r)
-	done(s.getStorage().CreateFile(r.Context(), volume, filePath, int64(fileSize), body))
+	done(s.getStorage().CreateFile(r.Context(), origvolume, volume, filePath, int64(fileSize), body))
 }
-
-var storageDeleteVersionHandler = grid.NewSingleHandler[*DeleteVersionHandlerParams, grid.NoPayload](grid.HandlerDeleteVersion, func() *DeleteVersionHandlerParams {
-	return &DeleteVersionHandlerParams{}
-}, grid.NewNoPayload)
 
 // DeleteVersionHandler delete updated metadata.
 func (s *storageRESTServer) DeleteVersionHandler(p *DeleteVersionHandlerParams) (np grid.NoPayload, gerr *grid.RemoteErr) {
@@ -362,15 +359,12 @@ func (s *storageRESTServer) DeleteVersionHandler(p *DeleteVersionHandlerParams) 
 	return np, grid.NewRemoteErr(err)
 }
 
-var storageReadVersionHandler = grid.NewSingleHandler[*grid.MSS, *FileInfo](grid.HandlerReadVersion, grid.NewMSS, func() *FileInfo {
-	return &FileInfo{}
-})
-
 // ReadVersionHandlerWS read metadata of versionID
 func (s *storageRESTServer) ReadVersionHandlerWS(params *grid.MSS) (*FileInfo, *grid.RemoteErr) {
 	if !s.checkID(params.Get(storageRESTDiskID)) {
 		return nil, grid.NewRemoteErr(errDiskNotFound)
 	}
+	origvolume := params.Get(storageRESTOrigVolume)
 	volume := params.Get(storageRESTVolume)
 	filePath := params.Get(storageRESTFilePath)
 	versionID := params.Get(storageRESTVersionID)
@@ -384,7 +378,16 @@ func (s *storageRESTServer) ReadVersionHandlerWS(params *grid.MSS) (*FileInfo, *
 		return nil, grid.NewRemoteErr(err)
 	}
 
-	fi, err := s.getStorage().ReadVersion(context.Background(), volume, filePath, versionID, ReadOptions{ReadData: readData, Healing: healing})
+	inclFreeVersions, err := strconv.ParseBool(params.Get(storageRESTInclFreeVersions))
+	if err != nil {
+		return nil, grid.NewRemoteErr(err)
+	}
+
+	fi, err := s.getStorage().ReadVersion(context.Background(), origvolume, volume, filePath, versionID, ReadOptions{
+		InclFreeVersions: inclFreeVersions,
+		ReadData:         readData,
+		Healing:          healing,
+	})
 	if err != nil {
 		return nil, grid.NewRemoteErr(err)
 	}
@@ -396,6 +399,7 @@ func (s *storageRESTServer) ReadVersionHandler(w http.ResponseWriter, r *http.Re
 	if !s.IsValid(w, r) {
 		return
 	}
+	origvolume := r.Form.Get(storageRESTOrigVolume)
 	volume := r.Form.Get(storageRESTVolume)
 	filePath := r.Form.Get(storageRESTFilePath)
 	versionID := r.Form.Get(storageRESTVersionID)
@@ -409,34 +413,39 @@ func (s *storageRESTServer) ReadVersionHandler(w http.ResponseWriter, r *http.Re
 		s.writeErrorResponse(w, err)
 		return
 	}
-	fi, err := s.getStorage().ReadVersion(r.Context(), volume, filePath, versionID, ReadOptions{ReadData: readData, Healing: healing})
+
+	inclFreeVersions, err := strconv.ParseBool(r.Form.Get(storageRESTInclFreeVersions))
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
 
-	logger.LogIf(r.Context(), msgp.Encode(w, &fi))
-}
+	fi, err := s.getStorage().ReadVersion(r.Context(), origvolume, volume, filePath, versionID, ReadOptions{
+		InclFreeVersions: inclFreeVersions,
+		ReadData:         readData,
+		Healing:          healing,
+	})
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
 
-var storageWriteMetadataHandler = grid.NewSingleHandler[*MetadataHandlerParams, grid.NoPayload](grid.HandlerWriteMetadata, func() *MetadataHandlerParams {
-	return &MetadataHandlerParams{}
-}, grid.NewNoPayload)
+	storageLogIf(r.Context(), msgp.Encode(w, &fi))
+}
 
 // WriteMetadataHandler rpc handler to write new updated metadata.
 func (s *storageRESTServer) WriteMetadataHandler(p *MetadataHandlerParams) (np grid.NoPayload, gerr *grid.RemoteErr) {
 	if !s.checkID(p.DiskID) {
 		return grid.NewNPErr(errDiskNotFound)
 	}
+
 	volume := p.Volume
 	filePath := p.FilePath
+	origvolume := p.OrigVolume
 
-	err := s.getStorage().WriteMetadata(context.Background(), volume, filePath, p.FI)
+	err := s.getStorage().WriteMetadata(context.Background(), origvolume, volume, filePath, p.FI)
 	return np, grid.NewRemoteErr(err)
 }
-
-var storageUpdateMetadataHandler = grid.NewSingleHandler[*MetadataHandlerParams, grid.NoPayload](grid.HandlerUpdateMetadata, func() *MetadataHandlerParams {
-	return &MetadataHandlerParams{}
-}, grid.NewNoPayload)
 
 // UpdateMetadataHandler update new updated metadata.
 func (s *storageRESTServer) UpdateMetadataHandler(p *MetadataHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
@@ -449,47 +458,28 @@ func (s *storageRESTServer) UpdateMetadataHandler(p *MetadataHandlerParams) (gri
 	return grid.NewNPErr(s.getStorage().UpdateMetadata(context.Background(), volume, filePath, p.FI, p.UpdateOpts))
 }
 
-// WriteAllHandler - write to file all content.
-func (s *storageRESTServer) WriteAllHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		return
-	}
-	volume := r.Form.Get(storageRESTVolume)
-	filePath := r.Form.Get(storageRESTFilePath)
-
-	if r.ContentLength < 0 {
-		s.writeErrorResponse(w, errInvalidArgument)
-		return
-	}
-	tmp := make([]byte, r.ContentLength)
-	_, err := io.ReadFull(r.Body, tmp)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
-	}
-	err = s.getStorage().WriteAll(r.Context(), volume, filePath, tmp)
-	if err != nil {
-		s.writeErrorResponse(w, err)
-	}
-}
-
-var storageCheckPartsHandler = grid.NewSingleHandler[*CheckPartsHandlerParams, grid.NoPayload](grid.HandlerCheckParts, func() *CheckPartsHandlerParams {
-	return &CheckPartsHandlerParams{}
-}, grid.NewNoPayload)
-
 // CheckPartsHandler - check if a file metadata exists.
-func (s *storageRESTServer) CheckPartsHandler(p *CheckPartsHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
+func (s *storageRESTServer) CheckPartsHandler(p *CheckPartsHandlerParams) (*CheckPartsResp, *grid.RemoteErr) {
 	if !s.checkID(p.DiskID) {
-		return grid.NewNPErr(errDiskNotFound)
+		return nil, grid.NewRemoteErr(errDiskNotFound)
 	}
 	volume := p.Volume
 	filePath := p.FilePath
-	return grid.NewNPErr(s.getStorage().CheckParts(context.Background(), volume, filePath, p.FI))
+
+	resp, err := s.getStorage().CheckParts(context.Background(), volume, filePath, p.FI)
+	return resp, grid.NewRemoteErr(err)
 }
 
-var storageReadAllHandler = grid.NewSingleHandler[*ReadAllHandlerParams, *grid.Bytes](grid.HandlerReadAll, func() *ReadAllHandlerParams {
-	return &ReadAllHandlerParams{}
-}, grid.NewBytes)
+func (s *storageRESTServer) WriteAllHandler(p *WriteAllHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
+	if !s.checkID(p.DiskID) {
+		return grid.NewNPErr(errDiskNotFound)
+	}
+
+	volume := p.Volume
+	filePath := p.FilePath
+
+	return grid.NewNPErr(s.getStorage().WriteAll(context.Background(), volume, filePath, p.Buf))
+}
 
 // ReadAllHandler - read all the contents of a file.
 func (s *storageRESTServer) ReadAllHandler(p *ReadAllHandlerParams) (*grid.Bytes, *grid.RemoteErr) {
@@ -523,12 +513,8 @@ func (s *storageRESTServer) ReadXLHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	logger.LogIf(r.Context(), msgp.Encode(w, &rf))
+	storageLogIf(r.Context(), msgp.Encode(w, &rf))
 }
-
-var storageReadXLHandler = grid.NewSingleHandler[*grid.MSS, *RawFileInfo](grid.HandlerReadXL, grid.NewMSS, func() *RawFileInfo {
-	return &RawFileInfo{}
-})
 
 // ReadXLHandlerWS - read xl.meta for an object at path.
 func (s *storageRESTServer) ReadXLHandlerWS(params *grid.MSS) (*RawFileInfo, *grid.RemoteErr) {
@@ -627,9 +613,11 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
 		// Windows can lock up with this optimization, so we fall back to regular copy.
 		sr, ok := rc.(*sendFileReader)
 		if ok {
+			// Sendfile sends in 4MiB chunks per sendfile syscall which is more than enough
+			// for most setups.
 			_, err = rf.ReadFrom(sr.Reader)
 			if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
-				logger.LogIf(r.Context(), err)
+				storageLogIf(r.Context(), err)
 			}
 			if err == nil || !errors.Is(err, xhttp.ErrNotImplemented) {
 				return
@@ -639,34 +627,30 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
 
 	_, err = xioutil.Copy(w, rc)
 	if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
-		logger.LogIf(r.Context(), err)
+		storageLogIf(r.Context(), err)
 	}
 }
 
 // ListDirHandler - list a directory.
-func (s *storageRESTServer) ListDirHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
-		return
+func (s *storageRESTServer) ListDirHandler(ctx context.Context, params *grid.MSS, out chan<- *ListDirResult) *grid.RemoteErr {
+	if !s.checkID(params.Get(storageRESTDiskID)) {
+		return grid.NewRemoteErr(errDiskNotFound)
 	}
-	volume := r.Form.Get(storageRESTVolume)
-	dirPath := r.Form.Get(storageRESTDirPath)
-	count, err := strconv.Atoi(r.Form.Get(storageRESTCount))
+	volume := params.Get(storageRESTVolume)
+	dirPath := params.Get(storageRESTDirPath)
+	origvolume := params.Get(storageRESTOrigVolume)
+	count, err := strconv.Atoi(params.Get(storageRESTCount))
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return grid.NewRemoteErr(err)
 	}
 
-	entries, err := s.getStorage().ListDir(r.Context(), volume, dirPath, count)
+	entries, err := s.getStorage().ListDir(ctx, origvolume, volume, dirPath, count)
 	if err != nil {
-		s.writeErrorResponse(w, err)
-		return
+		return grid.NewRemoteErr(err)
 	}
-	gob.NewEncoder(w).Encode(&entries)
+	out <- &ListDirResult{Entries: entries}
+	return nil
 }
-
-var storageDeleteFileHandler = grid.NewSingleHandler[*DeleteFileHandlerParams, grid.NoPayload](grid.HandlerDeleteFile, func() *DeleteFileHandlerParams {
-	return &DeleteFileHandlerParams{}
-}, grid.NewNoPayload)
 
 // DeleteFileHandler - delete a file.
 func (s *storageRESTServer) DeleteFileHandler(p *DeleteFileHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
@@ -723,28 +707,21 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 	encoder.Encode(dErrsResp)
 }
 
-var storageRenameDataHandler = grid.NewSingleHandler[*RenameDataHandlerParams, *RenameDataResp](grid.HandlerRenameData, func() *RenameDataHandlerParams {
-	return &RenameDataHandlerParams{}
-}, func() *RenameDataResp {
-	return &RenameDataResp{}
-})
-
 // RenameDataHandler - renames a meta object and data dir to destination.
 func (s *storageRESTServer) RenameDataHandler(p *RenameDataHandlerParams) (*RenameDataResp, *grid.RemoteErr) {
 	if !s.checkID(p.DiskID) {
 		return nil, grid.NewRemoteErr(errDiskNotFound)
 	}
 
-	sign, err := s.getStorage().RenameData(context.Background(), p.SrcVolume, p.SrcPath, p.FI, p.DstVolume, p.DstPath, p.Opts)
-	resp := &RenameDataResp{
-		Signature: sign,
-	}
-	return resp, grid.NewRemoteErr(err)
+	resp, err := s.getStorage().RenameData(context.Background(), p.SrcVolume, p.SrcPath, p.FI, p.DstVolume, p.DstPath, p.Opts)
+	return &resp, grid.NewRemoteErr(err)
 }
 
-var storageRenameFileHandler = grid.NewSingleHandler[*RenameFileHandlerParams, grid.NoPayload](grid.HandlerRenameFile, func() *RenameFileHandlerParams {
-	return &RenameFileHandlerParams{}
-}, grid.NewNoPayload)
+// RenameDataInlineHandler - renames a meta object and data dir to destination.
+func (s *storageRESTServer) RenameDataInlineHandler(p *RenameDataInlineHandlerParams) (*RenameDataResp, *grid.RemoteErr) {
+	defer p.Recycle()
+	return s.RenameDataHandler(&p.RenameDataHandlerParams)
+}
 
 // RenameFileHandler - rename a file from source to destination
 func (s *storageRESTServer) RenameFileHandler(p *RenameFileHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
@@ -832,9 +809,26 @@ func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func
 		defer xioutil.SafeClose(doneCh)
 		// Initiate ticker after body has been read.
 		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
+
 		for {
 			select {
 			case <-ticker.C:
+				// The done() might have been called
+				// concurrently, check for it before we
+				// write the filler byte.
+				select {
+				case err := <-doneCh:
+					if err != nil {
+						write([]byte{1})
+						write([]byte(err.Error()))
+					} else {
+						write([]byte{0})
+					}
+					return
+				default:
+				}
+
 				// Response not ready, write a filler byte.
 				write([]byte{32})
 				if canWrite {
@@ -847,7 +841,6 @@ func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func
 				} else {
 					write([]byte{0})
 				}
-				ticker.Stop()
 				return
 			}
 		}
@@ -895,6 +888,21 @@ func keepHTTPResponseAlive(w http.ResponseWriter) func(error) {
 		for {
 			select {
 			case <-ticker.C:
+				// The done() might have been called
+				// concurrently, check for it before we
+				// write the filler byte.
+				select {
+				case err := <-doneCh:
+					if err != nil {
+						write([]byte{1})
+						write([]byte(err.Error()))
+					} else {
+						write([]byte{0})
+					}
+					return
+				default:
+				}
+
 				// Response not ready, write a filler byte.
 				write([]byte{32})
 				if canWrite {
@@ -1111,11 +1119,6 @@ func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 	}
 }
 
-// VerifyFileResp - VerifyFile()'s response.
-type VerifyFileResp struct {
-	Err error
-}
-
 // VerifyFileHandler - Verify all part of file for bitrot errors.
 func (s *storageRESTServer) VerifyFileHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -1138,13 +1141,15 @@ func (s *storageRESTServer) VerifyFileHandler(w http.ResponseWriter, r *http.Req
 	setEventStreamHeaders(w)
 	encoder := gob.NewEncoder(w)
 	done := keepHTTPResponseAlive(w)
-	err := s.getStorage().VerifyFile(r.Context(), volume, filePath, fi)
+	resp, err := s.getStorage().VerifyFile(r.Context(), volume, filePath, fi)
 	done(nil)
-	vresp := &VerifyFileResp{}
+
 	if err != nil {
-		vresp.Err = StorageErr(err.Error())
+		s.writeErrorResponse(w, err)
+		return
 	}
-	encoder.Encode(vresp)
+
+	encoder.Encode(resp)
 }
 
 func checkDiskFatalErrs(errs []error) error {
@@ -1221,25 +1226,29 @@ func logFatalErrs(err error, endpoint Endpoint, exit bool) {
 			hint = fmt.Sprintf("Run the following command to add write permissions: `sudo chown -R %s. <path> && sudo chmod u+rxw <path>`", username)
 		}
 		if !exit {
-			logger.LogOnceIf(GlobalContext, fmt.Errorf("Drive is not writable %s, %s", endpoint, hint), "log-fatal-errs")
+			storageLogOnceIf(GlobalContext, fmt.Errorf("Drive is not writable %s, %s", endpoint, hint), "log-fatal-errs")
 		} else {
 			logger.Fatal(config.ErrUnableToWriteInBackend(err).Hint(hint), "Unable to initialize backend")
 		}
 	case errors.Is(err, errFaultyDisk):
 		if !exit {
-			logger.LogOnceIf(GlobalContext, fmt.Errorf("Drive is faulty at %s, please replace the drive - drive will be offline", endpoint), "log-fatal-errs")
+			storageLogOnceIf(GlobalContext, fmt.Errorf("Drive is faulty at %s, please replace the drive - drive will be offline", endpoint), "log-fatal-errs")
 		} else {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
 	case errors.Is(err, errDiskFull):
 		if !exit {
-			logger.LogOnceIf(GlobalContext, fmt.Errorf("Drive is already full at %s, incoming I/O will fail - drive will be offline", endpoint), "log-fatal-errs")
+			storageLogOnceIf(GlobalContext, fmt.Errorf("Drive is already full at %s, incoming I/O will fail - drive will be offline", endpoint), "log-fatal-errs")
 		} else {
+			logger.Fatal(err, "Unable to initialize backend")
+		}
+	case errors.Is(err, errInconsistentDisk):
+		if exit {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
 	default:
 		if !exit {
-			logger.LogOnceIf(GlobalContext, fmt.Errorf("Drive %s returned an unexpected error: %w, please investigate - drive will be offline", endpoint, err), "log-fatal-errs")
+			storageLogOnceIf(GlobalContext, fmt.Errorf("Drive %s returned an unexpected error: %w, please investigate - drive will be offline", endpoint, err), "log-fatal-errs")
 		} else {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
@@ -1333,53 +1342,54 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 			}
 
 			server := &storageRESTServer{
-				poolIndex: endpoint.PoolIdx,
-				setIndex:  endpoint.SetIdx,
-				diskIndex: endpoint.DiskIdx,
+				endpoint: endpoint,
 			}
 
 			subrouter := router.PathPrefix(path.Join(storageRESTPrefix, endpoint.Path)).Subrouter()
 
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodHealth).HandlerFunc(h(server.HealthHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodAppendFile).HandlerFunc(h(server.AppendFileHandler))
-			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodWriteAll).HandlerFunc(h(server.WriteAllHandler))
-
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadVersion).HandlerFunc(h(server.ReadVersionHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadXL).HandlerFunc(h(server.ReadXLHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCreateFile).HandlerFunc(h(server.CreateFileHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFile).HandlerFunc(h(server.ReadFileHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFileStream).HandlerFunc(h(server.ReadFileStreamHandler))
-			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodListDir).HandlerFunc(h(server.ListDirHandler))
 
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteVersions).HandlerFunc(h(server.DeleteVersionsHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodVerifyFile).HandlerFunc(h(server.VerifyFileHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatInfoFile).HandlerFunc(h(server.StatInfoFile))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadMultiple).HandlerFunc(h(server.ReadMultiple))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCleanAbandoned).HandlerFunc(h(server.CleanAbandonedDataHandler))
-			logger.FatalIf(storageReadAllHandler.Register(gm, server.ReadAllHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageRenameFileHandler.Register(gm, server.RenameFileHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageRenameDataHandler.Register(gm, server.RenameDataHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageDeleteFileHandler.Register(gm, server.DeleteFileHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageCheckPartsHandler.Register(gm, server.CheckPartsHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageReadVersionHandler.Register(gm, server.ReadVersionHandlerWS, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageWriteMetadataHandler.Register(gm, server.WriteMetadataHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageUpdateMetadataHandler.Register(gm, server.UpdateMetadataHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageDeleteVersionHandler.Register(gm, server.DeleteVersionHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageReadXLHandler.Register(gm, server.ReadXLHandlerWS, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageNSScannerHandler.RegisterNoInput(gm, server.NSScannerHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageDiskInfoHandler.Register(gm, server.DiskInfoHandler, endpoint.Path), "unable to register handler")
-			logger.FatalIf(storageStatVolHandler.Register(gm, server.StatVolHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageListDirRPC.RegisterNoInput(gm, server.ListDirHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageReadAllRPC.Register(gm, server.ReadAllHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageWriteAllRPC.Register(gm, server.WriteAllHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageRenameFileRPC.Register(gm, server.RenameFileHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageRenameDataRPC.Register(gm, server.RenameDataHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageRenameDataInlineRPC.Register(gm, server.RenameDataInlineHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageDeleteFileRPC.Register(gm, server.DeleteFileHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageCheckPartsRPC.Register(gm, server.CheckPartsHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageReadVersionRPC.Register(gm, server.ReadVersionHandlerWS, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageWriteMetadataRPC.Register(gm, server.WriteMetadataHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageUpdateMetadataRPC.Register(gm, server.UpdateMetadataHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageDeleteVersionRPC.Register(gm, server.DeleteVersionHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageReadXLRPC.Register(gm, server.ReadXLHandlerWS, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageNSScannerRPC.RegisterNoInput(gm, server.NSScannerHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageDiskInfoRPC.Register(gm, server.DiskInfoHandler, endpoint.Path), "unable to register handler")
+			logger.FatalIf(storageStatVolRPC.Register(gm, server.StatVolHandler, endpoint.Path), "unable to register handler")
 			logger.FatalIf(gm.RegisterStreamingHandler(grid.HandlerWalkDir, grid.StreamHandler{
 				Subroute:    endpoint.Path,
 				Handle:      server.WalkDirHandler,
 				OutCapacity: 1,
 			}), "unable to register handler")
 
-			createStorage := func(server *storageRESTServer) bool {
+			createStorage := func(endpoint Endpoint) bool {
 				xl, err := newXLStorage(endpoint, false)
 				if err != nil {
 					// if supported errors don't fail, we proceed to
 					// printing message and moving forward.
+					if errors.Is(err, errDriveIsRoot) {
+						err = fmt.Errorf("major: %v: minor: %v: %w", xl.major, xl.minor, err)
+					}
 					logFatalErrs(err, endpoint, false)
 					return false
 				}
@@ -1392,23 +1402,24 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 				defer globalLocalDrivesMu.Unlock()
 
 				globalLocalDrives = append(globalLocalDrives, storage)
+				globalLocalDrivesMap[endpoint.String()] = storage
 				globalLocalSetDrives[endpoint.PoolIdx][endpoint.SetIdx][endpoint.DiskIdx] = storage
 				return true
 			}
 
-			if createStorage(server) {
+			if createStorage(endpoint) {
 				continue
 			}
 
 			// Start async goroutine to create storage.
-			go func(server *storageRESTServer) {
+			go func(endpoint Endpoint) {
 				for {
 					time.Sleep(3 * time.Second)
-					if createStorage(server) {
+					if createStorage(endpoint) {
 						return
 					}
 				}
-			}(server)
+			}(endpoint)
 
 		}
 	}

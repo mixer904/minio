@@ -32,6 +32,10 @@ import (
 	xioutil "github.com/minio/minio/internal/ioutil"
 )
 
+//go:generate msgp -file $GOFILE -io=false -tests=false -unexported=false
+
+//msgp:ignore ObjectOptions TransitionOptions DeleteBucketOptions
+
 // CheckPreconditionFn returns true if precondition check failed.
 type CheckPreconditionFn func(o ObjectInfo) bool
 
@@ -109,18 +113,27 @@ type ObjectOptions struct {
 	// participating in a rebalance operation. Typically set for 'write' operations.
 	SkipRebalancing bool
 
+	DataMovement bool // indicates an going decommisionning or rebalacing
+
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
 
 	// IndexCB will return any index created but the compression.
 	// Object must have been read at this point.
 	IndexCB func() []byte
 
+	// InclFreeVersions indicates that free versions need to be included
+	// when looking up a version by fi.VersionID
 	InclFreeVersions bool
+	// SkipFreeVersion skips adding a free version when a tiered version is
+	// being 'replaced'
+	// Note: Used only when a tiered object is being expired.
+	SkipFreeVersion bool
 
 	MetadataChg           bool                  // is true if it is a metadata update operation.
 	EvalRetentionBypassFn EvalRetentionBypassFn // only set for enforcing retention bypass on DeleteObject.
 
 	FastGetObjInfo bool // Only for S3 Head/Get Object calls for now
+	NoAuditLog     bool // Only set for decom, rebalance, to avoid double audits.
 }
 
 // WalkOptions provides filtering, marker and other Walk() specific options.
@@ -166,8 +179,9 @@ type DeleteBucketOptions struct {
 
 // BucketOptions provides options for ListBuckets and GetBucketInfo call.
 type BucketOptions struct {
-	Deleted bool // true only when site replication is enabled
-	Cached  bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	Deleted    bool // true only when site replication is enabled
+	Cached     bool // true only when we are requesting a cached response instead of hitting the disk for example ListBuckets() call.
+	NoMetadata bool
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -231,6 +245,7 @@ type ObjectLayer interface {
 	Shutdown(context.Context) error
 	NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, scanMode madmin.HealScanMode) error
 	BackendInfo() madmin.BackendInfo
+	Legacy() bool // Only returns true for deployments which use CRCMOD as its object distribution algorithm.
 	StorageInfo(ctx context.Context, metrics bool) StorageInfo
 	LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo
 
@@ -243,7 +258,7 @@ type ObjectLayer interface {
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
 	ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (result ListObjectVersionsInfo, err error)
 	// Walk lists all objects including versions, delete markers.
-	Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts WalkOptions) error
+	Walk(ctx context.Context, bucket, prefix string, results chan<- itemOrErr[ObjectInfo], opts WalkOptions) error
 
 	// Object operations.
 
@@ -285,7 +300,6 @@ type ObjectLayer interface {
 
 	// Returns health of the backend
 	Health(ctx context.Context, opts HealthOptions) HealthResult
-	ReadHealth(ctx context.Context) bool
 
 	// Metadata operations
 	PutObjectMetadata(context.Context, string, string, ObjectOptions) (ObjectInfo, error)

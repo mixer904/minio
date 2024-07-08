@@ -19,7 +19,13 @@ package cmd
 
 import (
 	"time"
+
+	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/grid"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
+
+//go:generate msgp -file=$GOFILE
 
 // DeleteOptions represents the disk level delete options available for the APIs
 type DeleteOptions struct {
@@ -27,6 +33,8 @@ type DeleteOptions struct {
 	Recursive bool `msg:"r"`
 	Immediate bool `msg:"i"`
 	UndoWrite bool `msg:"u"`
+	// OldDataDir of the previous object
+	OldDataDir string `msg:"o,omitempty"` // old data dir used only when to revert a rename()
 }
 
 // BaseOptions represents common options for all Storage API calls
@@ -43,8 +51,6 @@ type DiskInfoOptions struct {
 	Metrics bool   `msg:"m"`
 	NoOp    bool   `msg:"np"`
 }
-
-//go:generate msgp -file=$GOFILE
 
 // DiskInfo is an extended type which returns current
 // disk usage per path.
@@ -80,7 +86,6 @@ type DiskInfo struct {
 type DiskMetrics struct {
 	LastMinute              map[string]AccElem `json:"apiLatencies,omitempty"`
 	APICalls                map[string]uint64  `json:"apiCalls,omitempty"`
-	TotalTokens             uint32             `json:"totalTokens,omitempty"`
 	TotalWaiting            uint32             `json:"totalWaiting,omitempty"`
 	TotalErrorsAvailability uint64             `json:"totalErrsAvailability"`
 	TotalErrorsTimeout      uint64             `json:"totalErrsTimeout"`
@@ -149,6 +154,15 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 	if f == nil || v == "" {
 		return -1
 	}
+	if v == nullVersionID {
+		for i, ver := range f.Versions {
+			if ver.VersionID == "" {
+				return i
+			}
+		}
+		return -1
+	}
+
 	for i, ver := range f.Versions {
 		if ver.VersionID == v {
 			return i
@@ -163,11 +177,6 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 type RawFileInfo struct {
 	// Content of entire xl.meta (may contain data depending on what was requested by the caller.
 	Buf []byte `msg:"b,allownil"`
-
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
 }
 
 // FileInfo - represents file stat information.
@@ -248,11 +257,6 @@ type FileInfo struct {
 	// usage in other calls in undefined please avoid.
 	Idx int `msg:"i"`
 
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
-
 	// Combined checksum when object was uploaded.
 	Checksum []byte `msg:"cs,allownil"`
 
@@ -292,10 +296,15 @@ func (fi FileInfo) ReadQuorum(dquorum int) int {
 
 // Equals checks if fi(FileInfo) matches ofi(FileInfo)
 func (fi FileInfo) Equals(ofi FileInfo) (ok bool) {
-	if !fi.MetadataEquals(ofi) {
+	typ1, ok1 := crypto.IsEncrypted(fi.Metadata)
+	typ2, ok2 := crypto.IsEncrypted(ofi.Metadata)
+	if ok1 != ok2 {
 		return false
 	}
-	if !fi.ReplicationInfoEquals(ofi) {
+	if typ1 != typ2 {
+		return false
+	}
+	if fi.IsCompressed() != ofi.IsCompressed() {
 		return false
 	}
 	if !fi.TransitionInfoEquals(ofi) {
@@ -320,6 +329,12 @@ func (fi FileInfo) GetDataDir() string {
 		return "legacy"
 	}
 	return fi.DataDir
+}
+
+// IsCompressed returns true if the object is marked as compressed.
+func (fi FileInfo) IsCompressed() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefix+"compression"]
+	return ok
 }
 
 // InlineData returns true if object contents are inlined alongside its metadata.
@@ -393,6 +408,7 @@ type DeleteVersionHandlerParams struct {
 type MetadataHandlerParams struct {
 	DiskID     string             `msg:"id"`
 	Volume     string             `msg:"v"`
+	OrigVolume string             `msg:"ov"`
 	FilePath   string             `msg:"fp"`
 	UpdateOpts UpdateMetadataOpts `msg:"uo"`
 	FI         FileInfo           `msg:"fi"`
@@ -430,6 +446,27 @@ type RenameDataHandlerParams struct {
 	Opts      RenameOptions `msg:"ro"`
 }
 
+// RenameDataInlineHandlerParams are parameters for RenameDataHandler with a buffer for inline data.
+type RenameDataInlineHandlerParams struct {
+	RenameDataHandlerParams `msg:"p"`
+}
+
+func newRenameDataInlineHandlerParams() *RenameDataInlineHandlerParams {
+	buf := grid.GetByteBufferCap(32 + 16<<10)
+	return &RenameDataInlineHandlerParams{RenameDataHandlerParams{FI: FileInfo{Data: buf[:0]}}}
+}
+
+// Recycle will reuse the memory allocated for the FileInfo data.
+func (r *RenameDataInlineHandlerParams) Recycle() {
+	if r == nil {
+		return
+	}
+	if cap(r.FI.Data) >= xioutil.SmallBlock {
+		grid.PutByteBuffer(r.FI.Data)
+		r.FI.Data = nil
+	}
+}
+
 // RenameFileHandlerParams are parameters for RenameFileHandler.
 type RenameFileHandlerParams struct {
 	DiskID      string `msg:"id"`
@@ -446,7 +483,48 @@ type ReadAllHandlerParams struct {
 	FilePath string `msg:"fp"`
 }
 
+// WriteAllHandlerParams are parameters for WriteAllHandler.
+type WriteAllHandlerParams struct {
+	DiskID   string `msg:"id"`
+	Volume   string `msg:"v"`
+	FilePath string `msg:"fp"`
+	Buf      []byte `msg:"b"`
+}
+
 // RenameDataResp - RenameData()'s response.
+// Provides information about the final state of Rename()
+//   - on xl.meta (array of versions) on disk to check for version disparity
+//   - on rewrite dataDir on disk that must be additionally purged
+//     only after as a 2-phase call, allowing the older dataDir to
+//     hang-around in-case we need some form of recovery.
 type RenameDataResp struct {
-	Signature uint64 `msg:"sig"`
+	Sign       []byte
+	OldDataDir string // contains '<uuid>', it is designed to be passed as value to Delete(bucket, pathJoin(object, dataDir))
+}
+
+const (
+	checkPartUnknown int = iota
+
+	// Changing the order can cause a data loss
+	// when running two nodes with incompatible versions
+	checkPartSuccess
+	checkPartDiskNotFound
+	checkPartVolumeNotFound
+	checkPartFileNotFound
+	checkPartFileCorrupt
+)
+
+// CheckPartsResp is a response of the storage CheckParts and VerifyFile APIs
+type CheckPartsResp struct {
+	Results []int
+}
+
+// LocalDiskIDs - GetLocalIDs response.
+type LocalDiskIDs struct {
+	IDs []string
+}
+
+// ListDirResult - ListDir()'s response.
+type ListDirResult struct {
+	Entries []string `msg:"e"`
 }

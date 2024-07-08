@@ -188,6 +188,24 @@ func (z *healingTracker) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "HealID")
 				return
 			}
+		case "ItemsSkipped":
+			z.ItemsSkipped, err = dc.ReadUint64()
+			if err != nil {
+				err = msgp.WrapError(err, "ItemsSkipped")
+				return
+			}
+		case "BytesSkipped":
+			z.BytesSkipped, err = dc.ReadUint64()
+			if err != nil {
+				err = msgp.WrapError(err, "BytesSkipped")
+				return
+			}
+		case "RetryAttempts":
+			z.RetryAttempts, err = dc.ReadUint64()
+			if err != nil {
+				err = msgp.WrapError(err, "RetryAttempts")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -201,9 +219,9 @@ func (z *healingTracker) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *healingTracker) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 23
+	// map header, size 26
 	// write "ID"
-	err = en.Append(0xde, 0x0, 0x17, 0xa2, 0x49, 0x44)
+	err = en.Append(0xde, 0x0, 0x1a, 0xa2, 0x49, 0x44)
 	if err != nil {
 		return
 	}
@@ -446,15 +464,45 @@ func (z *healingTracker) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "HealID")
 		return
 	}
+	// write "ItemsSkipped"
+	err = en.Append(0xac, 0x49, 0x74, 0x65, 0x6d, 0x73, 0x53, 0x6b, 0x69, 0x70, 0x70, 0x65, 0x64)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint64(z.ItemsSkipped)
+	if err != nil {
+		err = msgp.WrapError(err, "ItemsSkipped")
+		return
+	}
+	// write "BytesSkipped"
+	err = en.Append(0xac, 0x42, 0x79, 0x74, 0x65, 0x73, 0x53, 0x6b, 0x69, 0x70, 0x70, 0x65, 0x64)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint64(z.BytesSkipped)
+	if err != nil {
+		err = msgp.WrapError(err, "BytesSkipped")
+		return
+	}
+	// write "RetryAttempts"
+	err = en.Append(0xad, 0x52, 0x65, 0x74, 0x72, 0x79, 0x41, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x73)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint64(z.RetryAttempts)
+	if err != nil {
+		err = msgp.WrapError(err, "RetryAttempts")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *healingTracker) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 23
+	// map header, size 26
 	// string "ID"
-	o = append(o, 0xde, 0x0, 0x17, 0xa2, 0x49, 0x44)
+	o = append(o, 0xde, 0x0, 0x1a, 0xa2, 0x49, 0x44)
 	o = msgp.AppendString(o, z.ID)
 	// string "PoolIndex"
 	o = append(o, 0xa9, 0x50, 0x6f, 0x6f, 0x6c, 0x49, 0x6e, 0x64, 0x65, 0x78)
@@ -528,6 +576,15 @@ func (z *healingTracker) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "HealID"
 	o = append(o, 0xa6, 0x48, 0x65, 0x61, 0x6c, 0x49, 0x44)
 	o = msgp.AppendString(o, z.HealID)
+	// string "ItemsSkipped"
+	o = append(o, 0xac, 0x49, 0x74, 0x65, 0x6d, 0x73, 0x53, 0x6b, 0x69, 0x70, 0x70, 0x65, 0x64)
+	o = msgp.AppendUint64(o, z.ItemsSkipped)
+	// string "BytesSkipped"
+	o = append(o, 0xac, 0x42, 0x79, 0x74, 0x65, 0x73, 0x53, 0x6b, 0x69, 0x70, 0x70, 0x65, 0x64)
+	o = msgp.AppendUint64(o, z.BytesSkipped)
+	// string "RetryAttempts"
+	o = append(o, 0xad, 0x52, 0x65, 0x74, 0x72, 0x79, 0x41, 0x74, 0x74, 0x65, 0x6d, 0x70, 0x74, 0x73)
+	o = msgp.AppendUint64(o, z.RetryAttempts)
 	return
 }
 
@@ -713,6 +770,24 @@ func (z *healingTracker) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "HealID")
 				return
 			}
+		case "ItemsSkipped":
+			z.ItemsSkipped, bts, err = msgp.ReadUint64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "ItemsSkipped")
+				return
+			}
+		case "BytesSkipped":
+			z.BytesSkipped, bts, err = msgp.ReadUint64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "BytesSkipped")
+				return
+			}
+		case "RetryAttempts":
+			z.RetryAttempts, bts, err = msgp.ReadUint64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "RetryAttempts")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -735,6 +810,6 @@ func (z *healingTracker) Msgsize() (s int) {
 	for za0002 := range z.HealedBuckets {
 		s += msgp.StringPrefixSize + len(z.HealedBuckets[za0002])
 	}
-	s += 7 + msgp.StringPrefixSize + len(z.HealID)
+	s += 7 + msgp.StringPrefixSize + len(z.HealID) + 13 + msgp.Uint64Size + 13 + msgp.Uint64Size + 14 + msgp.Uint64Size
 	return
 }

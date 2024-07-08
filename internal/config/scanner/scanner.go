@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // Compression environment variables
@@ -33,6 +33,12 @@ const (
 
 	IdleSpeed    = "idle_speed"
 	EnvIdleSpeed = "MINIO_SCANNER_IDLE_SPEED"
+
+	ExcessVersions    = "alert_excess_versions"
+	EnvExcessVersions = "MINIO_SCANNER_ALERT_EXCESS_VERSIONS"
+
+	ExcessFolders    = "alert_excess_folders"
+	EnvExcessFolders = "MINIO_SCANNER_ALERT_EXCESS_FOLDERS"
 
 	// All below are deprecated in October 2022 and
 	// replaced them with a single speed parameter
@@ -50,8 +56,16 @@ const (
 type Config struct {
 	// Delay is the sleep multiplier.
 	Delay float64 `json:"delay"`
-	// Behavior of the scanner when there is no other parallel S3 requests
-	IdleMode int32 // 0 => throttling, 1 => full speed
+
+	// Sleep always or based on incoming S3 requests.
+	IdleMode int32 // 0 => on, 1 => off
+
+	// Alert upon this many excess object versions
+	ExcessVersions int64 // 100
+
+	// Alert upon this many excess sub-folders per folder in an erasure set.
+	ExcessFolders int64 // 50000
+
 	// MaxWait is maximum wait time between operations
 	MaxWait time.Duration
 	// Cycle is the time.Duration between each scanner cycles
@@ -69,6 +83,15 @@ var DefaultKVS = config.KVS{
 		Value:         "",
 		HiddenIfEmpty: true,
 	},
+	config.KV{
+		Key:   ExcessVersions,
+		Value: "100",
+	},
+	config.KV{
+		Key:   ExcessFolders,
+		Value: "50000",
+	},
+
 	// Deprecated Oct 2022
 	config.KV{
 		Key:           Delay,
@@ -91,15 +114,44 @@ var DefaultKVS = config.KVS{
 
 // LookupConfig - lookup config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
+	cfg = Config{
+		ExcessVersions: 100,
+		ExcessFolders:  50000,
+		IdleMode:       0, // Default is on
+	}
+
 	if err = config.CheckValidKeys(config.ScannerSubSys, kvs, DefaultKVS); err != nil {
 		return cfg, err
+	}
+
+	excessVersions, err := strconv.ParseInt(env.Get(EnvExcessVersions, kvs.GetWithDefault(ExcessVersions, DefaultKVS)), 10, 64)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ExcessVersions = excessVersions
+
+	excessFolders, err := strconv.ParseInt(env.Get(EnvExcessFolders, kvs.GetWithDefault(ExcessFolders, DefaultKVS)), 10, 64)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ExcessFolders = excessFolders
+
+	switch idleSpeed := env.Get(EnvIdleSpeed, kvs.GetWithDefault(IdleSpeed, DefaultKVS)); idleSpeed {
+	case "", config.EnableOn:
+		cfg.IdleMode = 0
+	case config.EnableOff:
+		cfg.IdleMode = 1
+	default:
+		return cfg, fmt.Errorf("unknown value: '%s'", idleSpeed)
 	}
 
 	// Stick to loading deprecated config/env if they are already set, and the Speed value
 	// has not been changed from its "default" value, if it has been changed honor new settings.
 	if kvs.GetWithDefault(Speed, DefaultKVS) == "default" {
 		if kvs.Get(Delay) != "" && kvs.Get(MaxWait) != "" {
-			return lookupDeprecatedScannerConfig(kvs)
+			if err = lookupDeprecatedScannerConfig(kvs, &cfg); err != nil {
+				return cfg, err
+			}
 		}
 	}
 
@@ -118,26 +170,17 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		return cfg, fmt.Errorf("unknown '%s' value", speed)
 	}
 
-	switch idleSpeed := env.Get(EnvIdleSpeed, kvs.GetWithDefault(IdleSpeed, DefaultKVS)); idleSpeed {
-	case "", "throttled": // Empty is the default mode;
-		cfg.IdleMode = 0
-	case "full":
-		cfg.IdleMode = 1
-	default:
-		return cfg, fmt.Errorf("unknown value: '%s'", idleSpeed)
-	}
-
-	return
+	return cfg, nil
 }
 
-func lookupDeprecatedScannerConfig(kvs config.KVS) (cfg Config, err error) {
+func lookupDeprecatedScannerConfig(kvs config.KVS, cfg *Config) (err error) {
 	delay := env.Get(EnvDelayLegacy, "")
 	if delay == "" {
 		delay = env.Get(EnvDelay, kvs.GetWithDefault(Delay, DefaultKVS))
 	}
 	cfg.Delay, err = strconv.ParseFloat(delay, 64)
 	if err != nil {
-		return cfg, err
+		return err
 	}
 	maxWait := env.Get(EnvMaxWaitLegacy, "")
 	if maxWait == "" {
@@ -145,7 +188,7 @@ func lookupDeprecatedScannerConfig(kvs config.KVS) (cfg Config, err error) {
 	}
 	cfg.MaxWait, err = time.ParseDuration(maxWait)
 	if err != nil {
-		return cfg, err
+		return err
 	}
 	cycle := env.Get(EnvCycle, kvs.GetWithDefault(Cycle, DefaultKVS))
 	if cycle == "" {
@@ -153,7 +196,7 @@ func lookupDeprecatedScannerConfig(kvs config.KVS) (cfg Config, err error) {
 	}
 	cfg.Cycle, err = time.ParseDuration(cycle)
 	if err != nil {
-		return cfg, err
+		return err
 	}
-	return cfg, nil
+	return nil
 }

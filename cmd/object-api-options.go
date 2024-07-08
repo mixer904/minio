@@ -37,6 +37,15 @@ func getDefaultOpts(header http.Header, copySource bool, metadata map[string]str
 	var sse encrypt.ServerSide
 
 	opts = ObjectOptions{UserDefined: metadata}
+	if v, ok := header[xhttp.MinIOSourceProxyRequest]; ok {
+		opts.ProxyHeaderSet = true
+		opts.ProxyRequest = strings.Join(v, "") == "true"
+	}
+	if _, ok := header[xhttp.MinIOSourceReplicationRequest]; ok {
+		opts.ReplicationRequest = true
+	}
+	opts.Speedtest = header.Get(globalObjectPerfUserMetadata) != ""
+
 	if copySource {
 		if crypto.SSECopy.IsRequested(header) {
 			clientKey, err = crypto.SSECopy.ParseHTTP(header)
@@ -66,14 +75,7 @@ func getDefaultOpts(header http.Header, copySource bool, metadata map[string]str
 	if crypto.S3.IsRequested(header) || (metadata != nil && crypto.S3.IsEncrypted(metadata)) {
 		opts.ServerSideEncryption = encrypt.NewSSE()
 	}
-	if v, ok := header[xhttp.MinIOSourceProxyRequest]; ok {
-		opts.ProxyHeaderSet = true
-		opts.ProxyRequest = strings.Join(v, "") == "true"
-	}
-	if _, ok := header[xhttp.MinIOSourceReplicationRequest]; ok {
-		opts.ReplicationRequest = true
-	}
-	opts.Speedtest = header.Get(globalObjectPerfUserMetadata) != ""
+
 	return
 }
 
@@ -480,7 +482,7 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 	}
 	opts.MTime = mtime
 	opts.UserDefined = make(map[string]string)
-
+	opts.UserDefined[ReservedMetadataPrefix+"Actual-Object-Size"] = r.Header.Get(xhttp.MinIOReplicationActualObjectSize)
 	// Transfer SSEC key in opts.EncryptFn
 	if crypto.SSEC.IsRequested(r.Header) {
 		key, err := ParseSSECustomerRequest(r)
@@ -490,6 +492,12 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 				return key
 			}
 		}
+	}
+	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
+		opts.ReplicationRequest = true
+	}
+	if r.Header.Get(ReplicationSsecChecksumHeader) != "" {
+		opts.UserDefined[ReplicationSsecChecksumHeader] = r.Header.Get(ReplicationSsecChecksumHeader)
 	}
 	return opts, nil
 }

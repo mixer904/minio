@@ -26,7 +26,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // generates format string depending on the string length and padding.
@@ -37,7 +37,7 @@ func getFormatStr(strLen int, padding int) string {
 
 // Prints the formatted startup message.
 func printStartupMessage(apiEndpoints []string, err error) {
-	logger.Info(color.Bold("MinIO Object Storage Server"))
+	logger.Info(color.Bold(MinioBannerName))
 	if err != nil {
 		if globalConsoleSys != nil {
 			globalConsoleSys.Send(GlobalContext, fmt.Sprintf("Server startup failed with '%v', some features may be missing", err))
@@ -51,12 +51,6 @@ func printStartupMessage(apiEndpoints []string, err error) {
 	}
 
 	strippedAPIEndpoints := stripStandardPorts(apiEndpoints, globalMinioHost)
-
-	// Object layer is initialized then print StorageInfo.
-	objAPI := newObjectLayerFn()
-	if objAPI != nil {
-		printStorageInfo(objAPI.StorageInfo(GlobalContext, true))
-	}
 
 	// Prints credential, region and browser access.
 	printServerCommonMsg(strippedAPIEndpoints)
@@ -115,26 +109,25 @@ func printServerCommonMsg(apiEndpoints []string) {
 	cred := globalActiveCred
 
 	// Get saved region.
-	region := globalSite.Region
+	region := globalSite.Region()
 
-	apiEndpointStr := strings.Join(apiEndpoints, "  ")
-
+	apiEndpointStr := strings.TrimSpace(strings.Join(apiEndpoints, "  "))
 	// Colorize the message and print.
-	logger.Info(color.Blue("S3-API: ") + color.Bold(fmt.Sprintf("%s ", apiEndpointStr)))
-	if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON) {
-		logger.Info(color.Blue("RootUser: ") + color.Bold("%s ", cred.AccessKey))
-		logger.Info(color.Blue("RootPass: ") + color.Bold("%s \n", cred.SecretKey))
+	logger.Info(color.Blue("API: ") + color.Bold(fmt.Sprintf("%s ", apiEndpointStr)))
+	if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON && globalAPIConfig.permitRootAccess()) {
+		logger.Info(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
+		logger.Info(color.Blue("   RootPass: ") + color.Bold("%s \n", cred.SecretKey))
 		if region != "" {
-			logger.Info(color.Blue("Region: ") + color.Bold("%s", fmt.Sprintf(getFormatStr(len(region), 2), region)))
+			logger.Info(color.Blue("   Region: ") + color.Bold("%s", fmt.Sprintf(getFormatStr(len(region), 2), region)))
 		}
 	}
 
 	if globalBrowserEnabled {
 		consoleEndpointStr := strings.Join(stripStandardPorts(getConsoleEndpoints(), globalMinioConsoleHost), " ")
-		logger.Info(color.Blue("Console: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
-		if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON) {
-			logger.Info(color.Blue("RootUser: ") + color.Bold("%s ", cred.AccessKey))
-			logger.Info(color.Blue("RootPass: ") + color.Bold("%s ", cred.SecretKey))
+		logger.Info(color.Blue("WebUI: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
+		if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON && globalAPIConfig.permitRootAccess()) {
+			logger.Info(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
+			logger.Info(color.Blue("   RootPass: ") + color.Bold("%s ", cred.SecretKey))
 		}
 	}
 
@@ -144,7 +137,7 @@ func printServerCommonMsg(apiEndpoints []string) {
 
 // Prints startup message for Object API access, prints link to our SDK documentation.
 func printObjectAPIMsg() {
-	logger.Info(color.Blue("\nDocumentation: ") + "https://min.io/docs/minio/linux/index.html")
+	logger.Info(color.Blue("\nDocs: ") + "https://min.io/docs/minio/linux/index.html")
 }
 
 func printLambdaTargets() {
@@ -153,7 +146,7 @@ func printLambdaTargets() {
 	}
 
 	arnMsg := color.Blue("Object Lambda ARNs: ")
-	for _, arn := range globalLambdaTargetList.List(globalSite.Region) {
+	for _, arn := range globalLambdaTargetList.List(globalSite.Region()) {
 		arnMsg += color.Bold(fmt.Sprintf("%s ", arn))
 	}
 	logger.Info(arnMsg + "\n")
@@ -165,7 +158,7 @@ func printEventNotifiers() {
 		return
 	}
 
-	arns := globalEventNotifier.GetARNList(true)
+	arns := globalEventNotifier.GetARNList()
 	if len(arns) == 0 {
 		return
 	}
@@ -187,8 +180,8 @@ func printCLIAccessMsg(endPoint string, alias string) {
 	const mcQuickStartGuide = "https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart"
 
 	// Configure 'mc', following block prints platform specific information for minio client.
-	if color.IsTerminal() && !globalServerCtxt.Anonymous {
-		logger.Info(color.Blue("\nCommand-line: ") + mcQuickStartGuide)
+	if color.IsTerminal() && (!globalServerCtxt.Anonymous && globalAPIConfig.permitRootAccess()) {
+		logger.Info(color.Blue("\nCLI: ") + mcQuickStartGuide)
 		mcMessage := fmt.Sprintf("$ mc alias set '%s' '%s' '%s' '%s'", alias,
 			endPoint, cred.AccessKey, cred.SecretKey)
 		logger.Info(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))

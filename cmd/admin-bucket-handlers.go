@@ -31,7 +31,7 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/klauspost/compress/zip"
-	"github.com/minio/kes-go"
+	"github.com/minio/kms-go/kes"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bucket/lifecycle"
@@ -39,9 +39,8 @@ import (
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/kms"
-	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -99,7 +98,7 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 	}
 
 	// Call site replication hook.
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta))
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, bucketMeta))
 
 	// Write success response.
 	writeSuccessResponseHeadersOnly(w)
@@ -431,7 +430,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 			case bucketNotificationConfig:
 				config, err := globalBucketMetadataSys.GetNotificationConfig(bucket)
 				if err != nil {
-					logger.LogIf(ctx, err)
+					adminLogIf(ctx, err)
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
@@ -447,7 +446,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					if errors.Is(err, BucketLifecycleNotFound{Bucket: bucket}) {
 						continue
 					}
-					logger.LogIf(ctx, err)
+					adminLogIf(ctx, err)
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
@@ -687,7 +686,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 					rpt.SetStatus(bucket, fileName, err)
 					continue
 				}
-				v := newBucketMetadata(bucket)
+				v, _ := globalBucketMetadataSys.Get(bucket)
 				bucketMap[bucket] = &v
 			}
 
@@ -723,7 +722,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 					rpt.SetStatus(bucket, fileName, err)
 					continue
 				}
-				v := newBucketMetadata(bucket)
+				v, _ := globalBucketMetadataSys.Get(bucket)
 				bucketMap[bucket] = &v
 			}
 
@@ -736,7 +735,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				rpt.SetStatus(bucket, fileName, fmt.Errorf("An Object Lock configuration is present on this bucket, so the versioning state cannot be suspended."))
 				continue
 			}
-			if _, err := getReplicationConfig(ctx, bucket); err == nil && v.Suspended() {
+			if rcfg, _ := getReplicationConfig(ctx, bucket); rcfg != nil && v.Suspended() {
 				rpt.SetStatus(bucket, fileName, fmt.Errorf("A replication configuration is present on this bucket, so the versioning state cannot be suspended."))
 				continue
 			}
@@ -776,7 +775,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				rpt.SetStatus(bucket, "", err)
 				continue
 			}
-			v := newBucketMetadata(bucket)
+			v, _ := globalBucketMetadataSys.Get(bucket)
 			bucketMap[bucket] = &v
 		}
 		if _, ok := bucketMap[bucket]; !ok {
@@ -784,7 +783,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 		}
 		switch fileName {
 		case bucketNotificationConfig:
-			config, err := event.ParseConfig(io.LimitReader(reader, sz), globalSite.Region, globalEventNotifier.targetList)
+			config, err := event.ParseConfig(io.LimitReader(reader, sz), globalSite.Region(), globalEventNotifier.targetList)
 			if err != nil {
 				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
 				continue
@@ -838,9 +837,13 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				rpt.SetStatus(bucket, fileName, err)
 				continue
 			}
-
+			rcfg, err := globalBucketObjectLockSys.Get(bucket)
+			if err != nil {
+				rpt.SetStatus(bucket, fileName, err)
+				continue
+			}
 			// Validate the received bucket policy document
-			if err = bucketLifecycle.Validate(); err != nil {
+			if err = bucketLifecycle.Validate(rcfg); err != nil {
 				rpt.SetStatus(bucket, fileName, err)
 				continue
 			}
@@ -875,8 +878,10 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 			}
 			kmsKey := encConfig.KeyID()
 			if kmsKey != "" {
-				kmsContext := kms.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
-				_, err := GlobalKMS.GenerateKey(ctx, kmsKey, kmsContext)
+				_, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{
+					Name:           kmsKey,
+					AssociatedData: kms.Context{"MinIO admin API": "ServerInfoHandler"}, // Context for a test key operation
+				})
 				if err != nil {
 					if errors.Is(err, kes.ErrKeyNotFound) {
 						rpt.SetStatus(bucket, fileName, errKMSKeyNotFound)

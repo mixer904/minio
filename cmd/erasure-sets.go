@@ -31,16 +31,14 @@ import (
 	"time"
 
 	"github.com/dchest/siphash"
-	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/dsync"
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // setsDsyncLockers is encapsulated type for Close()
@@ -81,10 +79,6 @@ type erasureSets struct {
 
 	poolIndex int
 
-	// A channel to send the set index to the MRF when
-	// any disk belonging to that set is connected
-	setReconnectEvent chan int
-
 	// Distribution algorithm of choice.
 	distributionAlgo string
 	deploymentID     [16]byte
@@ -115,26 +109,19 @@ func (s *erasureSets) getDiskMap() map[Endpoint]StorageAPI {
 
 // Initializes a new StorageAPI from the endpoint argument, returns
 // StorageAPI and also `format` which exists on the disk.
-func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatErasureV3, []byte, error) {
+func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatErasureV3, error) {
 	disk, err := newStorageAPI(endpoint, storageOpts{
 		cleanUp:     false,
 		healthCheck: false,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	format, formatData, err := loadFormatErasureWithData(disk, false)
+	format, err := loadFormatErasure(disk, false)
 	if err != nil {
-		if errors.Is(err, errUnformattedDisk) {
-			info, derr := disk.DiskInfo(context.TODO(), DiskInfoOptions{})
-			if derr != nil && info.RootDisk {
-				disk.Close()
-				return nil, nil, nil, fmt.Errorf("Drive: %s is a root drive", disk)
-			}
-		}
 		disk.Close()
-		return nil, nil, nil, fmt.Errorf("Drive: %s returned %w", disk, err) // make sure to '%w' to wrap the error
+		return nil, nil, fmt.Errorf("Drive: %s returned %w", disk, err) // make sure to '%w' to wrap the error
 	}
 
 	disk.Close()
@@ -143,10 +130,10 @@ func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatErasureV3, []byte, e
 		healthCheck: true,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	return disk, format, formatData, nil
+	return disk, format, nil
 }
 
 // findDiskIndex - returns the i,j'th position of the input `diskID` against the reference
@@ -195,6 +182,11 @@ func findDiskIndex(refFormat, format *formatErasureV3) (int, int, error) {
 	return -1, -1, fmt.Errorf("DriveID: %s not found", format.Erasure.This)
 }
 
+// Legacy returns 'true' if distribution algo is CRCMOD
+func (s *erasureSets) Legacy() (ok bool) {
+	return s.distributionAlgo == formatErasureVersionV2DistributionAlgoV1
+}
+
 // connectDisks - attempt to connect all the endpoints, loads format
 // and re-arranges the disks in proper position.
 func (s *erasureSets) connectDisks() {
@@ -227,11 +219,11 @@ func (s *erasureSets) connectDisks() {
 		wg.Add(1)
 		go func(endpoint Endpoint) {
 			defer wg.Done()
-			disk, format, formatData, err := connectEndpoint(endpoint)
+			disk, format, err := connectEndpoint(endpoint)
 			if err != nil {
 				if endpoint.IsLocal && errors.Is(err, errUnformattedDisk) {
 					globalBackgroundHealState.pushHealLocalDisks(endpoint)
-				} else {
+				} else if !errors.Is(err, errDriveIsRoot) {
 					printEndpointError(endpoint, err, true)
 				}
 				return
@@ -261,16 +253,23 @@ func (s *erasureSets) connectDisks() {
 			}
 
 			disk.SetDiskID(format.Erasure.This)
-			disk.SetDiskLoc(s.poolIndex, setIndex, diskIndex)
-			disk.SetFormatData(formatData)
 			s.erasureDisks[setIndex][diskIndex] = disk
-			s.erasureDisksMu.Unlock()
 
-			if disk.IsLocal() && globalIsDistErasure {
+			if disk.IsLocal() {
 				globalLocalDrivesMu.Lock()
-				globalLocalSetDrives[s.poolIndex][setIndex][diskIndex] = disk
+				if globalIsDistErasure {
+					globalLocalSetDrives[s.poolIndex][setIndex][diskIndex] = disk
+				}
+				for i, ldisk := range globalLocalDrives {
+					_, k, l := ldisk.GetDiskLoc()
+					if k == setIndex && l == diskIndex {
+						globalLocalDrives[i] = disk
+						break
+					}
+				}
 				globalLocalDrivesMu.Unlock()
 			}
+			s.erasureDisksMu.Unlock()
 		}(endpoint)
 	}
 
@@ -316,15 +315,18 @@ func (s *erasureSets) GetLockers(setIndex int) func() ([]dsync.NetLocker, string
 	}
 }
 
+func (s *erasureSets) GetEndpointStrings(setIndex int) func() []string {
+	return func() []string {
+		eps := make([]string, s.setDriveCount)
+		copy(eps, s.endpointStrings[setIndex*s.setDriveCount:setIndex*s.setDriveCount+s.setDriveCount])
+		return eps
+	}
+}
+
 func (s *erasureSets) GetEndpoints(setIndex int) func() []Endpoint {
 	return func() []Endpoint {
-		s.erasureDisksMu.RLock()
-		defer s.erasureDisksMu.RUnlock()
-
 		eps := make([]Endpoint, s.setDriveCount)
-		for i := 0; i < s.setDriveCount; i++ {
-			eps[i] = s.endpoints.Endpoints[setIndex*s.setDriveCount+i]
-		}
+		copy(eps, s.endpoints.Endpoints[setIndex*s.setDriveCount:setIndex*s.setDriveCount+s.setDriveCount])
 		return eps
 	}
 }
@@ -366,7 +368,6 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 		setDriveCount:      setDriveCount,
 		defaultParityCount: defaultParityCount,
 		format:             format,
-		setReconnectEvent:  make(chan int),
 		distributionAlgo:   format.Erasure.DistributionAlgo,
 		deploymentID:       uuid.MustParse(format.ID),
 		poolIndex:          poolIdx,
@@ -436,28 +437,17 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 					diskID, err := disk.GetDiskID()
 					if err != nil {
 						if !errors.Is(err, errUnformattedDisk) {
-							logger.LogIf(ctx, err)
+							bootLogIf(ctx, err)
 						}
 						return
 					}
 					if diskID == "" {
 						return
 					}
-					m, n, err := findDiskIndexByDiskID(format, diskID)
-					if err != nil {
-						logger.LogIf(ctx, err)
-						return
-					}
-					if m != i || n != j {
-						logger.LogIf(ctx, fmt.Errorf("Detected unexpected drive ordering refusing to use the drive - poolID: %s, found drive mounted at (set=%s, drive=%s) expected mount at (set=%s, drive=%s): %s(%s)", humanize.Ordinal(poolIdx+1), humanize.Ordinal(m+1), humanize.Ordinal(n+1), humanize.Ordinal(i+1), humanize.Ordinal(j+1), disk, diskID))
-						s.erasureDisks[i][j] = &unrecognizedDisk{storage: disk}
-						return
-					}
-					disk.SetDiskLoc(s.poolIndex, m, n)
-					s.endpointStrings[m*setDriveCount+n] = disk.String()
-					s.erasureDisks[m][n] = disk
+					s.erasureDisks[i][j] = disk
 				}(disk, i, j)
 			}
+
 			innerWg.Wait()
 
 			// Initialize erasure objects for a given set.
@@ -469,6 +459,7 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 				getDisks:           s.GetDisks(i),
 				getLockers:         s.GetLockers(i),
 				getEndpoints:       s.GetEndpoints(i),
+				getEndpointStrings: s.GetEndpointStrings(i),
 				nsMutex:            mutex,
 			}
 		}(i)
@@ -550,10 +541,10 @@ func (s *erasureSets) cleanupStaleUploads(ctx context.Context) {
 }
 
 type auditObjectOp struct {
-	Name  string   `json:"name"`
-	Pool  int      `json:"poolId"`
-	Set   int      `json:"setId"`
-	Disks []string `json:"disks"`
+	Name   string   `json:"name"`
+	Pool   int      `json:"poolId"`
+	Set    int      `json:"setId"`
+	Drives []string `json:"drives"`
 }
 
 // Add erasure set information to the current context
@@ -562,18 +553,11 @@ func auditObjectErasureSet(ctx context.Context, object string, set *erasureObjec
 		return
 	}
 
-	object = decodeDirObject(object)
-	endpoints := set.getEndpoints()
-	disksEndpoints := make([]string, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		disksEndpoints = append(disksEndpoints, endpoint.String())
-	}
-
 	op := auditObjectOp{
-		Name:  object,
-		Pool:  set.poolIndex + 1,
-		Set:   set.setIndex + 1,
-		Disks: disksEndpoints,
+		Name:   decodeDirObject(object),
+		Pool:   set.poolIndex + 1,
+		Set:    set.setIndex + 1,
+		Drives: set.getEndpointStrings(),
 	}
 
 	logger.GetReqInfo(ctx).AppendTags("objectLocation", op)
@@ -665,14 +649,6 @@ func (s *erasureSets) Shutdown(ctx context.Context) error {
 			return err
 		}
 	}
-	select {
-	case _, ok := <-s.setReconnectEvent:
-		if ok {
-			xioutil.SafeClose(s.setReconnectEvent)
-		}
-	default:
-		xioutil.SafeClose(s.setReconnectEvent)
-	}
 	return nil
 }
 
@@ -733,7 +709,7 @@ func listDeletedBuckets(ctx context.Context, storageDisks []StorageAPI, delBucke
 				// we ignore disk not found errors
 				return nil
 			}
-			volsInfo, err := storageDisks[index].ListDir(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, deletedBucketsPrefix), -1)
+			volsInfo, err := storageDisks[index].ListDir(ctx, "", minioMetaBucket, pathJoin(bucketMetaPrefix, deletedBucketsPrefix), -1)
 			if err != nil {
 				if errors.Is(err, errFileNotFound) {
 					return nil
@@ -1078,7 +1054,7 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 	if !reflect.DeepEqual(s.format, refFormat) {
 		// Format is corrupted and unrecognized by the running instance.
-		logger.LogIf(ctx, fmt.Errorf("Unable to heal the newly replaced drives due to format.json inconsistencies, please engage MinIO support for further assistance: %w",
+		healingLogIf(ctx, fmt.Errorf("Unable to heal the newly replaced drives due to format.json inconsistencies, please engage MinIO support for further assistance: %w",
 			errCorruptedFormat))
 		return res, errCorruptedFormat
 	}
@@ -1107,7 +1083,7 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 				continue
 			}
 			if err := saveFormatErasure(storageDisks[index], format, formatOpID); err != nil {
-				logger.LogIf(ctx, fmt.Errorf("Drive %s failed to write updated 'format.json': %v", storageDisks[index], err))
+				healingLogIf(ctx, fmt.Errorf("Drive %s failed to write updated 'format.json': %v", storageDisks[index], err))
 				storageDisks[index].Close()
 				tmpNewFormats[index] = nil // this disk failed to write new format
 			}
@@ -1122,7 +1098,7 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 			m, n, err := findDiskIndexByDiskID(refFormat, format.Erasure.This)
 			if err != nil {
-				logger.LogIf(ctx, err)
+				healingLogIf(ctx, err)
 				continue
 			}
 
@@ -1132,18 +1108,15 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 			if disk := storageDisks[index]; disk != nil {
 				if disk.IsLocal() {
-					disk.SetDiskLoc(s.poolIndex, m, n)
-
 					xldisk, ok := disk.(*xlStorageDiskIDCheck)
 					if ok {
-						if driveQuorum {
-							commonWrites, commonDeletes := calcCommonWritesDeletes(currentDisksInfo[m], (s.setDriveCount+1)/2)
-							xldisk.totalWrites.Store(commonWrites)
-							xldisk.totalDeletes.Store(commonDeletes)
-							xldisk.storage.setWriteAttribute(commonWrites)
-							xldisk.storage.setDeleteAttribute(commonDeletes)
+						_, commonDeletes := calcCommonWritesDeletes(currentDisksInfo[m], (s.setDriveCount+1)/2)
+						xldisk.totalDeletes.Store(commonDeletes)
+						xldisk.storage.setDeleteAttribute(commonDeletes)
+
+						if globalDriveMonitoring {
+							go xldisk.monitorDiskWritable(xldisk.diskCtx)
 						}
-						go xldisk.monitorDiskWritable(xldisk.diskCtx)
 					}
 				} else {
 					disk.Close() // Close the remote storage client, re-initialize with healthchecks.
@@ -1151,14 +1124,22 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 					if err != nil {
 						continue
 					}
-					disk.SetDiskLoc(s.poolIndex, m, n)
 				}
 
 				s.erasureDisks[m][n] = disk
 
-				if disk.IsLocal() && globalIsDistErasure {
+				if disk.IsLocal() {
 					globalLocalDrivesMu.Lock()
-					globalLocalSetDrives[s.poolIndex][m][n] = disk
+					if globalIsDistErasure {
+						globalLocalSetDrives[s.poolIndex][m][n] = disk
+					}
+					for i, ldisk := range globalLocalDrives {
+						_, k, l := ldisk.GetDiskLoc()
+						if k == m && l == n {
+							globalLocalDrives[i] = disk
+							break
+						}
+					}
 					globalLocalDrivesMu.Unlock()
 				}
 			}

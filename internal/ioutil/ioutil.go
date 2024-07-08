@@ -20,7 +20,6 @@
 package ioutil
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -35,28 +34,21 @@ import (
 
 // Block sizes constant.
 const (
-	BlockSizeSmall       = 32 * humanize.KiByte // Default r/w block size for smaller objects.
-	BlockSizeLarge       = 2 * humanize.MiByte  // Default r/w block size for larger objects.
-	BlockSizeReallyLarge = 4 * humanize.MiByte  // Default write block size for objects per shard >= 64MiB
+	SmallBlock = 32 * humanize.KiByte // Default r/w block size for smaller objects.
+	LargeBlock = 1 * humanize.MiByte  // Default r/w block size for normal objects.
 )
 
 // aligned sync.Pool's
 var (
-	ODirectPoolXLarge = sync.Pool{
-		New: func() interface{} {
-			b := disk.AlignedBlock(BlockSizeReallyLarge)
-			return &b
-		},
-	}
 	ODirectPoolLarge = sync.Pool{
 		New: func() interface{} {
-			b := disk.AlignedBlock(BlockSizeLarge)
+			b := disk.AlignedBlock(LargeBlock)
 			return &b
 		},
 	}
 	ODirectPoolSmall = sync.Pool{
 		New: func() interface{} {
-			b := disk.AlignedBlock(BlockSizeSmall)
+			b := disk.AlignedBlock(SmallBlock)
 			return &b
 		},
 	}
@@ -105,13 +97,6 @@ type ioret[V any] struct {
 	err error
 }
 
-// DeadlineWriter deadline writer with timeout
-type DeadlineWriter struct {
-	io.WriteCloser
-	timeout time.Duration
-	err     error
-}
-
 // WithDeadline will execute a function with a deadline and return a value of a given type.
 // If the deadline/context passes before the function finishes executing,
 // the zero value and the context error is returned.
@@ -153,21 +138,17 @@ func NewDeadlineWorker(timeout time.Duration) *DeadlineWorker {
 // channel so that the work function can attempt to exit gracefully.
 // Multiple calls to Run will run independently of each other.
 func (d *DeadlineWorker) Run(work func() error) error {
-	c := make(chan ioret[struct{}], 1)
-	t := time.NewTimer(d.timeout)
-	go func() {
-		c <- ioret[struct{}]{val: struct{}{}, err: work()}
-	}()
+	_, err := WithDeadline[struct{}](context.Background(), d.timeout, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, work()
+	})
+	return err
+}
 
-	select {
-	case r := <-c:
-		if !t.Stop() {
-			<-t.C
-		}
-		return r.err
-	case <-t.C:
-		return context.DeadlineExceeded
-	}
+// DeadlineWriter deadline writer with timeout
+type DeadlineWriter struct {
+	io.WriteCloser
+	timeout time.Duration
+	err     error
 }
 
 // NewDeadlineWriter wraps a writer to make it respect given deadline
@@ -183,31 +164,21 @@ func (w *DeadlineWriter) Write(buf []byte) (int, error) {
 		return 0, w.err
 	}
 
-	c := make(chan ioret[int], 1)
-	t := time.NewTimer(w.timeout)
-	go func() {
-		n, err := w.WriteCloser.Write(buf)
-		c <- ioret[int]{val: n, err: err}
-		close(c)
-	}()
-
-	select {
-	case r := <-c:
-		if !t.Stop() {
-			<-t.C
-		}
-		w.err = r.err
-		return r.val, r.err
-	case <-t.C:
-		w.WriteCloser.Close()
-		w.err = context.DeadlineExceeded
-		return 0, context.DeadlineExceeded
-	}
+	n, err := WithDeadline[int](context.Background(), w.timeout, func(ctx context.Context) (int, error) {
+		return w.WriteCloser.Write(buf)
+	})
+	w.err = err
+	return n, err
 }
 
 // Close closer interface to close the underlying closer
 func (w *DeadlineWriter) Close() error {
-	return w.WriteCloser.Close()
+	err := w.WriteCloser.Close()
+	w.err = err
+	if err == nil {
+		w.err = errors.New("we are closed") // Avoids any reuse on the Write() side.
+	}
+	return err
 }
 
 // LimitWriter implements io.WriteCloser.
@@ -285,15 +256,26 @@ func (s *SkipReader) Read(p []byte) (int, error) {
 	if l == 0 {
 		return 0, nil
 	}
-	for s.skipCount > 0 {
-		if l > s.skipCount {
-			l = s.skipCount
+	if s.skipCount > 0 {
+		tmp := p
+		if s.skipCount > l && l < copyBufferSize {
+			// We may get a very small buffer, so we grab a temporary buffer.
+			bufp := copyBufPool.Get().(*[]byte)
+			buf := *bufp
+			tmp = buf[:copyBufferSize]
+			defer copyBufPool.Put(bufp)
+			l = int64(len(tmp))
 		}
-		n, err := s.Reader.Read(p[:l])
-		if err != nil {
-			return 0, err
+		for s.skipCount > 0 {
+			if l > s.skipCount {
+				l = s.skipCount
+			}
+			n, err := s.Reader.Read(tmp[:l])
+			if err != nil {
+				return 0, err
+			}
+			s.skipCount -= int64(n)
 		}
-		s.skipCount -= int64(n)
 	}
 	return s.Reader.Read(p)
 }
@@ -303,9 +285,11 @@ func NewSkipReader(r io.Reader, n int64) io.Reader {
 	return &SkipReader{r, n}
 }
 
+const copyBufferSize = 32 * 1024
+
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 32*1024)
+		b := make([]byte, copyBufferSize)
 		return &b
 	},
 }
@@ -314,6 +298,7 @@ var copyBufPool = sync.Pool{
 func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
 	bufp := copyBufPool.Get().(*[]byte)
 	buf := *bufp
+	buf = buf[:copyBufferSize]
 	defer copyBufPool.Put(bufp)
 
 	return io.CopyBuffer(dst, src, buf)
@@ -351,19 +336,6 @@ func CopyAligned(w io.Writer, r io.Reader, alignedBuf []byte, totalSize int64, f
 		return 0, nil
 	}
 
-	// Writes remaining bytes in the buffer.
-	writeUnaligned := func(w io.Writer, buf []byte) (remainingWritten int64, err error) {
-		// Disable O_DIRECT on fd's on unaligned buffer
-		// perform an amortized Fdatasync(fd) on the fd at
-		// the end, this is performed by the caller before
-		// closing 'w'.
-		if err = disk.DisableDirectIO(file); err != nil {
-			return remainingWritten, err
-		}
-		// Since w is *os.File io.Copy shall use ReadFrom() call.
-		return io.Copy(w, bytes.NewReader(buf))
-	}
-
 	var written int64
 	for {
 		buf := alignedBuf
@@ -381,15 +353,38 @@ func CopyAligned(w io.Writer, r io.Reader, alignedBuf []byte, totalSize int64, f
 		}
 
 		buf = buf[:nr]
-		var nw int64
-		if len(buf)%DirectioAlignSize == 0 {
-			var n int
+		var (
+			n  int
+			un int
+			nw int64
+		)
+
+		remain := len(buf) % DirectioAlignSize
+		if remain == 0 {
 			// buf is aligned for directio write()
 			n, err = w.Write(buf)
 			nw = int64(n)
 		} else {
+			if remain < len(buf) {
+				n, err = w.Write(buf[:len(buf)-remain])
+				if err != nil {
+					return written, err
+				}
+				nw = int64(n)
+			}
+
+			// Disable O_DIRECT on fd's on unaligned buffer
+			// perform an amortized Fdatasync(fd) on the fd at
+			// the end, this is performed by the caller before
+			// closing 'w'.
+			if err = disk.DisableDirectIO(file); err != nil {
+				return written, err
+			}
+
 			// buf is not aligned, hence use writeUnaligned()
-			nw, err = writeUnaligned(w, buf)
+			// for the remainder
+			un, err = w.Write(buf[len(buf)-remain:])
+			nw += int64(un)
 		}
 
 		if nw > 0 {

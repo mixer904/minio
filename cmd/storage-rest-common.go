@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -20,7 +20,7 @@ package cmd
 //go:generate msgp -file $GOFILE -unexported
 
 const (
-	storageRESTVersion       = "v55" // ReadAll, RenameFile migrate to websockets
+	storageRESTVersion       = "v59" // Change ReadOptions inclFreeVersions
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -43,32 +43,33 @@ const (
 	storageRESTMethodStatInfoFile   = "/statfile"
 	storageRESTMethodReadMultiple   = "/readmultiple"
 	storageRESTMethodCleanAbandoned = "/cleanabandoned"
-	storageRESTMethodLinkXL         = "/linkxl"
 )
 
 const (
-	storageRESTVolume        = "volume"
-	storageRESTVolumes       = "volumes"
-	storageRESTDirPath       = "dir-path"
-	storageRESTFilePath      = "file-path"
-	storageRESTVersionID     = "version-id"
-	storageRESTReadData      = "read-data"
-	storageRESTHealing       = "healing"
-	storageRESTTotalVersions = "total-versions"
-	storageRESTSrcVolume     = "source-volume"
-	storageRESTSrcPath       = "source-path"
-	storageRESTDstVolume     = "destination-volume"
-	storageRESTDstPath       = "destination-path"
-	storageRESTOffset        = "offset"
-	storageRESTLength        = "length"
-	storageRESTCount         = "count"
-	storageRESTBitrotAlgo    = "bitrot-algo"
-	storageRESTBitrotHash    = "bitrot-hash"
-	storageRESTDiskID        = "disk-id"
-	storageRESTForceDelete   = "force-delete"
-	storageRESTGlob          = "glob"
-	storageRESTMetrics       = "metrics"
-	storageRESTDriveQuorum   = "drive-quorum"
+	storageRESTVolume           = "volume"
+	storageRESTVolumes          = "volumes"
+	storageRESTDirPath          = "dir-path"
+	storageRESTFilePath         = "file-path"
+	storageRESTVersionID        = "version-id"
+	storageRESTReadData         = "read-data"
+	storageRESTHealing          = "healing"
+	storageRESTTotalVersions    = "total-versions"
+	storageRESTSrcVolume        = "source-volume"
+	storageRESTSrcPath          = "source-path"
+	storageRESTDstVolume        = "destination-volume"
+	storageRESTDstPath          = "destination-path"
+	storageRESTOffset           = "offset"
+	storageRESTLength           = "length"
+	storageRESTCount            = "count"
+	storageRESTBitrotAlgo       = "bitrot-algo"
+	storageRESTBitrotHash       = "bitrot-hash"
+	storageRESTDiskID           = "disk-id"
+	storageRESTForceDelete      = "force-delete"
+	storageRESTGlob             = "glob"
+	storageRESTMetrics          = "metrics"
+	storageRESTDriveQuorum      = "drive-quorum"
+	storageRESTOrigVolume       = "orig-volume"
+	storageRESTInclFreeVersions = "incl-free-versions"
 )
 
 type nsScannerOptions struct {

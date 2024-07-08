@@ -31,8 +31,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/dsync"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // list all errors that can be ignore in a bucket operation.
@@ -58,9 +57,13 @@ type erasureObjects struct {
 	// getLockers returns list of remote and local lockers.
 	getLockers func() ([]dsync.NetLocker, string)
 
-	// getEndpoints returns list of endpoint strings belonging this set.
+	// getEndpoints returns list of endpoint belonging this set.
 	// some may be local and some remote.
 	getEndpoints func() []Endpoint
+
+	// getEndpoints returns list of endpoint strings belonging this set.
+	// some may be local and some remote.
+	getEndpointStrings func() []string
 
 	// Locker mutex map.
 	nsMutex *nsLockMap
@@ -99,6 +102,8 @@ func diskErrToDriveState(err error) (state string) {
 		state = madmin.DriveStatePermission
 	case errors.Is(err, errFaultyDisk):
 		state = madmin.DriveStateFaulty
+	case errors.Is(err, errDriveIsRoot):
+		state = madmin.DriveStateRootMount
 	case err == nil:
 		state = madmin.DriveStateOk
 	default:
@@ -172,6 +177,7 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) (disks
 				PoolIndex: endpoints[index].PoolIdx,
 				SetIndex:  endpoints[index].SetIdx,
 				DiskIndex: endpoints[index].DiskIdx,
+				Local:     endpoints[index].IsLocal,
 			}
 			if disks[index] == OfflineDisk {
 				di.State = diskErrToDriveState(errDiskNotFound)
@@ -203,7 +209,6 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) (disks
 				APICalls:                make(map[string]uint64, len(info.Metrics.APICalls)),
 				TotalErrorsAvailability: info.Metrics.TotalErrorsAvailability,
 				TotalErrorsTimeout:      info.Metrics.TotalErrorsTimeout,
-				TotalTokens:             info.Metrics.TotalTokens,
 				TotalWaiting:            info.Metrics.TotalWaiting,
 			}
 			for k, v := range info.Metrics.LastMinute {
@@ -269,11 +274,11 @@ func (er erasureObjects) LocalStorageInfo(ctx context.Context, metrics bool) Sto
 }
 
 // getOnlineDisksWithHealingAndInfo - returns online disks and overall healing status.
-// Disks are randomly ordered, but in the following groups:
+// Disks are ordered in the following groups:
 // - Non-scanning disks
 // - Non-healing disks
 // - Healing disks (if inclHealing is true)
-func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (newDisks []StorageAPI, newInfos []DiskInfo, healing bool) {
+func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (newDisks []StorageAPI, newInfos []DiskInfo, healing int) {
 	var wg sync.WaitGroup
 	disks := er.getDisks()
 	infos := make([]DiskInfo, len(disks))
@@ -312,7 +317,7 @@ func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (new
 			continue
 		}
 		if info.Healing {
-			healing = true
+			healing++
 			if inclHealing {
 				healingDisks = append(healingDisks, disks[i])
 				healingInfos = append(healingInfos, infos[i])
@@ -340,32 +345,32 @@ func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (new
 	return newDisks, newInfos, healing
 }
 
-func (er erasureObjects) getOnlineDisksWithHealing(inclHealing bool) (newDisks []StorageAPI, healing bool) {
-	newDisks, _, healing = er.getOnlineDisksWithHealingAndInfo(inclHealing)
-	return
+func (er erasureObjects) getOnlineDisksWithHealing(inclHealing bool) ([]StorageAPI, bool) {
+	newDisks, _, healing := er.getOnlineDisksWithHealingAndInfo(inclHealing)
+	return newDisks, healing > 0
 }
 
 // Clean-up previously deleted objects. from .minio.sys/tmp/.trash/
 func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
-	// run multiple cleanup's local to this server.
 	var wg sync.WaitGroup
 	for _, disk := range er.getLocalDisks() {
-		if disk != nil {
-			wg.Add(1)
-			go func(disk StorageAPI) {
-				defer wg.Done()
-				diskPath := disk.Endpoint().Path
-				readDirFn(pathJoin(diskPath, minioMetaTmpDeletedBucket), func(ddir string, typ os.FileMode) error {
-					w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
-					return w.Run(func() error {
-						wait := deletedCleanupSleeper.Timer(ctx)
-						removeAll(pathJoin(diskPath, minioMetaTmpDeletedBucket, ddir))
-						wait()
-						return nil
-					})
-				})
-			}(disk)
+		if disk == nil {
+			continue
 		}
+		wg.Add(1)
+		go func(disk StorageAPI) {
+			defer wg.Done()
+			drivePath := disk.Endpoint().Path
+			readDirFn(pathJoin(drivePath, minioMetaTmpDeletedBucket), func(ddir string, typ os.FileMode) error {
+				w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
+				return w.Run(func() error {
+					wait := deleteCleanupSleeper.Timer(ctx)
+					removeAll(pathJoin(drivePath, minioMetaTmpDeletedBucket, ddir))
+					wait()
+					return nil
+				})
+			})
+		}(disk)
 	}
 	wg.Wait()
 }
@@ -380,7 +385,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 	// Collect disks we can use.
 	disks, healing := er.getOnlineDisksWithHealing(false)
 	if len(disks) == 0 {
-		logger.LogIf(ctx, errors.New("data-scanner: all drives are offline or being healed, skipping scanner cycle"))
+		scannerLogIf(ctx, errors.New("data-scanner: all drives are offline or being healed, skipping scanner cycle"))
 		return nil
 	}
 
@@ -445,7 +450,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				if cache.Info.LastUpdate.Equal(lastSave) {
 					continue
 				}
-				logger.LogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-cache-update")
+				scannerLogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-cache-update")
 				updates <- cache.clone()
 
 				lastSave = cache.Info.LastUpdate
@@ -454,7 +459,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 					// Save final state...
 					cache.Info.NextCycle = wantCycle
 					cache.Info.LastUpdate = time.Now()
-					logger.LogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-channel-closed")
+					scannerLogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-channel-closed")
 					updates <- cache.clone()
 					return
 				}
@@ -490,14 +495,13 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				// Load cache for bucket
 				cacheName := pathJoin(bucket.Name, dataUsageCacheName)
 				cache := dataUsageCache{}
-				logger.LogIf(ctx, cache.load(ctx, er, cacheName))
+				scannerLogIf(ctx, cache.load(ctx, er, cacheName))
 				if cache.Info.Name == "" {
 					cache.Info.Name = bucket.Name
 				}
 				cache.Info.SkipHealing = healing
 				cache.Info.NextCycle = wantCycle
 				if cache.Info.Name != bucket.Name {
-					logger.LogIf(ctx, fmt.Errorf("cache name mismatch: %s != %s", cache.Info.Name, bucket.Name))
 					cache.Info = dataUsageCacheInfo{
 						Name:       bucket.Name,
 						LastUpdate: time.Time{},
@@ -527,9 +531,9 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode, nil)
 				if err != nil {
 					if !cache.Info.LastUpdate.IsZero() && cache.Info.LastUpdate.After(before) {
-						logger.LogIf(ctx, cache.save(ctx, er, cacheName))
+						scannerLogIf(ctx, cache.save(ctx, er, cacheName))
 					} else {
-						logger.LogIf(ctx, err)
+						scannerLogIf(ctx, err)
 					}
 					// This ensures that we don't close
 					// bucketResults channel while the
@@ -540,9 +544,13 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				}
 
 				wg.Wait()
+				// Flatten for upstream, but save full state.
 				var root dataUsageEntry
 				if r := cache.root(); r != nil {
 					root = cache.flatten(*r)
+					if root.ReplicationStats.empty() {
+						root.ReplicationStats = nil
+					}
 				}
 				select {
 				case <-ctx.Done():
@@ -555,7 +563,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				}
 
 				// Save cache
-				logger.LogIf(ctx, cache.save(ctx, er, cacheName))
+				scannerLogIf(ctx, cache.save(ctx, er, cacheName))
 			}
 		}(i)
 	}

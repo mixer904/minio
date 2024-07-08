@@ -27,10 +27,10 @@ import (
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
@@ -267,7 +267,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 		// Continue to towards the next part.
 		partOffset -= part.Size
 	}
-	logger.LogIf(ctx, InvalidRange{})
+	internalLogIf(ctx, InvalidRange{})
 	// Offset beyond the size of the object return InvalidRange.
 	return 0, 0, InvalidRange{}
 }
@@ -275,7 +275,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
 	// with less quorum return error.
 	if quorum < 1 {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 	metaHashes := make([]string, len(metaArr))
 	h := sha256.New()
@@ -300,17 +300,23 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 				fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
 			}
 
-			// ILM transition fields
-			fmt.Fprint(h, meta.TransitionStatus)
-			fmt.Fprint(h, meta.TransitionTier)
-			fmt.Fprint(h, meta.TransitionedObjName)
-			fmt.Fprint(h, meta.TransitionVersionID)
+			if meta.IsRemote() {
+				// ILM transition fields
+				fmt.Fprint(h, meta.TransitionStatus)
+				fmt.Fprint(h, meta.TransitionTier)
+				fmt.Fprint(h, meta.TransitionedObjName)
+				fmt.Fprint(h, meta.TransitionVersionID)
+			}
 
-			// Server-side replication fields
-			fmt.Fprintf(h, "%v", meta.MarkDeleted)
-			fmt.Fprint(h, meta.Metadata[string(meta.ReplicationState.ReplicaStatus)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationStatusInternal])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.VersionPurgeStatusInternal])
+			// If metadata says encrypted, ask for it in quorum.
+			if etyp, ok := crypto.IsEncrypted(meta.Metadata); ok {
+				fmt.Fprint(h, etyp)
+			}
+
+			// If compressed, look for compressed FileInfo only
+			if meta.IsCompressed() {
+				fmt.Fprint(h, meta.Metadata[ReservedMetadataPrefix+"compression"])
+			}
 
 			metaHashes[i] = hex.EncodeToString(h.Sum(nil))
 			h.Reset()
@@ -335,12 +341,17 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	}
 
 	if maxCount < quorum {
-		return FileInfo{}, errErasureReadQuorum
+		return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 	}
 
-	// Find the successor mod time in quorum, otherwise leave the
-	// candidate's successor modTime as found
-	succModTimeMap := make(map[time.Time]int)
+	// objProps represents properties that go beyond a single version
+	type objProps struct {
+		succModTime time.Time
+		numVersions int
+	}
+	// Find the successor mod time and numVersions in quorum, otherwise leave the
+	// candidate as found
+	otherPropsMap := make(counterMap[objProps])
 	var candidate FileInfo
 	var found bool
 	for i, hash := range metaHashes {
@@ -350,28 +361,25 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 					candidate = metaArr[i]
 					found = true
 				}
-				succModTimeMap[metaArr[i].SuccessorModTime]++
+				props := objProps{
+					succModTime: metaArr[i].SuccessorModTime,
+					numVersions: metaArr[i].NumVersions,
+				}
+				otherPropsMap[props]++
 			}
-		}
-	}
-	var succModTime time.Time
-	var smodTimeQuorum bool
-	for smodTime, count := range succModTimeMap {
-		if count >= quorum {
-			smodTimeQuorum = true
-			succModTime = smodTime
-			break
 		}
 	}
 
 	if found {
-		if smodTimeQuorum {
-			candidate.SuccessorModTime = succModTime
-			candidate.IsLatest = succModTime.IsZero()
+		// Update candidate FileInfo with succModTime and numVersions in quorum when available
+		if props, ok := otherPropsMap.GetValueWithQuorum(quorum); ok {
+			candidate.SuccessorModTime = props.succModTime
+			candidate.IsLatest = props.succModTime.IsZero()
+			candidate.NumVersions = props.numVersions
 		}
 		return candidate, nil
 	}
-	return FileInfo{}, errErasureReadQuorum
+	return FileInfo{}, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInconsistentMeta}
 }
 
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
@@ -381,7 +389,7 @@ func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Tim
 }
 
 // writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
-func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	// Start writing `xl.meta` to all disks in parallel.
@@ -395,9 +403,9 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 			fi := files[index]
 			fi.Erasure.Index = index + 1
 			if fi.IsValid() {
-				return disks[index].WriteMetadata(ctx, bucket, prefix, fi)
+				return disks[index].WriteMetadata(ctx, origbucket, bucket, prefix, fi)
 			}
-			return errCorruptedFormat
+			return errFileCorrupt
 		}, index)
 	}
 
@@ -492,15 +500,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 	parities := listObjectParities(partsMetaData, errs)
 	parityBlocks := commonParity(parities, defaultParityCount)
 	if parityBlocks < 0 {
-		return -1, -1, errErasureReadQuorum
-	}
-
-	if parityBlocks == 0 {
-		// For delete markers do not use 'defaultParityCount' as it is not expected to be the case.
-		// Use maximum allowed read quorum instead, writeQuorum+1 is returned for compatibility sake
-		// but there are no callers that shall be using this.
-		readQuorum := len(partsMetaData) / 2
-		return readQuorum, readQuorum + 1, nil
+		return -1, -1, InsufficientReadQuorum{Err: errErasureReadQuorum, Type: RQInsufficientOnlineDrives}
 	}
 
 	dataBlocks := len(partsMetaData) - parityBlocks
@@ -518,6 +518,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 const (
 	tierFVID     = "tier-free-versionID"
 	tierFVMarker = "tier-free-marker"
+	tierSkipFVID = "tier-skip-fvid"
 )
 
 // SetTierFreeVersionID sets free-version's versionID. This method is used by
@@ -542,6 +543,23 @@ func (fi *FileInfo) SetTierFreeVersion() {
 		fi.Metadata = make(map[string]string)
 	}
 	fi.Metadata[ReservedMetadataPrefixLower+tierFVMarker] = ""
+}
+
+// SetSkipTierFreeVersion indicates to skip adding a tier free version id.
+// Note: Used only when expiring tiered objects and the remote content has
+// already been scheduled for deletion
+func (fi *FileInfo) SetSkipTierFreeVersion() {
+	if fi.Metadata == nil {
+		fi.Metadata = make(map[string]string)
+	}
+	fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID] = ""
+}
+
+// SkipTierFreeVersion returns true if set, false otherwise.
+// See SetSkipTierVersion for its purpose.
+func (fi *FileInfo) SkipTierFreeVersion() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID]
+	return ok
 }
 
 // TierFreeVersion returns true if version is a free-version.

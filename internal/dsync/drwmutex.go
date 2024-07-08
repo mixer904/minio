@@ -28,8 +28,8 @@ import (
 
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
 )
 
 // Indicator if logging is enabled.
@@ -254,7 +254,7 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 				log("lockBlocking %s/%s for %#v: granted\n", id, source, dm.Names)
 
 				// Refresh lock continuously and cancel if there is no quorum in the lock anymore
-				dm.startContinousLockRefresh(lockLossCallback, id, source, quorum)
+				dm.startContinuousLockRefresh(lockLossCallback, id, source, quorum)
 
 				return locked
 			}
@@ -272,7 +272,7 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 	}
 }
 
-func (dm *DRWMutex) startContinousLockRefresh(lockLossCallback func(), id, source string, quorum int) {
+func (dm *DRWMutex) startContinuousLockRefresh(lockLossCallback func(), id, source string, quorum int) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dm.m.Lock()
@@ -639,9 +639,17 @@ func (dm *DRWMutex) Unlock(ctx context.Context) {
 	tolerance := len(restClnts) / 2
 
 	isReadLock := false
-	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
-	}
+	started := time.Now()
+	// Do async unlocking.
+	// This means unlock will no longer block on the network or missing quorum.
+	go func() {
+		for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
+			if time.Since(started) > dm.clnt.Timeouts.UnlockCall {
+				return
+			}
+		}
+	}()
 }
 
 // RUnlock releases a read lock held on dm.
@@ -678,11 +686,20 @@ func (dm *DRWMutex) RUnlock(ctx context.Context) {
 
 	// Tolerance is not set, defaults to half of the locker clients.
 	tolerance := len(restClnts) / 2
-
 	isReadLock := true
-	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
-	}
+	started := time.Now()
+	// Do async unlocking.
+	// This means unlock will no longer block on the network or missing quorum.
+	go func() {
+		for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
+			// If we have been waiting for more than the force unlock timeout, return
+			// Remotes will have canceled due to the missing refreshes anyway.
+			if time.Since(started) > dm.clnt.Timeouts.UnlockCall {
+				return
+			}
+		}
+	}()
 }
 
 // sendRelease sends a release message to a node that previously granted a lock

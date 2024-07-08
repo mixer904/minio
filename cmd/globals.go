@@ -34,6 +34,7 @@ import (
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/browser"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
 	"go.uber.org/atomic"
@@ -55,8 +56,9 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/v2/certs"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/certs"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // minio configuration related constants.
@@ -129,6 +131,11 @@ const (
 	tlsClientSessionCacheSize = 100
 )
 
+func init() {
+	// Injected to prevent circular dependency.
+	pubsub.GetByteBuffer = grid.GetByteBuffer
+}
+
 type poolDisksLayout struct {
 	cmdline string
 	layout  [][]string
@@ -153,14 +160,15 @@ type serverCtxt struct {
 	FTP  []string
 	SFTP []string
 
-	UserTimeout       time.Duration
-	ConnReadDeadline  time.Duration
-	ConnWriteDeadline time.Duration
+	MemLimit uint64
 
-	ShutdownTimeout   time.Duration
-	IdleTimeout       time.Duration
-	ReadHeaderTimeout time.Duration
+	UserTimeout         time.Duration
+	IdleTimeout         time.Duration
+	ReadHeaderTimeout   time.Duration
+	MaxIdleConnsPerHost int
 
+	SendBufSize, RecvBufSize int
+	CrossDomainXML           string
 	// The layout of disks as interpreted
 	Layout disksLayout
 }
@@ -197,9 +205,8 @@ var (
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
-	globalSite = config.Site{
-		Region: globalMinioDefaultRegion,
-	}
+	// Captures site name and region
+	globalSite config.Site
 
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
@@ -230,7 +237,7 @@ var (
 	globalBucketMonitor     *bandwidth.Monitor
 	globalPolicySys         *PolicySys
 	globalIAMSys            *IAMSys
-	globalBytePoolCap       *bpool.BytePoolCap
+	globalBytePoolCap       atomic.Pointer[bpool.BytePoolCap]
 
 	globalLifecycleSys       *LifecycleSys
 	globalBucketSSEConfigSys *BucketSSEConfigSys
@@ -302,7 +309,8 @@ var (
 	// Time when the server is started
 	globalBootTime = UTCNow()
 
-	globalActiveCred auth.Credentials
+	globalActiveCred         auth.Credentials
+	globalSiteReplicatorCred siteReplicatorCred
 
 	// Captures if root credentials are set via ENV.
 	globalCredViaEnv bool
@@ -336,7 +344,7 @@ var (
 	globalDNSConfig dns.Store
 
 	// GlobalKMS initialized KMS configuration
-	GlobalKMS kms.KMS
+	GlobalKMS *kms.KMS
 
 	// Common lock for various subsystems performing the leader tasks
 	globalLeaderLock *sharedLock
@@ -369,13 +377,15 @@ var (
 		return *ptr
 	}
 
-	globalAllHealState *allHealState
+	globalAllHealState = newHealState(GlobalContext, true)
 
 	// The always present healing routine ready to heal objects
-	globalBackgroundHealRoutine *healRoutine
-	globalBackgroundHealState   *allHealState
+	globalBackgroundHealRoutine = newHealRoutine()
+	globalBackgroundHealState   = newHealState(GlobalContext, false)
 
-	globalMRFState mrfState
+	globalMRFState = mrfState{
+		opCh: make(chan partialOperation, mrfOpsQueueSize),
+	}
 
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
@@ -383,8 +393,6 @@ var (
 	globalProxyEndpoints []ProxyEndpoint
 
 	globalInternodeTransport http.RoundTripper
-
-	globalProxyTransport http.RoundTripper
 
 	globalRemoteTargetTransport http.RoundTripper
 
@@ -396,8 +404,6 @@ var (
 
 	globalTierConfigMgr *TierConfigMgr
 
-	globalTierJournal *TierJournal
-
 	globalConsoleSrv *consoleapi.Server
 
 	// handles service freeze or un-freeze S3 API calls.
@@ -408,9 +414,12 @@ var (
 	globalServiceFreezeMu  sync.Mutex // Updates.
 
 	// List of local drives to this node, this is only set during server startup,
-	// and should never be mutated. Hold globalLocalDrivesMu to access.
-	globalLocalDrives   []StorageAPI
-	globalLocalDrivesMu sync.RWMutex
+	// and is only mutated by HealFormat. Hold globalLocalDrivesMu to access.
+	globalLocalDrives    []StorageAPI
+	globalLocalDrivesMap = make(map[string]StorageAPI)
+	globalLocalDrivesMu  sync.RWMutex
+
+	globalDriveMonitoring = env.Get("_MINIO_DRIVE_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn
 
 	// Is MINIO_CI_CD set?
 	globalIsCICD bool
@@ -434,14 +443,14 @@ var (
 	subnetAdminPublicKey    = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEAyC+ol5v0FP+QcsR6d1KypR/063FInmNEFsFzbEwlHQyEQN3O7kNI\nwVDN1vqp1wDmJYmv4VZGRGzfFw1q+QV7K1TnysrEjrqpVxfxzDQCoUadAp8IxLLc\ns2fjyDNxnZjoC6fTID9C0khKnEa5fPZZc3Ihci9SiCGkPmyUyCGVSxWXIKqL2Lrj\nyDc0pGeEhWeEPqw6q8X2jvTC246tlzqpDeNsPbcv2KblXRcKniQNbBrizT37CKHQ\nM6hc9kugrZbFuo8U5/4RQvZPJnx/DVjLDyoKo2uzuVQs4s+iBrA5sSSLp8rPED/3\n6DgWw3e244Dxtrg972dIT1IOqgn7KUJzVQIDAQAB\n-----END PUBLIC KEY-----")
 	subnetAdminPublicKeyDev = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEArhQYXQd6zI4uagtVfthAPOt6i4AYHnEWCoNeAovM4MNl42I9uQFh\n3VHkbWj9Gpx9ghf6PgRgK+8FcFvy+StmGcXpDCiFywXX24uNhcZjscX1C4Esk0BW\nidfI2eXYkOlymD4lcK70SVgJvC693Qa7Z3FE1KU8Nfv2bkxEE4bzOkojX9t6a3+J\nR8X6Z2U8EMlH1qxJPgiPogELhWP0qf2Lq7GwSAflo1Tj/ytxvD12WrnE0Rrj/8yP\nSnp7TbYm91KocKMExlmvx3l2XPLxeU8nf9U0U+KOmorejD3MDMEPF+tlk9LB3JWP\nZqYYe38rfALVTn4RVJriUcNOoEpEyC0WEwIDAQAB\n-----END PUBLIC KEY-----")
 
-	globalConnReadDeadline  time.Duration
-	globalConnWriteDeadline time.Duration
+	// dynamic sleeper to avoid thundering herd for trash folder expunge routine
+	deleteCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)
 
-	// Controller for deleted file sweeper.
-	deletedCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)
+	// dynamic sleeper for multipart expiration routine
+	deleteMultipartCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)
 
-	// Is _MINIO_DISABLE_API_FREEZE_ON_BOOT set?
-	globalDisableFreezeOnBoot bool
+	// Is MINIO_SYNC_BOOT set?
+	globalEnableSyncBoot bool
 
 	// Contains NIC interface name used for internode communication
 	globalInternodeInterface     string
@@ -455,6 +464,7 @@ var (
 
 	// Indicates if server was started as `--address ":0"`
 	globalDynamicAPIPort bool
+
 	// Add new variable global values here.
 )
 

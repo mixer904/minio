@@ -84,7 +84,7 @@ func TestParseLegalHoldStatus(t *testing.T) {
 }
 
 // TestUnmarshalDefaultRetention checks if default retention
-// marshaling and unmarshaling work as expected
+// marshaling and unmarshalling work as expected
 func TestUnmarshalDefaultRetention(t *testing.T) {
 	days := uint64(4)
 	years := uint64(1)
@@ -606,7 +606,7 @@ func TestFilterObjectLockMetadata(t *testing.T) {
 
 	for i, tt := range tests {
 		o := FilterObjectLockMetadata(tt.metadata, tt.filterRetention, tt.filterLegalHold)
-		if !reflect.DeepEqual(o, tt.metadata) {
+		if !reflect.DeepEqual(o, tt.expected) {
 			t.Fatalf("Case %d expected %v, got %v", i, tt.metadata, o)
 		}
 	}

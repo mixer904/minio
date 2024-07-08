@@ -36,8 +36,10 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
+
+const logSubsys = "internodes"
 
 // DefaultTimeout - default REST timeout is 10 seconds.
 const DefaultTimeout = 10 * time.Second
@@ -284,11 +286,22 @@ func (c *Client) dumpHTTP(req *http.Request, resp *http.Response) {
 	return
 }
 
+// ErrClientClosed returned when *Client is closed.
+var ErrClientClosed = errors.New("rest client is closed")
+
 // Call - make a REST call with context.
 func (c *Client) Call(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
-	if !c.IsOnline() {
+	switch atomic.LoadInt32(&c.connected) {
+	case closed:
+		// client closed, this is usually a manual process
+		// so return a local error as client is closed
+		return nil, &NetworkError{Err: ErrClientClosed}
+	case offline:
+		// client offline, return last error captured.
 		return nil, &NetworkError{Err: c.LastError()}
 	}
+
+	// client is still connected, attempt the request.
 
 	// Shallow copy. We don't modify the *UserInfo, if set.
 	// All other fields are copied.
@@ -316,7 +329,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 				atomic.AddUint64(&globalStats.errs, 1)
 			}
 			if c.MarkOffline(err) {
-				logger.LogOnceIf(ctx, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
+				logger.LogOnceIf(ctx, logSubsys, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
 			}
 		}
 		return nil, &NetworkError{err}
@@ -340,7 +353,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 		// instead, see cmd/storage-rest-server.go for ideas.
 		if c.HealthCheckFn != nil && resp.StatusCode == http.StatusPreconditionFailed {
 			err = fmt.Errorf("Marking %s offline temporarily; caused by PreconditionFailed with drive ID mismatch", c.url.Host)
-			logger.LogOnceIf(ctx, err, c.url.Host)
+			logger.LogOnceIf(ctx, logSubsys, err, c.url.Host)
 			c.MarkOffline(err)
 		}
 		defer xhttp.DrainBody(resp.Body)
@@ -352,7 +365,7 @@ func (c *Client) Call(ctx context.Context, method string, values url.Values, bod
 					atomic.AddUint64(&globalStats.errs, 1)
 				}
 				if c.MarkOffline(err) {
-					logger.LogOnceIf(ctx, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
+					logger.LogOnceIf(ctx, logSubsys, fmt.Errorf("Marking %s offline temporarily; caused by %w", c.url.Host, err), c.url.Host)
 				}
 			}
 			return nil, err
@@ -388,11 +401,9 @@ func NewClient(uu *url.URL, tr http.RoundTripper, newAuthToken func(aud string) 
 
 	// Transport is exactly same as Go default in https://golang.org/pkg/net/http/#RoundTripper
 	// except custom DialContext and TLSClientConfig.
-	return &Client{
+	clnt := &Client{
 		httpClient:               &http.Client{Transport: tr},
 		url:                      u,
-		lastErr:                  err,
-		lastErrTime:              time.Now(),
 		newAuthToken:             newAuthToken,
 		connected:                connected,
 		lastConn:                 time.Now().UnixNano(),
@@ -400,6 +411,16 @@ func NewClient(uu *url.URL, tr http.RoundTripper, newAuthToken func(aud string) 
 		HealthCheckReconnectUnit: 200 * time.Millisecond,
 		HealthCheckTimeout:       time.Second,
 	}
+	if err != nil {
+		clnt.lastErr = err
+		clnt.lastErrTime = time.Now()
+	}
+
+	if clnt.HealthCheckFn != nil {
+		// make connection pre-emptively.
+		go clnt.HealthCheckFn()
+	}
+	return clnt
 }
 
 // IsOnline returns whether the client is likely to be online.
@@ -441,15 +462,7 @@ func exponentialBackoffWait(r *rand.Rand, unit, cap time.Duration) func(uint) ti
 	}
 }
 
-// MarkOffline - will mark a client as being offline and spawns
-// a goroutine that will attempt to reconnect if HealthCheckFn is set.
-// returns true if the node changed state from online to offline
-func (c *Client) MarkOffline(err error) bool {
-	c.Lock()
-	c.lastErr = err
-	c.lastErrTime = time.Now()
-	atomic.StoreInt64(&c.lastConn, time.Now().UnixNano())
-	c.Unlock()
+func (c *Client) runHealthCheck() bool {
 	// Start goroutine that will attempt to reconnect.
 	// If server is already trying to reconnect this will have no effect.
 	if c.HealthCheckFn != nil && atomic.CompareAndSwapInt32(&c.connected, online, offline) {
@@ -469,7 +482,7 @@ func (c *Client) MarkOffline(err error) bool {
 					if atomic.CompareAndSwapInt32(&c.connected, offline, online) {
 						now := time.Now()
 						disconnected := now.Sub(c.LastConn())
-						logger.Info("Client '%s' re-connected in %s", c.url.String(), disconnected)
+						logger.Event(context.Background(), "healthcheck", "Client '%s' re-connected in %s", c.url.String(), disconnected)
 						atomic.StoreInt64(&c.lastConn, now.UnixNano())
 					}
 					return
@@ -481,4 +494,17 @@ func (c *Client) MarkOffline(err error) bool {
 		return true
 	}
 	return false
+}
+
+// MarkOffline - will mark a client as being offline and spawns
+// a goroutine that will attempt to reconnect if HealthCheckFn is set.
+// returns true if the node changed state from online to offline
+func (c *Client) MarkOffline(err error) bool {
+	c.Lock()
+	c.lastErr = err
+	c.lastErrTime = time.Now()
+	atomic.StoreInt64(&c.lastConn, time.Now().UnixNano())
+	c.Unlock()
+
+	return c.runHealthCheck()
 }

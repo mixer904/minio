@@ -20,7 +20,9 @@ package grid
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -29,7 +31,6 @@ import (
 	"github.com/gobwas/ws/wsutil"
 	"github.com/google/uuid"
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
 )
@@ -120,7 +121,7 @@ func NewManager(ctx context.Context, o ManagerOptions) (*Manager, error) {
 		})
 	}
 	if !found {
-		return nil, fmt.Errorf("grid: local host not found")
+		return nil, fmt.Errorf("grid: local host (%s) not found in cluster setup", o.Local)
 	}
 
 	return m, nil
@@ -142,7 +143,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 			if r := recover(); r != nil {
 				debug.PrintStack()
 				err := fmt.Errorf("grid: panic: %v\n", r)
-				logger.LogIf(context.Background(), err, err.Error())
+				gridLogIf(context.Background(), err, err.Error())
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 		}()
@@ -151,7 +152,7 @@ func (m *Manager) Handler() http.HandlerFunc {
 		}
 		ctx := req.Context()
 		if err := m.authRequest(req); err != nil {
-			logger.LogOnceIf(ctx, fmt.Errorf("auth %s: %w", req.RemoteAddr, err), req.RemoteAddr+err.Error())
+			gridLogOnceIf(ctx, fmt.Errorf("auth %s: %w", req.RemoteAddr, err), req.RemoteAddr)
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -168,7 +169,10 @@ func (m *Manager) Handler() http.HandlerFunc {
 			if err == nil {
 				return
 			}
-			logger.LogOnceIf(ctx, err, err.Error())
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			gridLogOnceIf(ctx, err, req.RemoteAddr)
 			resp := connectResp{
 				ID:             m.ID,
 				Accepted:       false,
@@ -250,7 +254,7 @@ func (m *Manager) RegisterSingleHandler(id HandlerID, h SingleHandlerFn, subrout
 
 	if len(subroute) == 0 {
 		if m.handlers.hasAny(id) && !id.isTestHandler() {
-			return ErrHandlerAlreadyExists
+			return fmt.Errorf("handler %v: %w", id.String(), ErrHandlerAlreadyExists)
 		}
 
 		m.handlers.single[id] = h
@@ -258,7 +262,7 @@ func (m *Manager) RegisterSingleHandler(id HandlerID, h SingleHandlerFn, subrout
 	}
 	subID := makeSubHandlerID(id, s)
 	if m.handlers.hasSubhandler(subID) && !id.isTestHandler() {
-		return ErrHandlerAlreadyExists
+		return fmt.Errorf("handler %v, subroute:%v: %w", id.String(), s, ErrHandlerAlreadyExists)
 	}
 	m.handlers.subSingle[subID] = h
 	// Copy so clients can also pick it up for other subpaths.
@@ -329,4 +333,14 @@ func (m *Manager) debugMsg(d debugMsg, args ...any) {
 	for _, c := range m.targets {
 		c.debugMsg(d, args...)
 	}
+}
+
+// ConnStats returns the connection statistics for all connections.
+func (m *Manager) ConnStats() madmin.RPCMetrics {
+	var res madmin.RPCMetrics
+	for _, c := range m.targets {
+		t := c.Stats()
+		res.Merge(&t)
+	}
+	return res
 }

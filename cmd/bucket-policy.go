@@ -32,7 +32,7 @@ import (
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // PolicySys - policy subsystem.
@@ -53,7 +53,7 @@ func (sys *PolicySys) IsAllowed(args policy.BucketPolicyArgs) bool {
 
 	// Log unhandled errors.
 	if _, ok := err.(BucketPolicyNotFound); !ok {
-		logger.LogIf(GlobalContext, err)
+		internalLogIf(GlobalContext, err, logger.WarningKind)
 	}
 
 	// As policy is not available for given bucket name, returns IsOwner i.e.
@@ -64,6 +64,14 @@ func (sys *PolicySys) IsAllowed(args policy.BucketPolicyArgs) bool {
 // NewPolicySys - creates new policy system.
 func NewPolicySys() *PolicySys {
 	return &PolicySys{}
+}
+
+func getSTSConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
+	m := make(map[string][]string)
+	if d := r.Form.Get("DurationSeconds"); d != "" {
+		m["DurationSeconds"] = []string{d}
+	}
+	return m
 }
 
 func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {

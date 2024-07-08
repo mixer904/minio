@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2023 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -22,7 +22,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"path"
 	"strings"
@@ -62,6 +64,12 @@ var (
 		Message:    "Specified remote backend is not empty",
 		StatusCode: http.StatusBadRequest,
 	}
+
+	errTierInvalidConfig = AdminError{
+		Code:       "XMinioAdminTierInvalidConfig",
+		Message:    "Unable to setup remote tier, check tier configuration",
+		StatusCode: http.StatusBadRequest,
+	}
 )
 
 const (
@@ -74,12 +82,15 @@ const (
 // tierConfigPath refers to remote tier config object name
 var tierConfigPath = path.Join(minioConfigPrefix, tierConfigFile)
 
+const tierCfgRefreshAtHdr = "X-MinIO-TierCfg-RefreshedAt"
+
 // TierConfigMgr holds the collection of remote tiers configured in this deployment.
 type TierConfigMgr struct {
 	sync.RWMutex `msg:"-"`
 	drivercache  map[string]WarmBackend `msg:"-"`
 
-	Tiers map[string]madmin.TierConfig `json:"tiers"`
+	Tiers           map[string]madmin.TierConfig `json:"tiers"`
+	lastRefreshedAt time.Time                    `msg:"-"`
 }
 
 type tierMetrics struct {
@@ -153,23 +164,29 @@ var (
 	}
 )
 
-func (t *tierMetrics) Report() []Metric {
-	metrics := getHistogramMetrics(t.histogram, tierTTLBMD)
+func (t *tierMetrics) Report() []MetricV2 {
+	metrics := getHistogramMetrics(t.histogram, tierTTLBMD, true)
 	t.RLock()
 	defer t.RUnlock()
 	for tier, stat := range t.requestsCount {
-		metrics = append(metrics, Metric{
+		metrics = append(metrics, MetricV2{
 			Description:    tierRequestsSuccessMD,
 			Value:          float64(stat.success),
 			VariableLabels: map[string]string{"tier": tier},
 		})
-		metrics = append(metrics, Metric{
+		metrics = append(metrics, MetricV2{
 			Description:    tierRequestsFailureMD,
 			Value:          float64(stat.failure),
 			VariableLabels: map[string]string{"tier": tier},
 		})
 	}
 	return metrics
+}
+
+func (config *TierConfigMgr) refreshedAt() time.Time {
+	config.RLock()
+	defer config.RUnlock()
+	return config.lastRefreshedAt
 }
 
 // IsTierValid returns true if there exists a remote tier by name tierName,
@@ -208,7 +225,7 @@ func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig, ig
 		return errTierAlreadyExists
 	}
 
-	d, err := newWarmBackend(ctx, tier)
+	d, err := newWarmBackend(ctx, tier, true)
 	if err != nil {
 		return err
 	}
@@ -232,8 +249,11 @@ func (config *TierConfigMgr) Add(ctx context.Context, tier madmin.TierConfig, ig
 
 // Remove removes tier if it is empty.
 func (config *TierConfigMgr) Remove(ctx context.Context, tier string) error {
-	d, err := config.getDriver(tier)
+	d, err := config.getDriver(ctx, tier)
 	if err != nil {
+		if errors.Is(err, errTierNotFound) {
+			return nil
+		}
 		return err
 	}
 	if inuse, err := d.InUse(ctx); err != nil {
@@ -251,7 +271,7 @@ func (config *TierConfigMgr) Remove(ctx context.Context, tier string) error {
 // Verify verifies if tier's config is valid by performing all supported
 // operations on the corresponding warmbackend.
 func (config *TierConfigMgr) Verify(ctx context.Context, tier string) error {
-	d, err := config.getDriver(tier)
+	d, err := config.getDriver(ctx, tier)
 	if err != nil {
 		return err
 	}
@@ -348,7 +368,7 @@ func (config *TierConfigMgr) Edit(ctx context.Context, tierName string, creds ma
 		cfg.MinIO.SecretKey = creds.SecretKey
 	}
 
-	d, err := newWarmBackend(ctx, cfg)
+	d, err := newWarmBackend(ctx, cfg, true)
 	if err != nil {
 		return err
 	}
@@ -372,7 +392,7 @@ func (config *TierConfigMgr) Bytes() ([]byte, error) {
 }
 
 // getDriver returns a warmBackend interface object initialized with remote tier config matching tierName
-func (config *TierConfigMgr) getDriver(tierName string) (d WarmBackend, err error) {
+func (config *TierConfigMgr) getDriver(ctx context.Context, tierName string) (d WarmBackend, err error) {
 	config.Lock()
 	defer config.Unlock()
 
@@ -388,7 +408,7 @@ func (config *TierConfigMgr) getDriver(tierName string) (d WarmBackend, err erro
 	if !ok {
 		return nil, errTierNotFound
 	}
-	d, err = newWarmBackend(context.TODO(), t)
+	d, err = newWarmBackend(ctx, t, false)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +433,7 @@ func (config *TierConfigMgr) configReader(ctx context.Context) (*PutObjReader, *
 		return nil, nil, err
 	}
 	if GlobalKMS == nil {
-		return NewPutObjReader(hr), &ObjectOptions{}, nil
+		return NewPutObjReader(hr), &ObjectOptions{MaxParity: true}, nil
 	}
 
 	// Note: Local variables with names ek, oek, etc are named inline with
@@ -443,6 +463,7 @@ func (config *TierConfigMgr) configReader(ctx context.Context) (*PutObjReader, *
 	opts := &ObjectOptions{
 		UserDefined: metadata,
 		MTime:       UTCNow(),
+		MaxParity:   true,
 	}
 
 	return pReader, opts, nil
@@ -451,17 +472,22 @@ func (config *TierConfigMgr) configReader(ctx context.Context) (*PutObjReader, *
 // Reload updates config by reloading remote tier config from config store.
 func (config *TierConfigMgr) Reload(ctx context.Context, objAPI ObjectLayer) error {
 	newConfig, err := loadTierConfig(ctx, objAPI)
+
+	config.Lock()
+	defer config.Unlock()
+
 	switch err {
 	case nil:
 		break
 	case errConfigNotFound: // nothing to reload
+		// To maintain the invariance that lastRefreshedAt records the
+		// timestamp of last successful refresh
+		config.lastRefreshedAt = UTCNow()
 		return nil
 	default:
 		return err
 	}
 
-	config.Lock()
-	defer config.Unlock()
 	// Reset drivercache built using current config
 	for k := range config.drivercache {
 		delete(config.drivercache, k)
@@ -474,7 +500,7 @@ func (config *TierConfigMgr) Reload(ctx context.Context, objAPI ObjectLayer) err
 	for tier, cfg := range newConfig.Tiers {
 		config.Tiers[tier] = cfg
 	}
-
+	config.lastRefreshedAt = UTCNow()
 	return nil
 }
 
@@ -501,6 +527,31 @@ func NewTierConfigMgr() *TierConfigMgr {
 	}
 }
 
+func (config *TierConfigMgr) refreshTierConfig(ctx context.Context, objAPI ObjectLayer) {
+	const tierCfgRefresh = 15 * time.Minute
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	randInterval := func() time.Duration {
+		return time.Duration(r.Float64() * 5 * float64(time.Second))
+	}
+
+	// To avoid all MinIO nodes reading the tier config object at the same
+	// time.
+	t := time.NewTimer(tierCfgRefresh + randInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			err := config.Reload(ctx, objAPI)
+			if err != nil {
+				tierLogIf(ctx, err)
+			}
+		}
+		t.Reset(tierCfgRefresh + randInterval())
+	}
+}
+
 // loadTierConfig loads remote tier configuration from objAPI.
 func loadTierConfig(ctx context.Context, objAPI ObjectLayer) (*TierConfigMgr, error) {
 	if objAPI == nil {
@@ -513,7 +564,7 @@ func loadTierConfig(ctx context.Context, objAPI ObjectLayer) (*TierConfigMgr, er
 	}
 
 	if len(data) <= 4 {
-		return nil, fmt.Errorf("tierConfigInit: no data")
+		return nil, errors.New("tierConfigInit: no data")
 	}
 
 	// Read header
@@ -536,19 +587,11 @@ func loadTierConfig(ctx context.Context, objAPI ObjectLayer) (*TierConfigMgr, er
 	return cfg, nil
 }
 
-// Reset clears remote tier configured and clears tier driver cache.
-func (config *TierConfigMgr) Reset() {
-	config.Lock()
-	for k := range config.drivercache {
-		delete(config.drivercache, k)
-	}
-	for k := range config.Tiers {
-		delete(config.Tiers, k)
-	}
-	config.Unlock()
-}
-
 // Init initializes tier configuration reading from objAPI
 func (config *TierConfigMgr) Init(ctx context.Context, objAPI ObjectLayer) error {
-	return config.Reload(ctx, objAPI)
+	err := config.Reload(ctx, objAPI)
+	if globalIsDistErasure {
+		go config.refreshTierConfig(ctx, objAPI)
+	}
+	return err
 }
