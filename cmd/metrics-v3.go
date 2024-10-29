@@ -270,7 +270,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 		loadClusterUsageObjectMetrics,
 	)
 
-	clusterUsageBucketsMG := NewBucketMetricsGroup(clusterUsageBucketsCollectorPath,
+	clusterUsageBucketsMG := NewMetricsGroup(clusterUsageBucketsCollectorPath,
 		[]MetricDescriptor{
 			usageSinceLastUpdateSecondsMD,
 			usageBucketTotalBytesMD,
@@ -341,6 +341,7 @@ func newMetricGroups(r *prometheus.Registry) *metricsV3Collection {
 			replicationMaxQueuedBytesMD,
 			replicationMaxQueuedCountMD,
 			replicationMaxDataTransferRateMD,
+			replicationRecentBacklogCountMD,
 		},
 		loadClusterReplicationMetrics,
 	)

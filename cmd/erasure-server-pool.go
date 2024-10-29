@@ -45,6 +45,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/sync/errgroup"
 	"github.com/minio/pkg/v3/wildcard"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 type erasureServerPools struct {
@@ -63,6 +64,8 @@ type erasureServerPools struct {
 	decommissionCancelers []context.CancelFunc
 
 	s3Peer *S3PeerSys
+
+	mpCache *xsync.MapOf[string, MultipartInfo]
 }
 
 func (z *erasureServerPools) SinglePool() bool {
@@ -168,7 +171,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 	if !globalIsDistErasure {
 		globalLocalDrivesMu.Lock()
-		globalLocalDrives = localDrives
+		globalLocalDrivesMap = make(map[string]StorageAPI, len(localDrives))
 		for _, drive := range localDrives {
 			globalLocalDrivesMap[drive.Endpoint().String()] = drive
 		}
@@ -187,17 +190,10 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		globalLeaderLock = newSharedLock(GlobalContext, z, "leader.lock")
 	})
 
-	// Enable background operations on
-	//
-	// - Disk auto healing
-	// - MRF (most recently failed) healing
-	// - Background expiration routine for lifecycle policies
+	// Start self healing after the object initialization
+	// so various tasks will be useful
 	bootstrapTrace("initAutoHeal", func() {
 		initAutoHeal(GlobalContext, z)
-	})
-
-	bootstrapTrace("initHealMRF", func() {
-		go globalMRFState.healRoutine(z)
 	})
 
 	// initialize the object layer.
@@ -223,15 +219,39 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		break
 	}
 
+	// initialize the incomplete uploads cache
+	z.mpCache = xsync.NewMapOf[string, MultipartInfo]()
+
+	go z.cleanupStaleMPCache(ctx)
+
 	return z, nil
 }
 
-func (z *erasureServerPools) NewNSLock(bucket string, objects ...string) RWLocker {
-	poolID := hashKey(z.distributionAlgo, "", len(z.serverPools), z.deploymentID)
-	if len(objects) >= 1 {
-		poolID = hashKey(z.distributionAlgo, objects[0], len(z.serverPools), z.deploymentID)
+func (z *erasureServerPools) cleanupStaleMPCache(ctx context.Context) {
+	timer := time.NewTimer(globalAPIConfig.getStaleUploadsCleanupInterval())
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			z.mpCache.Range(func(id string, info MultipartInfo) bool {
+				if time.Since(info.Initiated) >= globalAPIConfig.getStaleUploadsExpiry() {
+					z.mpCache.Delete(id)
+					// No need to notify to peers, each node will delete its own cache.
+				}
+				return true
+			})
+
+			// Reset for the next interval
+			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
+		}
 	}
-	return z.serverPools[poolID].NewNSLock(bucket, objects...)
+}
+
+func (z *erasureServerPools) NewNSLock(bucket string, objects ...string) RWLocker {
+	return z.serverPools[0].NewNSLock(bucket, objects...)
 }
 
 // GetDisksID will return disks by their ID.
@@ -536,7 +556,7 @@ func (z *erasureServerPools) getPoolInfoExistingWithOpts(ctx context.Context, bu
 			return pinfo, z.poolsWithObject(poolObjInfos, opts), nil
 		}
 		defPool = pinfo
-		if !isErrObjectNotFound(pinfo.Err) {
+		if !isErrObjectNotFound(pinfo.Err) && !isErrVersionNotFound(pinfo.Err) {
 			return pinfo, noReadQuorumPools, pinfo.Err
 		}
 
@@ -1071,23 +1091,20 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
 	}
 
-	if !opts.NoLock {
-		ns := z.NewNSLock(bucket, object)
-		lkctx, err := ns.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return ObjectInfo{}, err
-		}
-		ctx = lkctx.Context()
-		defer ns.Unlock(lkctx)
-		opts.NoLock = true
-	}
-
-	idx, err := z.getPoolIdxNoLock(ctx, bucket, object, data.Size())
+	idx, err := z.getPoolIdx(ctx, bucket, object, data.Size())
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
-	// Overwrite the object at the right pool
+	if opts.DataMovement && idx == opts.SrcPoolIdx {
+		return ObjectInfo{}, DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
+	}
+
 	return z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
 }
 
@@ -1139,13 +1156,44 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return pinfo.ObjInfo, nil
 	}
 
+	// Datamovement must never be allowed on the same pool.
+	if opts.DataMovement && opts.SrcPoolIdx == pinfo.Index {
+		return pinfo.ObjInfo, DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
+	}
+
+	if opts.DataMovement {
+		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
+		objInfo.Name = decodeDirObject(object)
+		return objInfo, err
+	}
+
 	// Delete concurrently in all server pools with read quorum error for unversioned objects.
 	if len(noReadQuorumPools) > 0 && !opts.Versioned && !opts.VersionSuspended {
 		return z.deleteObjectFromAllPools(ctx, bucket, object, opts, noReadQuorumPools)
 	}
-	objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
+
+	for _, pool := range z.serverPools {
+		objInfo, err := pool.DeleteObject(ctx, bucket, object, opts)
+		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			objInfo.Name = decodeDirObject(object)
+			return objInfo, err
+		}
+		if err == nil {
+			objInfo.Name = decodeDirObject(object)
+			return objInfo, nil
+		}
+	}
+
 	objInfo.Name = decodeDirObject(object)
-	return objInfo, err
+	if opts.VersionID != "" {
+		return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
+	}
+	return objInfo, ObjectNotFound{Bucket: bucket, Object: object}
 }
 
 func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucket string, object string, opts ObjectOptions, poolIndices []poolErrs) (objInfo ObjectInfo, err error) {
@@ -1264,19 +1312,20 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 			go func(idx int, pool *erasureSets) {
 				defer wg.Done()
 				objs := poolObjIdxMap[idx]
-				if len(objs) > 0 {
-					orgIndexes := origIndexMap[idx]
-					deletedObjects, errs := pool.DeleteObjects(ctx, bucket, objs, opts)
-					mu.Lock()
-					for i, derr := range errs {
-						if derr != nil {
-							derrs[orgIndexes[i]] = derr
-						}
-						deletedObjects[i].ObjectName = decodeDirObject(deletedObjects[i].ObjectName)
-						dobjects[orgIndexes[i]] = deletedObjects[i]
-					}
-					mu.Unlock()
+				if len(objs) == 0 {
+					return
 				}
+				orgIndexes := origIndexMap[idx]
+				deletedObjects, errs := pool.DeleteObjects(ctx, bucket, objs, opts)
+				mu.Lock()
+				for i, derr := range errs {
+					if derr != nil {
+						derrs[orgIndexes[i]] = derr
+					}
+					deletedObjects[i].ObjectName = decodeDirObject(deletedObjects[i].ObjectName)
+					dobjects[orgIndexes[i]] = deletedObjects[i]
+				}
+				mu.Unlock()
 			}(idx, pool)
 		}
 		wg.Wait()
@@ -1526,14 +1575,12 @@ func (z *erasureServerPools) listObjectsGeneric(ctx context.Context, bucket, pre
 			loi.NextMarker = last.Name
 		}
 
-		if merged.lastSkippedEntry != "" {
-			if merged.lastSkippedEntry > loi.NextMarker {
-				// An object hidden by ILM was found during listing. Since the number of entries
-				// fetched from drives is limited, set IsTruncated to true to ask the s3 client
-				// to continue listing if it wishes in order to find if there is more objects.
-				loi.IsTruncated = true
-				loi.NextMarker = merged.lastSkippedEntry
-			}
+		if loi.IsTruncated && merged.lastSkippedEntry > loi.NextMarker {
+			// An object hidden by ILM was found during a truncated listing. Since the number of entries
+			// fetched from drives is limited by max-keys, we should use the last ILM filtered entry
+			// as a continuation token if it is lexially higher than the last visible object so that the
+			// next call of WalkDir() with the max-keys can reach new objects not seen previously.
+			loi.NextMarker = merged.lastSkippedEntry
 		}
 
 		if loi.NextMarker != "" {
@@ -1697,15 +1744,32 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 		return ListMultipartsInfo{}, err
 	}
 
-	if z.SinglePool() {
-		return z.serverPools[0].ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
-	}
-
 	poolResult := ListMultipartsInfo{}
 	poolResult.MaxUploads = maxUploads
 	poolResult.KeyMarker = keyMarker
 	poolResult.Prefix = prefix
 	poolResult.Delimiter = delimiter
+
+	// if no prefix provided, return the list from cache
+	if prefix == "" {
+		if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+			return ListMultipartsInfo{}, toObjectErr(err, bucket)
+		}
+
+		z.mpCache.Range(func(_ string, mp MultipartInfo) bool {
+			poolResult.Uploads = append(poolResult.Uploads, mp)
+			return true
+		})
+		sort.Slice(poolResult.Uploads, func(i int, j int) bool {
+			return poolResult.Uploads[i].Initiated.Before(poolResult.Uploads[j].Initiated)
+		})
+		return poolResult, nil
+	}
+
+	if z.SinglePool() {
+		return z.serverPools[0].ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
@@ -1717,14 +1781,26 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 		}
 		poolResult.Uploads = append(poolResult.Uploads, result.Uploads...)
 	}
+
 	return poolResult, nil
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.
-func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (*NewMultipartUploadResult, error) {
+func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (mp *NewMultipartUploadResult, err error) {
 	if err := checkNewMultipartArgs(ctx, bucket, object); err != nil {
 		return nil, err
 	}
+
+	defer func() {
+		if err == nil && mp != nil {
+			z.mpCache.Store(mp.UploadID, MultipartInfo{
+				Bucket:    bucket,
+				Object:    object,
+				UploadID:  mp.UploadID,
+				Initiated: time.Now(),
+			})
+		}
+	}()
 
 	if z.SinglePool() {
 		return z.serverPools[0].NewMultipartUpload(ctx, bucket, object, opts)
@@ -1754,6 +1830,15 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 		return nil, err
 	}
 
+	if opts.DataMovement && idx == opts.SrcPoolIdx {
+		return nil, DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
+	}
+
 	return z.serverPools[idx].NewMultipartUpload(ctx, bucket, object, opts)
 }
 
@@ -1772,6 +1857,16 @@ func (z *erasureServerPools) PutObjectPart(ctx context.Context, bucket, object, 
 	if err := checkPutObjectPartArgs(ctx, bucket, object, uploadID); err != nil {
 		return PartInfo{}, err
 	}
+
+	// Read lock for upload id.
+	// Only held while reading the upload metadata.
+	uploadIDRLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	rlkctx, err := uploadIDRLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return PartInfo{}, err
+	}
+	ctx = rlkctx.Context()
+	defer uploadIDRLock.RUnlock(rlkctx)
 
 	if z.SinglePool() {
 		return z.serverPools[0].PutObjectPart(ctx, bucket, object, uploadID, partID, data, opts)
@@ -1805,9 +1900,18 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 		return MultipartInfo{}, err
 	}
 
+	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return MultipartInfo{}, err
+	}
+	ctx = lkctx.Context()
+	defer uploadIDLock.RUnlock(lkctx)
+
 	if z.SinglePool() {
 		return z.serverPools[0].GetMultipartInfo(ctx, bucket, object, uploadID, opts)
 	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
@@ -1823,6 +1927,7 @@ func (z *erasureServerPools) GetMultipartInfo(ctx context.Context, bucket, objec
 		// any other unhandled error return right here.
 		return MultipartInfo{}, err
 	}
+
 	return MultipartInfo{}, InvalidUploadID{
 		Bucket:   bucket,
 		Object:   object,
@@ -1836,9 +1941,18 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		return ListPartsInfo{}, err
 	}
 
+	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	lkctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return ListPartsInfo{}, err
+	}
+	ctx = lkctx.Context()
+	defer uploadIDLock.RUnlock(lkctx)
+
 	if z.SinglePool() {
 		return z.serverPools[0].ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
 	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
@@ -1852,6 +1966,7 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 		}
 		return ListPartsInfo{}, err
 	}
+
 	return ListPartsInfo{}, InvalidUploadID{
 		Bucket:   bucket,
 		Object:   object,
@@ -1860,10 +1975,25 @@ func (z *erasureServerPools) ListObjectParts(ctx context.Context, bucket, object
 }
 
 // Aborts an in-progress multipart operation on hashedSet based on the object name.
-func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error {
+func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) (err error) {
 	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return err
 	}
+
+	defer func() {
+		if err == nil {
+			z.mpCache.Delete(uploadID)
+			globalNotificationSys.DeleteUploadID(ctx, uploadID)
+		}
+	}()
+
+	lk := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return err
+	}
+	ctx = lkctx.Context()
+	defer lk.Unlock(lkctx)
 
 	if z.SinglePool() {
 		return z.serverPools[0].AbortMultipartUpload(ctx, bucket, object, uploadID, opts)
@@ -1895,6 +2025,23 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 	if err = checkCompleteMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return objInfo, err
 	}
+
+	defer func() {
+		if err == nil {
+			z.mpCache.Delete(uploadID)
+			globalNotificationSys.DeleteUploadID(ctx, uploadID)
+		}
+	}()
+
+	// Hold write locks to verify uploaded parts, also disallows any
+	// parallel PutObjectPart() requests.
+	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
+	wlkctx, err := uploadIDLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return objInfo, err
+	}
+	ctx = wlkctx.Context()
+	defer uploadIDLock.Unlock(wlkctx)
 
 	if z.SinglePool() {
 		return z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
@@ -1938,6 +2085,12 @@ func (z *erasureServerPools) GetBucketInfo(ctx context.Context, bucket string, o
 	return bucketInfo, nil
 }
 
+// ClearUploadID deletes given uploadID from cache
+func (z *erasureServerPools) ClearUploadID(uploadID string) error {
+	z.mpCache.Delete(uploadID)
+	return nil
+}
+
 // DeleteBucket - deletes a bucket on all serverPools simultaneously,
 // even if one of the serverPools fail to delete buckets, we proceed to
 // undo a successful operation.
@@ -1960,6 +2113,34 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
+	}
+
+	if !opts.Force {
+		results := make(chan itemOrErr[ObjectInfo])
+
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		err := z.Walk(ctx, bucket, "", results, WalkOptions{Limit: 1})
+		if err != nil {
+			s3LogIf(ctx, fmt.Errorf("unable to verify if the bucket %s is empty: %w", bucket, err))
+			return toObjectErr(err, bucket)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case r, found := <-results:
+			if found {
+				if r.Err != nil {
+					s3LogIf(ctx, fmt.Errorf("unable to verify if the bucket %s is empty: %w", bucket, r.Err))
+					return toObjectErr(r.Err, bucket)
+				}
+				return toObjectErr(errVolumeNotEmpty, bucket)
+			}
+		}
+
+		// Always pass force to the lower level
+		opts.Force = true
 	}
 
 	err := z.s3Peer.DeleteBucket(ctx, bucket, opts)
@@ -2104,7 +2285,7 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 			disks, infos, _ := set.getOnlineDisksWithHealingAndInfo(true)
 			if len(disks) == 0 {
 				xioutil.SafeClose(results)
-				err := fmt.Errorf("Walk: no online disks found in pool %d, set %d", setIdx, poolIdx)
+				err := fmt.Errorf("Walk: no online disks found in (set:%d pool:%d) %w", setIdx, poolIdx, errErasureReadQuorum)
 				cancelCause(err)
 				return err
 			}
@@ -2180,6 +2361,7 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 					filterPrefix:   filterPrefix,
 					recursive:      true,
 					forwardTo:      opts.Marker,
+					perDiskLimit:   opts.Limit,
 					minDisks:       listingQuorum,
 					reportNotFound: false,
 					agreed:         send,
@@ -2447,6 +2629,7 @@ const (
 type HealthOptions struct {
 	Maintenance    bool
 	DeploymentType string
+	NoLogging      bool
 }
 
 // HealthResult returns the current state of the system, also
@@ -2483,7 +2666,7 @@ func (hr HealthResult) String() string {
 		if i == 0 {
 			str.WriteString(")")
 		} else {
-			str.WriteString("), ")
+			str.WriteString(") | ")
 		}
 	}
 	return str.String()
@@ -2606,7 +2789,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 			})
 
 			healthy := erasureSetUpCount[poolIdx][setIdx].online >= poolWriteQuorums[poolIdx]
-			if !healthy {
+			if !healthy && !opts.NoLogging {
 				storageLogIf(logger.SetReqInfo(ctx, reqInfo),
 					fmt.Errorf("Write quorum could not be established on pool: %d, set: %d, expected write quorum: %d, drives-online: %d",
 						poolIdx, setIdx, poolWriteQuorums[poolIdx], erasureSetUpCount[poolIdx][setIdx].online), logger.FatalKind)
@@ -2614,7 +2797,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 			result.Healthy = result.Healthy && healthy
 
 			healthyRead := erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx]
-			if !healthyRead {
+			if !healthyRead && !opts.NoLogging {
 				storageLogIf(logger.SetReqInfo(ctx, reqInfo),
 					fmt.Errorf("Read quorum could not be established on pool: %d, set: %d, expected read quorum: %d, drives-online: %d",
 						poolIdx, setIdx, poolReadQuorums[poolIdx], erasureSetUpCount[poolIdx][setIdx].online))
@@ -2639,7 +2822,19 @@ func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, obje
 		return z.serverPools[0].PutObjectMetadata(ctx, bucket, object, opts)
 	}
 
+	if !opts.NoLock {
+		// Lock the object before updating metadata.
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+
 	opts.MetadataChg = true
+	opts.NoLock = true
 	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
@@ -2656,7 +2851,19 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 		return z.serverPools[0].PutObjectTags(ctx, bucket, object, tags, opts)
 	}
 
+	if !opts.NoLock {
+		// Lock the object before updating tags.
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+
 	opts.MetadataChg = true
+	opts.NoLock = true
 
 	// We don't know the size here set 1GiB at least.
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
@@ -2674,8 +2881,19 @@ func (z *erasureServerPools) DeleteObjectTags(ctx context.Context, bucket, objec
 		return z.serverPools[0].DeleteObjectTags(ctx, bucket, object, opts)
 	}
 
-	opts.MetadataChg = true
+	if !opts.NoLock {
+		// Lock the object before deleting tags.
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
 
+	opts.MetadataChg = true
+	opts.NoLock = true
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -2706,8 +2924,20 @@ func (z *erasureServerPools) TransitionObject(ctx context.Context, bucket, objec
 		return z.serverPools[0].TransitionObject(ctx, bucket, object, opts)
 	}
 
+	if !opts.NoLock {
+		// Acquire write lock before starting to transition the object.
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+		if err != nil {
+			return err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+
 	// Avoid transitioning an object from a pool being decommissioned.
 	opts.SkipDecommissioned = true
+	opts.NoLock = true
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return err
@@ -2723,8 +2953,20 @@ func (z *erasureServerPools) RestoreTransitionedObject(ctx context.Context, buck
 		return z.serverPools[0].RestoreTransitionedObject(ctx, bucket, object, opts)
 	}
 
+	if !opts.NoLock {
+		// Acquire write lock before restoring transitioned object
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
+		if err != nil {
+			return err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+
 	// Avoid restoring object from a pool being decommissioned.
 	opts.SkipDecommissioned = true
+	opts.NoLock = true
 	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
 	if err != nil {
 		return err
@@ -2779,6 +3021,15 @@ func (z *erasureServerPools) DecomTieredObject(ctx context.Context, bucket, obje
 	idx, err := z.getPoolIdxNoLock(ctx, bucket, object, fi.Size)
 	if err != nil {
 		return err
+	}
+
+	if opts.DataMovement && idx == opts.SrcPoolIdx {
+		return DataMovementOverwriteErr{
+			Bucket:    bucket,
+			Object:    object,
+			VersionID: opts.VersionID,
+			Err:       errDataMovementSrcDstPoolSame,
+		}
 	}
 
 	return z.serverPools[idx].DecomTieredObject(ctx, bucket, object, fi, opts)

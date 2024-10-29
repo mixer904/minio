@@ -433,7 +433,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 		UID:       id,
 		Resources: names,
 		Source:    source,
-		Quorum:    quorum,
+		Quorum:    &quorum,
 	}
 
 	// Combined timeout for the lock attempt.
@@ -643,6 +643,8 @@ func (dm *DRWMutex) Unlock(ctx context.Context) {
 	// Do async unlocking.
 	// This means unlock will no longer block on the network or missing quorum.
 	go func() {
+		ctx, done := context.WithTimeout(ctx, drwMutexUnlockCallTimeout)
+		defer done()
 		for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
 			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
 			if time.Since(started) > dm.clnt.Timeouts.UnlockCall {

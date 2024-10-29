@@ -276,8 +276,12 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	}
 	globalBatchJobsMetrics.save(job.ID, ri)
 
+	retryAttempts := job.Replicate.Flags.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchReplJobDefaultRetries
+	}
 	delay := job.Replicate.Flags.Retry.Delay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = batchReplJobDefaultRetryDelay
 	}
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -287,22 +291,22 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 	isStorageClassOnly := len(r.Flags.Filter.Metadata) == 1 && strings.EqualFold(r.Flags.Filter.Metadata[0].Key, xhttp.AmzStorageClass)
 
 	skip := func(oi ObjectInfo) (ok bool) {
-		if r.Flags.Filter.OlderThan > 0 && time.Since(oi.ModTime) < r.Flags.Filter.OlderThan {
+		if r.Flags.Filter.OlderThan > 0 && time.Since(oi.ModTime) < r.Flags.Filter.OlderThan.D() {
 			// skip all objects that are newer than specified older duration
 			return true
 		}
 
-		if r.Flags.Filter.NewerThan > 0 && time.Since(oi.ModTime) >= r.Flags.Filter.NewerThan {
+		if r.Flags.Filter.NewerThan > 0 && time.Since(oi.ModTime) >= r.Flags.Filter.NewerThan.D() {
 			// skip all objects that are older than specified newer duration
 			return true
 		}
 
-		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.Before(oi.ModTime) {
+		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.After(oi.ModTime) {
 			// skip all objects that are created before the specified time.
 			return true
 		}
 
-		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.After(oi.ModTime) {
+		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.Before(oi.ModTime) {
 			// skip all objects that are created after the specified time.
 			return true
 		}
@@ -377,7 +381,6 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		return err
 	}
 
-	retryAttempts := ri.RetryAttempts
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
 		attempts := attempts
@@ -385,12 +388,27 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 		minioSrc := r.Source.Type == BatchJobReplicateResourceMinIO
 		ctx, cancel := context.WithCancel(ctx)
-		objInfoCh := c.ListObjects(ctx, r.Source.Bucket, miniogo.ListObjectsOptions{
-			Prefix:       r.Source.Prefix,
-			WithVersions: minioSrc,
-			Recursive:    true,
-			WithMetadata: true,
-		})
+
+		objInfoCh := make(chan miniogo.ObjectInfo, 1)
+		go func() {
+			prefixes := r.Source.Prefix.F()
+			if len(prefixes) == 0 {
+				prefixes = []string{""}
+			}
+			for _, prefix := range prefixes {
+				prefixObjInfoCh := c.ListObjects(ctx, r.Source.Bucket, miniogo.ListObjectsOptions{
+					Prefix:       prefix,
+					WithVersions: minioSrc,
+					Recursive:    true,
+					WithMetadata: true,
+				})
+				for obj := range prefixObjInfoCh {
+					objInfoCh <- obj
+				}
+			}
+			xioutil.SafeClose(objInfoCh)
+		}()
+
 		prevObj := ""
 		skipReplicate := false
 
@@ -540,7 +558,7 @@ func toObjectInfo(bucket, object string, objInfo miniogo.ObjectInfo) ObjectInfo 
 	return oi
 }
 
-func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo) error {
+func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo, prefix string) error {
 	input := make(chan minio.SnowballObject, 1)
 	opts := minio.SnowballOptions{
 		Opts:     minio.PutObjectOptions{},
@@ -560,6 +578,10 @@ func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLa
 			if err != nil {
 				batchLogIf(ctx, err)
 				continue
+			}
+
+			if prefix != "" {
+				entry.Name = pathJoin(prefix, entry.Name)
 			}
 
 			snowballObj := minio.SnowballObject{
@@ -725,7 +747,7 @@ const (
 
 	batchReplJobAPIVersion        = "v1"
 	batchReplJobDefaultRetries    = 3
-	batchReplJobDefaultRetryDelay = 250 * time.Millisecond
+	batchReplJobDefaultRetryDelay = time.Second
 )
 
 func getJobPath(job BatchJobRequest) string {
@@ -753,22 +775,10 @@ func (ri *batchJobInfo) loadOrInit(ctx context.Context, api ObjectLayer, job Bat
 		switch {
 		case job.Replicate != nil:
 			ri.Version = batchReplVersionV1
-			ri.RetryAttempts = batchReplJobDefaultRetries
-			if job.Replicate.Flags.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.Replicate.Flags.Retry.Attempts
-			}
 		case job.KeyRotate != nil:
 			ri.Version = batchKeyRotateVersionV1
-			ri.RetryAttempts = batchKeyRotateJobDefaultRetries
-			if job.KeyRotate.Flags.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.KeyRotate.Flags.Retry.Attempts
-			}
 		case job.Expire != nil:
 			ri.Version = batchExpireVersionV1
-			ri.RetryAttempts = batchExpireJobDefaultRetries
-			if job.Expire.Retry.Attempts > 0 {
-				ri.RetryAttempts = job.Expire.Retry.Attempts
-			}
 		}
 		return nil
 	}
@@ -977,8 +987,10 @@ func (ri *batchJobInfo) trackCurrentBucketObject(bucket string, info ObjectInfo,
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 
-	ri.Bucket = bucket
-	ri.Object = info.Name
+	if success {
+		ri.Bucket = bucket
+		ri.Object = info.Name
+	}
 	ri.countItem(info.Size, info.DeleteMarker, success, attempt)
 }
 
@@ -1013,29 +1025,34 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 	globalBatchJobsMetrics.save(job.ID, ri)
 	lastObject := ri.Object
 
+	retryAttempts := job.Replicate.Flags.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchReplJobDefaultRetries
+	}
 	delay := job.Replicate.Flags.Retry.Delay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = batchReplJobDefaultRetryDelay
 	}
+
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	selectObj := func(info FileInfo) (ok bool) {
-		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan {
+		if r.Flags.Filter.OlderThan > 0 && time.Since(info.ModTime) < r.Flags.Filter.OlderThan.D() {
 			// skip all objects that are newer than specified older duration
 			return false
 		}
 
-		if r.Flags.Filter.NewerThan > 0 && time.Since(info.ModTime) >= r.Flags.Filter.NewerThan {
+		if r.Flags.Filter.NewerThan > 0 && time.Since(info.ModTime) >= r.Flags.Filter.NewerThan.D() {
 			// skip all objects that are older than specified newer duration
 			return false
 		}
 
-		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.Before(info.ModTime) {
+		if !r.Flags.Filter.CreatedAfter.IsZero() && r.Flags.Filter.CreatedAfter.After(info.ModTime) {
 			// skip all objects that are created before the specified time.
 			return false
 		}
 
-		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.After(info.ModTime) {
+		if !r.Flags.Filter.CreatedBefore.IsZero() && r.Flags.Filter.CreatedBefore.Before(info.ModTime) {
 			// skip all objects that are created after the specified time.
 			return false
 		}
@@ -1104,7 +1121,6 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 
 	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 
-	retryAttempts := ri.RetryAttempts
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
 		attempts := attempts
@@ -1113,7 +1129,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			slowCh = make(chan itemOrErr[ObjectInfo], 100)
 		)
 
-		if !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
+		if r.Source.Snowball.Disable != nil && !*r.Source.Snowball.Disable && r.Source.Type.isMinio() && r.Target.Type.isMinio() {
 			go func() {
 				// Snowball currently needs the high level minio-go Client, not the Core one
 				cl, err := miniogo.New(u.Host, &miniogo.Options{
@@ -1123,7 +1139,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 					BucketLookup: lookupStyle(r.Target.Path),
 				})
 				if err != nil {
-					batchLogIf(ctx, err)
+					batchLogOnceIf(ctx, err, job.ID+"miniogo.New")
 					return
 				}
 
@@ -1133,8 +1149,8 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				batch := make([]ObjectInfo, 0, *r.Source.Snowball.Batch)
 				writeFn := func(batch []ObjectInfo) {
 					if len(batch) > 0 {
-						if err := r.writeAsArchive(ctx, api, cl, batch); err != nil {
-							batchLogIf(ctx, err)
+						if err := r.writeAsArchive(ctx, api, cl, batch, r.Target.Prefix); err != nil {
+							batchLogOnceIf(ctx, err, job.ID+"writeAsArchive")
 							for _, b := range batch {
 								slowCh <- itemOrErr[ObjectInfo]{Item: b}
 							}
@@ -1142,7 +1158,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 							ri.trackCurrentBucketBatch(r.Source.Bucket, batch)
 							globalBatchJobsMetrics.save(job.ID, ri)
 							// persist in-memory state to disk after every 10secs.
-							batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+							batchLogOnceIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job), job.ID+"updateAfter")
 						}
 					}
 				}
@@ -1182,19 +1198,32 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		if walkQuorum == "" {
 			walkQuorum = "strict"
 		}
-		ctx, cancel := context.WithCancel(ctx)
+		ctx, cancelCause := context.WithCancelCause(ctx)
 		// one of source/target is s3, skip delete marker and all versions under the same object name.
 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
 
-		if err := api.Walk(ctx, r.Source.Bucket, r.Source.Prefix, walkCh, WalkOptions{
-			Marker:   lastObject,
-			Filter:   selectObj,
-			AskDisks: walkQuorum,
-		}); err != nil {
-			cancel()
-			// Do not need to retry if we can't list objects on source.
-			return err
-		}
+		go func() {
+			prefixes := r.Source.Prefix.F()
+			if len(prefixes) == 0 {
+				prefixes = []string{""}
+			}
+			for _, prefix := range prefixes {
+				prefixWalkCh := make(chan itemOrErr[ObjectInfo], 100)
+				if err := api.Walk(ctx, r.Source.Bucket, prefix, prefixWalkCh, WalkOptions{
+					Marker:   lastObject,
+					Filter:   selectObj,
+					AskDisks: walkQuorum,
+				}); err != nil {
+					cancelCause(err)
+					xioutil.SafeClose(walkCh)
+					return
+				}
+				for obj := range prefixWalkCh {
+					walkCh <- obj
+				}
+			}
+			xioutil.SafeClose(walkCh)
+		}()
 
 		prevObj := ""
 
@@ -1202,7 +1231,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		for res := range slowCh {
 			if res.Err != nil {
 				ri.Failed = true
-				batchLogIf(ctx, res.Err)
+				batchLogOnceIf(ctx, res.Err, job.ID+"res.Err")
 				continue
 			}
 			result := res.Item
@@ -1229,7 +1258,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 						return
 					}
 					stopFn(result, err)
-					batchLogIf(ctx, err)
+					batchLogOnceIf(ctx, err, job.ID+"ReplicateToTarget")
 					success = false
 				} else {
 					stopFn(result, nil)
@@ -1237,7 +1266,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				ri.trackCurrentBucketObject(r.Source.Bucket, result, success, attempts)
 				globalBatchJobsMetrics.save(job.ID, ri)
 				// persist in-memory state to disk after every 10secs.
-				batchLogIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job))
+				batchLogOnceIf(ctx, ri.updateAfter(ctx, api, 10*time.Second, job), job.ID+"updateAfter2")
 
 				if wait := globalBatchConfig.ReplicationWait(); wait > 0 {
 					time.Sleep(wait)
@@ -1245,20 +1274,23 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			}()
 		}
 		wk.Wait()
-
+		// Do not need to retry if we can't list objects on source.
+		if context.Cause(ctx) != nil {
+			return context.Cause(ctx)
+		}
 		ri.RetryAttempts = attempts
 		ri.Complete = ri.ObjectsFailed == 0
 		ri.Failed = ri.ObjectsFailed > 0
 
 		globalBatchJobsMetrics.save(job.ID, ri)
 		// persist in-memory state to disk.
-		batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
+		batchLogOnceIf(ctx, ri.updateAfter(ctx, api, 0, job), job.ID+"updateAfter3")
 
 		if err := r.Notify(ctx, ri); err != nil {
-			batchLogIf(ctx, fmt.Errorf("unable to notify %v", err))
+			batchLogOnceIf(ctx, fmt.Errorf("unable to notify %v", err), job.ID+"notify")
 		}
 
-		cancel()
+		cancelCause(nil)
 		if ri.Failed {
 			ri.ObjectsFailed = 0
 			ri.Bucket = ""
@@ -1545,9 +1577,6 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 	}
 
 	jobType := r.Form.Get("jobType")
-	if jobType == "" {
-		jobType = string(madmin.BatchJobReplicate)
-	}
 
 	resultCh := make(chan itemOrErr[ObjectInfo])
 
@@ -1565,6 +1594,9 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 			writeErrorResponseJSON(ctx, w, toAPIError(ctx, result.Err), r.URL)
 			return
 		}
+		if strings.HasPrefix(result.Item.Name, batchJobReportsPrefix+slashSeparator) {
+			continue
+		}
 		req := &BatchJobRequest{}
 		if err := req.load(ctx, objectAPI, result.Item.Name); err != nil {
 			if !errors.Is(err, errNoSuchJob) {
@@ -1573,7 +1605,7 @@ func (a adminAPIHandlers) ListBatchJobs(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		if jobType == string(req.Type()) {
+		if jobType == string(req.Type()) || jobType == "" {
 			listResult.Jobs = append(listResult.Jobs, madmin.BatchJobResult{
 				ID:      req.ID,
 				Type:    req.Type(),
@@ -1673,7 +1705,7 @@ func (a adminAPIHandlers) DescribeBatchJob(w http.ResponseWriter, r *http.Reques
 	w.Write(buf)
 }
 
-// StarBatchJob queue a new job for execution
+// StartBatchJob queue a new job for execution
 func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1881,6 +1913,9 @@ func (j *BatchJobPool) resume(randomWait func() time.Duration) {
 			batchLogIf(j.ctx, result.Err)
 			continue
 		}
+		if strings.HasPrefix(result.Item.Name, batchJobReportsPrefix+slashSeparator) {
+			continue
+		}
 		// ignore batch-replicate.bin and batch-rotate.bin entries
 		if strings.HasSuffix(result.Item.Name, slashSeparator) {
 			continue
@@ -1951,7 +1986,6 @@ func (j *BatchJobPool) AddWorker() {
 					}
 				}
 			}
-			job.delete(j.ctx, j.objLayer)
 			j.canceler(job.ID, false)
 		case <-j.workerKillCh:
 			return
@@ -2012,7 +2046,9 @@ func (j *BatchJobPool) canceler(jobID string, cancel bool) error {
 			canceler()
 		}
 	}
-	delete(j.jobCancelers, jobID)
+	if cancel {
+		delete(j.jobCancelers, jobID)
+	}
 	return nil
 }
 
@@ -2138,9 +2174,40 @@ func (m *batchJobMetrics) purgeJobMetrics() {
 			m.RUnlock()
 			for _, jobID := range toDeleteJobMetrics {
 				m.delete(jobID)
+				j := BatchJobRequest{
+					ID: jobID,
+				}
+				j.delete(GlobalContext, newObjectLayerFn())
 			}
 		}
 	}
+}
+
+// load metrics from disk on startup
+func (m *batchJobMetrics) init(ctx context.Context, objectAPI ObjectLayer) error {
+	resultCh := make(chan itemOrErr[ObjectInfo])
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := objectAPI.Walk(ctx, minioMetaBucket, batchJobReportsPrefix, resultCh, WalkOptions{}); err != nil {
+		return err
+	}
+
+	for result := range resultCh {
+		if result.Err != nil {
+			return result.Err
+		}
+		ri := &batchJobInfo{}
+		if err := ri.loadByPath(ctx, objectAPI, result.Item.Name); err != nil {
+			if !errors.Is(err, errNoSuchJob) {
+				batchLogIf(ctx, err)
+			}
+			continue
+		}
+		m.metrics[ri.JobID] = ri
+	}
+	return nil
 }
 
 func (m *batchJobMetrics) delete(jobID string) {
@@ -2219,4 +2286,31 @@ func lookupStyle(s string) miniogo.BucketLookupType {
 
 	}
 	return lookup
+}
+
+// BatchJobPrefix - to support prefix field yaml unmarshalling with string or slice of strings
+type BatchJobPrefix []string
+
+var _ yaml.Unmarshaler = &BatchJobPrefix{}
+
+// UnmarshalYAML - to support prefix field yaml unmarshalling with string or slice of strings
+func (b *BatchJobPrefix) UnmarshalYAML(value *yaml.Node) error {
+	// try slice first
+	tmpSlice := []string{}
+	if err := value.Decode(&tmpSlice); err == nil {
+		*b = tmpSlice
+		return nil
+	}
+	// try string
+	tmpStr := ""
+	if err := value.Decode(&tmpStr); err == nil {
+		*b = []string{tmpStr}
+		return nil
+	}
+	return fmt.Errorf("unable to decode %s", value.Value)
+}
+
+// F - return prefix(es) as slice
+func (b *BatchJobPrefix) F() []string {
+	return *b
 }

@@ -33,13 +33,13 @@ import (
 // API sub-system constants
 const (
 	apiRequestsMax             = "requests_max"
-	apiRequestsDeadline        = "requests_deadline"
 	apiClusterDeadline         = "cluster_deadline"
 	apiCorsAllowOrigin         = "cors_allow_origin"
 	apiRemoteTransportDeadline = "remote_transport_deadline"
 	apiListQuorum              = "list_quorum"
 	apiReplicationPriority     = "replication_priority"
 	apiReplicationMaxWorkers   = "replication_max_workers"
+	apiReplicationMaxLWorkers  = "replication_max_lrg_workers"
 
 	apiTransitionWorkers           = "transition_workers"
 	apiStaleUploadsCleanupInterval = "stale_uploads_cleanup_interval"
@@ -52,16 +52,18 @@ const (
 	apiSyncEvents                  = "sync_events"
 	apiObjectMaxVersions           = "object_max_versions"
 
-	EnvAPIRequestsMax                 = "MINIO_API_REQUESTS_MAX"
-	EnvAPIRequestsDeadline            = "MINIO_API_REQUESTS_DEADLINE"
-	EnvAPIClusterDeadline             = "MINIO_API_CLUSTER_DEADLINE"
-	EnvAPICorsAllowOrigin             = "MINIO_API_CORS_ALLOW_ORIGIN"
-	EnvAPIRemoteTransportDeadline     = "MINIO_API_REMOTE_TRANSPORT_DEADLINE"
-	EnvAPITransitionWorkers           = "MINIO_API_TRANSITION_WORKERS"
-	EnvAPIListQuorum                  = "MINIO_API_LIST_QUORUM"
-	EnvAPISecureCiphers               = "MINIO_API_SECURE_CIPHERS" // default config.EnableOn
-	EnvAPIReplicationPriority         = "MINIO_API_REPLICATION_PRIORITY"
-	EnvAPIReplicationMaxWorkers       = "MINIO_API_REPLICATION_MAX_WORKERS"
+	EnvAPIRequestsMax             = "MINIO_API_REQUESTS_MAX"
+	EnvAPIRequestsDeadline        = "MINIO_API_REQUESTS_DEADLINE"
+	EnvAPIClusterDeadline         = "MINIO_API_CLUSTER_DEADLINE"
+	EnvAPICorsAllowOrigin         = "MINIO_API_CORS_ALLOW_ORIGIN"
+	EnvAPIRemoteTransportDeadline = "MINIO_API_REMOTE_TRANSPORT_DEADLINE"
+	EnvAPITransitionWorkers       = "MINIO_API_TRANSITION_WORKERS"
+	EnvAPIListQuorum              = "MINIO_API_LIST_QUORUM"
+	EnvAPISecureCiphers           = "MINIO_API_SECURE_CIPHERS" // default config.EnableOn
+	EnvAPIReplicationPriority     = "MINIO_API_REPLICATION_PRIORITY"
+	EnvAPIReplicationMaxWorkers   = "MINIO_API_REPLICATION_MAX_WORKERS"
+	EnvAPIReplicationMaxLWorkers  = "MINIO_API_REPLICATION_MAX_LRG_WORKERS"
+
 	EnvAPIStaleUploadsCleanupInterval = "MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL"
 	EnvAPIStaleUploadsExpiry          = "MINIO_API_STALE_UPLOADS_EXPIRY"
 	EnvAPIDeleteCleanupInterval       = "MINIO_API_DELETE_CLEANUP_INTERVAL"
@@ -78,6 +80,7 @@ const (
 // Deprecated key and ENVs
 const (
 	apiReadyDeadline            = "ready_deadline"
+	apiRequestsDeadline         = "requests_deadline"
 	apiReplicationWorkers       = "replication_workers"
 	apiReplicationFailedWorkers = "replication_failed_workers"
 )
@@ -88,10 +91,6 @@ var (
 		config.KV{
 			Key:   apiRequestsMax,
 			Value: "0",
-		},
-		config.KV{
-			Key:   apiRequestsDeadline,
-			Value: "10s",
 		},
 		config.KV{
 			Key:   apiClusterDeadline,
@@ -116,6 +115,10 @@ var (
 		config.KV{
 			Key:   apiReplicationMaxWorkers,
 			Value: "500",
+		},
+		config.KV{
+			Key:   apiReplicationMaxLWorkers,
+			Value: "10",
 		},
 		config.KV{
 			Key:   apiTransitionWorkers,
@@ -164,13 +167,13 @@ var (
 // Config storage class configuration
 type Config struct {
 	RequestsMax                 int           `json:"requests_max"`
-	RequestsDeadline            time.Duration `json:"requests_deadline"`
 	ClusterDeadline             time.Duration `json:"cluster_deadline"`
 	CorsAllowOrigin             []string      `json:"cors_allow_origin"`
 	RemoteTransportDeadline     time.Duration `json:"remote_transport_deadline"`
 	ListQuorum                  string        `json:"list_quorum"`
 	ReplicationPriority         string        `json:"replication_priority"`
 	ReplicationMaxWorkers       int           `json:"replication_max_workers"`
+	ReplicationMaxLWorkers      int           `json:"replication_max_lrg_workers"`
 	TransitionWorkers           int           `json:"transition_workers"`
 	StaleUploadsCleanupInterval time.Duration `json:"stale_uploads_cleanup_interval"`
 	StaleUploadsExpiry          time.Duration `json:"stale_uploads_expiry"`
@@ -197,6 +200,7 @@ func (sCfg *Config) UnmarshalJSON(data []byte) error {
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	deprecatedKeys := []string{
 		apiReadyDeadline,
+		apiRequestsDeadline,
 		"extend_list_cache_life",
 		apiReplicationWorkers,
 		apiReplicationFailedWorkers,
@@ -243,12 +247,6 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		return cfg, errors.New("invalid API max requests value")
 	}
 
-	requestsDeadline, err := time.ParseDuration(env.Get(EnvAPIRequestsDeadline, kvs.GetWithDefault(apiRequestsDeadline, DefaultKVS)))
-	if err != nil {
-		return cfg, err
-	}
-	cfg.RequestsDeadline = requestsDeadline
-
 	clusterDeadline, err := time.ParseDuration(env.Get(EnvAPIClusterDeadline, kvs.GetWithDefault(apiClusterDeadline, DefaultKVS)))
 	if err != nil {
 		return cfg, err
@@ -280,11 +278,21 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err != nil {
 		return cfg, err
 	}
-
 	if replicationMaxWorkers <= 0 || replicationMaxWorkers > 500 {
 		return cfg, config.ErrInvalidReplicationWorkersValue(nil).Msg("Number of replication workers should be between 1 and 500")
 	}
 	cfg.ReplicationMaxWorkers = replicationMaxWorkers
+
+	replicationMaxLWorkers, err := strconv.Atoi(env.Get(EnvAPIReplicationMaxLWorkers, kvs.GetWithDefault(apiReplicationMaxLWorkers, DefaultKVS)))
+	if err != nil {
+		return cfg, err
+	}
+	if replicationMaxLWorkers <= 0 || replicationMaxLWorkers > 10 {
+		return cfg, config.ErrInvalidReplicationWorkersValue(nil).Msg("Number of replication workers for transfers >=128MiB should be between 1 and 10 per node")
+	}
+
+	cfg.ReplicationMaxLWorkers = replicationMaxLWorkers
+
 	transitionWorkers, err := strconv.Atoi(env.Get(EnvAPITransitionWorkers, kvs.GetWithDefault(apiTransitionWorkers, DefaultKVS)))
 	if err != nil {
 		return cfg, err

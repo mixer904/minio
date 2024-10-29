@@ -593,8 +593,9 @@ func generateListVersionsResponse(ctx context.Context, bucket, prefix, marker, v
 			for k, v := range cleanReservedKeys(object.UserDefined) {
 				content.UserMetadata.Set(k, v)
 			}
-
-			content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
+			if !object.Expires.IsZero() {
+				content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
+			}
 			content.Internal = &ObjectInternalInfo{
 				K: object.DataBlocks,
 				M: object.ParityBlocks,
@@ -729,7 +730,9 @@ func generateListObjectsV2Response(ctx context.Context, bucket, prefix, token, n
 				for k, v := range cleanReservedKeys(object.UserDefined) {
 					content.UserMetadata.Set(k, v)
 				}
-				content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
+				if !object.Expires.IsZero() {
+					content.UserMetadata.Set("expires", object.Expires.Format(http.TimeFormat))
+				}
 				content.Internal = &ObjectInternalInfo{
 					K: object.DataBlocks,
 					M: object.ParityBlocks,
@@ -947,19 +950,10 @@ func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
 // writeErrorResponse writes error headers
 func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
 	switch err.HTTPStatusCode {
-	case http.StatusServiceUnavailable:
+	case http.StatusServiceUnavailable, http.StatusTooManyRequests:
 		// Set retry-after header to indicate user-agents to retry request after 60 seconds.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
 		w.Header().Set(xhttp.RetryAfter, "60")
-	case http.StatusTooManyRequests:
-		_, deadline := globalAPIConfig.getRequestsPool()
-		if deadline <= 0 {
-			// Set retry-after header to indicate user-agents to retry request after 10 seconds.
-			// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
-			w.Header().Set(xhttp.RetryAfter, "10")
-		} else {
-			w.Header().Set(xhttp.RetryAfter, strconv.Itoa(int(deadline.Seconds())))
-		}
 	}
 
 	switch err.Code {

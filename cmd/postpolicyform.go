@@ -29,10 +29,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bcicen/jstream"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/s3select/jstream"
 )
 
 // startWithConds - map which indicates if a given condition supports starts-with policy operator
@@ -140,7 +140,7 @@ type PostPolicyForm struct {
 func sanitizePolicy(r io.Reader) (io.Reader, error) {
 	var buf bytes.Buffer
 	e := json.NewEncoder(&buf)
-	d := jstream.NewDecoder(r, 0).ObjectAsKVS()
+	d := jstream.NewDecoder(r, 0).ObjectAsKVS().MaxDepth(10)
 	sset := set.NewStringSet()
 	for mv := range d.Stream() {
 		var kvs jstream.KVS
@@ -364,7 +364,7 @@ func checkPostPolicy(formValues http.Header, postPolicyForm PostPolicyForm) erro
 		for key := range checkHeader {
 			logKeys = append(logKeys, key)
 		}
-		return fmt.Errorf("Each form field that you specify in a form (except %s) must appear in the list of conditions.", strings.Join(logKeys, ", "))
+		return fmt.Errorf("Each form field that you specify in a form must appear in the list of policy conditions. %q not specified in the policy.", strings.Join(logKeys, ", "))
 	}
 
 	return nil

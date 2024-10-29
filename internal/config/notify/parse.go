@@ -375,6 +375,10 @@ var (
 			Value: "0",
 		},
 		config.KV{
+			Key:   target.KafkaBatchCommitTimeout,
+			Value: "0s",
+		},
+		config.KV{
 			Key:   target.KafkaCompressionCodec,
 			Value: "",
 		},
@@ -463,14 +467,23 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 			return nil, err
 		}
 
+		batchCommitTimeoutEnv := target.EnvKafkaBatchCommitTimeout
+		if k != config.Default {
+			batchCommitTimeoutEnv = batchCommitTimeoutEnv + config.Default + k
+		}
+		batchCommitTimeout, err := time.ParseDuration(env.Get(batchCommitTimeoutEnv, kv.Get(target.KafkaBatchCommitTimeout)))
+		if err != nil {
+			return nil, err
+		}
 		kafkaArgs := target.KafkaArgs{
-			Enable:     enabled,
-			Brokers:    brokers,
-			Topic:      env.Get(topicEnv, kv.Get(target.KafkaTopic)),
-			QueueDir:   env.Get(queueDirEnv, kv.Get(target.KafkaQueueDir)),
-			QueueLimit: queueLimit,
-			Version:    env.Get(versionEnv, kv.Get(target.KafkaVersion)),
-			BatchSize:  uint32(batchSize),
+			Enable:             enabled,
+			Brokers:            brokers,
+			Topic:              env.Get(topicEnv, kv.Get(target.KafkaTopic)),
+			QueueDir:           env.Get(queueDirEnv, kv.Get(target.KafkaQueueDir)),
+			QueueLimit:         queueLimit,
+			Version:            env.Get(versionEnv, kv.Get(target.KafkaVersion)),
+			BatchSize:          uint32(batchSize),
+			BatchCommitTimeout: batchCommitTimeout,
 		}
 
 		tlsEnableEnv := target.EnvKafkaTLS
@@ -861,20 +874,24 @@ var (
 			Value: config.EnableOff,
 		},
 		config.KV{
-			Key:   target.NATSStreaming,
-			Value: config.EnableOff,
+			Key:           target.NATSStreaming,
+			Value:         config.EnableOff,
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   target.NATSStreamingAsync,
-			Value: config.EnableOff,
+			Key:           target.NATSStreamingAsync,
+			Value:         config.EnableOff,
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   target.NATSStreamingMaxPubAcksInFlight,
-			Value: "0",
+			Key:           target.NATSStreamingMaxPubAcksInFlight,
+			Value:         "0",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   target.NATSStreamingClusterID,
-			Value: "",
+			Key:           target.NATSStreamingClusterID,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
 			Key:   target.NATSQueueDir,

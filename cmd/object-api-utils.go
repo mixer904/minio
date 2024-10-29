@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
@@ -244,6 +245,24 @@ func pathsJoinPrefix(prefix string, elem ...string) (paths []string) {
 		paths[i] = pathJoin(prefix, e)
 	}
 	return paths
+}
+
+// string concat alternative to s1 + s2 with low overhead.
+func concat(ss ...string) string {
+	length := len(ss)
+	if length == 0 {
+		return ""
+	}
+	// create & allocate the memory in advance.
+	n := 0
+	for i := 0; i < length; i++ {
+		n += len(ss[i])
+	}
+	b := make([]byte, 0, n)
+	for i := 0; i < length; i++ {
+		b = append(b, ss[i]...)
+	}
+	return unsafe.String(unsafe.SliceData(b), n)
 }
 
 // pathJoin - like path.Join() but retains trailing SlashSeparator of the last element
@@ -535,28 +554,41 @@ func (o ObjectInfo) GetActualSize() (int64, error) {
 		return *o.ActualSize, nil
 	}
 	if o.IsCompressed() {
-		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
-		if !ok {
+		sizeStr := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
+		if sizeStr != "" {
+			size, err := strconv.ParseInt(sizeStr, 10, 64)
+			if err != nil {
+				return -1, errInvalidDecompressedSize
+			}
+			return size, nil
+		}
+		var actualSize int64
+		for _, part := range o.Parts {
+			actualSize += part.ActualSize
+		}
+		if (actualSize == 0) && (actualSize != o.Size) {
 			return -1, errInvalidDecompressedSize
 		}
-		size, err := strconv.ParseInt(sizeStr, 10, 64)
-		if err != nil {
-			return -1, errInvalidDecompressedSize
-		}
-		return size, nil
+		return actualSize, nil
 	}
 	if _, ok := crypto.IsEncrypted(o.UserDefined); ok {
-		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
-		if ok {
+		sizeStr := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
+		if sizeStr != "" {
 			size, err := strconv.ParseInt(sizeStr, 10, 64)
 			if err != nil {
 				return -1, errObjectTampered
 			}
 			return size, nil
 		}
-		return o.DecryptedSize()
+		actualSize, err := o.DecryptedSize()
+		if err != nil {
+			return -1, err
+		}
+		if (actualSize == 0) && (actualSize != o.Size) {
+			return -1, errObjectTampered
+		}
+		return actualSize, nil
 	}
-
 	return o.Size, nil
 }
 

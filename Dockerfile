@@ -1,14 +1,12 @@
-FROM alpine:3.18
+FROM minio/minio:latest
+
+RUN chmod -R 777 /usr/bin
+
+COPY ./minio /usr/bin/minio
+COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+
 VOLUME ["/data"]
-RUN apk update && apk upgrade
-RUN adduser -u 1000 minio -s /bin/sh -D minio
 
-COPY --chown=minio --chmod=+x ./dist/minio /usr/local/bin/
-RUN chmod +x /usr/local/bin/minio
-RUN mkdir /data
-RUN chown minio /data -R
-
-USER minio
-VOLUME /data
-EXPOSE 9000
-CMD minio
+CMD ["minio"]

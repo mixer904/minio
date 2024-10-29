@@ -569,7 +569,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				APIName: "Scanner",
 				Bucket:  f.root,
 				Object:  prefixName,
-				Tags: map[string]interface{}{
+				Tags: map[string]string{
 					"x-minio-prefixes-total": strconv.Itoa(totalFolders),
 				},
 			})
@@ -1138,7 +1138,7 @@ func (i *scannerItem) applyVersionActions(ctx context.Context, o ObjectLayer, fi
 			APIName: "Scanner",
 			Bucket:  i.bucket,
 			Object:  i.objectPath(),
-			Tags: map[string]interface{}{
+			Tags: map[string]string{
 				"x-minio-versions": strconv.Itoa(len(objInfos)),
 			},
 		})
@@ -1170,7 +1170,7 @@ func (i *scannerItem) applyVersionActions(ctx context.Context, o ObjectLayer, fi
 			APIName: "Scanner",
 			Bucket:  i.bucket,
 			Object:  i.objectPath(),
-			Tags: map[string]interface{}{
+			Tags: map[string]string{
 				"x-minio-versions-count": strconv.Itoa(len(objInfos)),
 				"x-minio-versions-size":  strconv.FormatInt(cumulativeSize, 10),
 			},
@@ -1325,10 +1325,13 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	dobj, err = objLayer.DeleteObject(ctx, obj.Bucket, encodeDirObject(obj.Name), opts)
 	if err != nil {
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			traceFn(ILMExpiry, nil, nil)
 			return false
 		}
 		// Assume it is still there.
-		ilmLogOnceIf(ctx, fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err), "non-transition-expiry"+obj.Name)
+		err := fmt.Errorf("DeleteObject(%s, %s): %w", obj.Bucket, obj.Name, err)
+		ilmLogOnceIf(ctx, err, "non-transition-expiry"+obj.Name)
+		traceFn(ILMExpiry, nil, err)
 		return false
 	}
 	if dobj.Name == "" {
@@ -1336,6 +1339,8 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 	}
 
 	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
+	tags["version-id"] = dobj.VersionID
+
 	// Send audit for the lifecycle delete operation
 	auditLogLifecycle(ctx, dobj, ILMExpiry, tags, traceFn)
 
@@ -1547,7 +1552,7 @@ const (
 	ILMTransition = " ilm:transition"
 )
 
-func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags map[string]interface{}, traceFn func(event string)) {
+func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags map[string]string, traceFn func(event string, metadata map[string]string, err error)) {
 	var apiName string
 	switch event {
 	case ILMExpiry:
@@ -1565,5 +1570,5 @@ func auditLogLifecycle(ctx context.Context, oi ObjectInfo, event string, tags ma
 		VersionID: oi.VersionID,
 		Tags:      tags,
 	})
-	traceFn(event)
+	traceFn(event, tags, nil)
 }

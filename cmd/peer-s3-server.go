@@ -34,7 +34,7 @@ const (
 
 func healBucketLocal(ctx context.Context, bucket string, opts madmin.HealOpts) (res madmin.HealResultItem, err error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	// Initialize sync waitgroup.
@@ -158,7 +158,7 @@ func healBucketLocal(ctx context.Context, bucket string, opts madmin.HealOpts) (
 
 func listBucketsLocal(ctx context.Context, opts BucketOptions) (buckets []BucketInfo, err error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	quorum := (len(localDrives) / 2)
@@ -204,15 +204,17 @@ func listBucketsLocal(ctx context.Context, opts BucketOptions) (buckets []Bucket
 	return buckets, nil
 }
 
-func cloneDrives(drives []StorageAPI) []StorageAPI {
-	newDrives := make([]StorageAPI, len(drives))
-	copy(newDrives, drives)
-	return newDrives
+func cloneDrives(drives map[string]StorageAPI) []StorageAPI {
+	copyDrives := make([]StorageAPI, 0, len(drives))
+	for _, drive := range drives {
+		copyDrives = append(copyDrives, drive)
+	}
+	return copyDrives
 }
 
 func getBucketInfoLocal(ctx context.Context, bucket string, opts BucketOptions) (BucketInfo, error) {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)
@@ -261,7 +263,7 @@ func getBucketInfoLocal(ctx context.Context, bucket string, opts BucketOptions) 
 
 func deleteBucketLocal(ctx context.Context, bucket string, opts DeleteBucketOptions) error {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)
@@ -277,29 +279,12 @@ func deleteBucketLocal(ctx context.Context, bucket string, opts DeleteBucketOpti
 		}, index)
 	}
 
-	var recreate bool
-	errs := g.Wait()
-	for index, err := range errs {
-		if errors.Is(err, errVolumeNotEmpty) {
-			recreate = true
-		}
-		if err == nil && recreate {
-			// ignore any errors
-			localDrives[index].MakeVol(ctx, bucket)
-		}
-	}
-
-	// Since we recreated buckets and error was `not-empty`, return not-empty.
-	if recreate {
-		return errVolumeNotEmpty
-	} // for all other errors reduce by write quorum.
-
-	return reduceWriteQuorumErrs(ctx, errs, bucketOpIgnoredErrs, (len(localDrives)/2)+1)
+	return reduceWriteQuorumErrs(ctx, g.Wait(), bucketOpIgnoredErrs, (len(localDrives)/2)+1)
 }
 
 func makeBucketLocal(ctx context.Context, bucket string, opts MakeBucketOptions) error {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	g := errgroup.WithNErrs(len(localDrives)).WithConcurrency(32)

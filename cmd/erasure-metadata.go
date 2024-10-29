@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
@@ -173,6 +174,7 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		}
 	}
 	objInfo.Checksum = fi.Checksum
+	objInfo.decryptPartsChecksums(nil)
 	objInfo.Inlined = fi.InlineData()
 	// Success.
 	return objInfo
@@ -214,9 +216,21 @@ func (fi FileInfo) ReplicationInfoEquals(ofi FileInfo) bool {
 }
 
 // objectPartIndex - returns the index of matching object part number.
+// Returns -1 if the part cannot be found.
 func objectPartIndex(parts []ObjectPartInfo, partNumber int) int {
 	for i, part := range parts {
 		if partNumber == part.Number {
+			return i
+		}
+	}
+	return -1
+}
+
+// objectPartIndexNums returns the index of the specified part number.
+// Returns -1 if the part cannot be found.
+func objectPartIndexNums(parts []int, partNumber int) int {
+	for i, part := range parts {
+		if part != 0 && partNumber == part {
 			return i
 		}
 	}
@@ -287,13 +301,14 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 		mtimeValid := meta.ModTime.Equal(modTime)
 		if mtimeValid || etagOnly {
 			fmt.Fprintf(h, "%v", meta.XLV1)
-			if !etagOnly {
-				// Verify dataDir is same only when mtime is valid and etag is not considered.
-				fmt.Fprintf(h, "%v", meta.GetDataDir())
-			}
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
+				fmt.Fprintf(h, "part.%d", part.Size)
 			}
+			// Previously we checked if we had quorum on DataDir value.
+			// We have removed this check to allow reading objects with different DataDir
+			// values in a few drives (due to a rebalance-stop race bug)
+			// provided their their etags or ModTimes match.
 
 			if !meta.Deleted && meta.Size != 0 {
 				fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
@@ -388,8 +403,7 @@ func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Tim
 	return findFileInfoInQuorum(ctx, metaArr, modTime, etag, quorum)
 }
 
-// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
-func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+func writeAllMetadataWithRevert(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int, revert bool) ([]StorageAPI, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	// Start writing `xl.meta` to all disks in parallel.
@@ -413,7 +427,35 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bu
 	mErrs := g.Wait()
 
 	err := reduceWriteQuorumErrs(ctx, mErrs, objectOpIgnoredErrs, quorum)
+	if err != nil && revert {
+		ng := errgroup.WithNErrs(len(disks))
+		for index := range disks {
+			if mErrs[index] != nil {
+				continue
+			}
+			index := index
+			ng.Go(func() error {
+				if disks[index] == nil {
+					return errDiskNotFound
+				}
+				return disks[index].Delete(ctx, bucket, pathJoin(prefix, xlStorageFormatFile), DeleteOptions{
+					Recursive: true,
+				})
+			}, index)
+		}
+		ng.Wait()
+	}
+
 	return evalDisks(disks, mErrs), err
+}
+
+func writeAllMetadata(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, true)
+}
+
+// writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
+func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+	return writeAllMetadataWithRevert(ctx, disks, origbucket, bucket, prefix, files, quorum, false)
 }
 
 func commonParity(parities []int, defaultParityCount int) int {
@@ -456,6 +498,7 @@ func commonParity(parities []int, defaultParityCount int) int {
 }
 
 func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int) {
+	totalShards := len(partsMetadata)
 	parities = make([]int, len(partsMetadata))
 	for index, metadata := range partsMetadata {
 		if errs[index] != nil {
@@ -466,9 +509,13 @@ func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int)
 			parities[index] = -1
 			continue
 		}
+		//nolint:gocritic
 		// Delete marker or zero byte objects take highest parity.
 		if metadata.Deleted || metadata.Size == 0 {
-			parities[index] = len(partsMetadata) / 2
+			parities[index] = totalShards / 2
+		} else if metadata.TransitionStatus == lifecycle.TransitionComplete {
+			// For tiered objects, read quorum is N/2+1 to ensure simple majority on xl.meta. It is not equal to EcM because the data integrity is entrusted with the warm tier.
+			parities[index] = totalShards - (totalShards/2 + 1)
 		} else {
 			parities[index] = metadata.Erasure.ParityBlocks
 		}

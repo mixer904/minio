@@ -93,8 +93,15 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if globalInplaceUpdateDisabled || currentReleaseTime.IsZero() {
+	if globalInplaceUpdateDisabled {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
+		return
+	}
+
+	if currentReleaseTime.IsZero() || currentReleaseTime.Equal(timeSentinel) {
+		apiErr := errorCodes.ToAPIErr(ErrMethodNotAllowed)
+		apiErr.Description = fmt.Sprintf("unable to perform in-place update, release time is unrecognized: %s", currentReleaseTime)
+		writeErrorResponseJSON(ctx, w, apiErr, r.URL)
 		return
 	}
 
@@ -108,6 +115,11 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		if runtime.GOOS == globalWindowsOSName {
 			updateURL = minioReleaseWindowsInfoURL
 		}
+	}
+
+	local := globalLocalNodeName
+	if local == "" {
+		local = "127.0.0.1"
 	}
 
 	u, err := url.Parse(updateURL)
@@ -128,6 +140,39 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	updateStatus := madmin.ServerUpdateStatusV2{
+		DryRun:  dryRun,
+		Results: make([]madmin.ServerPeerUpdateStatus, 0, len(globalNotificationSys.allPeerClients)),
+	}
+	peerResults := make(map[string]madmin.ServerPeerUpdateStatus, len(globalNotificationSys.allPeerClients))
+	failedClients := make(map[int]bool, len(globalNotificationSys.allPeerClients))
+
+	if lrTime.Sub(currentReleaseTime) <= 0 {
+		updateStatus.Results = append(updateStatus.Results, madmin.ServerPeerUpdateStatus{
+			Host:           local,
+			Err:            fmt.Sprintf("server is running the latest version: %s", Version),
+			CurrentVersion: Version,
+		})
+
+		for _, client := range globalNotificationSys.peerClients {
+			updateStatus.Results = append(updateStatus.Results, madmin.ServerPeerUpdateStatus{
+				Host:           client.String(),
+				Err:            fmt.Sprintf("server is running the latest version: %s", Version),
+				CurrentVersion: Version,
+			})
+		}
+
+		// Marshal API response
+		jsonBytes, err := json.Marshal(updateStatus)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+
+		writeSuccessResponseJSON(w, jsonBytes)
+		return
+	}
+
 	u.Path = path.Dir(u.Path) + SlashSeparator + releaseInfo
 	// Download Binary Once
 	binC, bin, err := downloadBinary(u, mode)
@@ -136,16 +181,6 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-
-	updateStatus := madmin.ServerUpdateStatusV2{DryRun: dryRun}
-	peerResults := make(map[string]madmin.ServerPeerUpdateStatus)
-
-	local := globalLocalNodeName
-	if local == "" {
-		local = "127.0.0.1"
-	}
-
-	failedClients := make(map[int]struct{})
 
 	if globalIsDistErasure {
 		// Push binary to other servers
@@ -156,7 +191,7 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 					Err:            nerr.Err.Error(),
 					CurrentVersion: Version,
 				}
-				failedClients[idx] = struct{}{}
+				failedClients[idx] = true
 			} else {
 				peerResults[nerr.Host.String()] = madmin.ServerPeerUpdateStatus{
 					Host:           nerr.Host.String(),
@@ -167,25 +202,17 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	if lrTime.Sub(currentReleaseTime) > 0 {
-		if err = verifyBinary(u, sha256Sum, releaseInfo, mode, bytes.NewReader(bin)); err != nil {
-			peerResults[local] = madmin.ServerPeerUpdateStatus{
-				Host:           local,
-				Err:            err.Error(),
-				CurrentVersion: Version,
-			}
-		} else {
-			peerResults[local] = madmin.ServerPeerUpdateStatus{
-				Host:           local,
-				CurrentVersion: Version,
-				UpdatedVersion: lrTime.Format(MinioReleaseTagTimeLayout),
-			}
+	if err = verifyBinary(u, sha256Sum, releaseInfo, mode, bytes.NewReader(bin)); err != nil {
+		peerResults[local] = madmin.ServerPeerUpdateStatus{
+			Host:           local,
+			Err:            err.Error(),
+			CurrentVersion: Version,
 		}
 	} else {
 		peerResults[local] = madmin.ServerPeerUpdateStatus{
 			Host:           local,
-			Err:            fmt.Sprintf("server is already running the latest version: %s", Version),
 			CurrentVersion: Version,
+			UpdatedVersion: lrTime.Format(MinioReleaseTagTimeLayout),
 		}
 	}
 
@@ -193,8 +220,7 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		if globalIsDistErasure {
 			ng := WithNPeers(len(globalNotificationSys.peerClients))
 			for idx, client := range globalNotificationSys.peerClients {
-				_, ok := failedClients[idx]
-				if ok {
+				if failedClients[idx] {
 					continue
 				}
 				client := client
@@ -240,14 +266,14 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 		startTime := time.Now().Add(restartUpdateDelay)
 		ng := WithNPeers(len(globalNotificationSys.peerClients))
 		for idx, client := range globalNotificationSys.peerClients {
-			_, ok := failedClients[idx]
-			if ok {
+			if failedClients[idx] {
 				continue
 			}
 			client := client
 			ng.Go(ctx, func() error {
 				prs, ok := peerResults[client.String()]
-				if ok && prs.CurrentVersion != prs.UpdatedVersion && prs.UpdatedVersion != "" {
+				// We restart only on success, not for any failures.
+				if ok && prs.Err == "" {
 					return client.SignalService(serviceRestart, "", dryRun, &startTime)
 				}
 				return nil
@@ -284,7 +310,9 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 	writeSuccessResponseJSON(w, jsonBytes)
 
 	if !dryRun {
-		if lrTime.Sub(currentReleaseTime) > 0 {
+		prs, ok := peerResults[local]
+		// We restart only on success, not for any failures.
+		if ok && prs.Err == "" {
 			globalServiceSignalCh <- serviceRestart
 		}
 	}
@@ -848,9 +876,10 @@ func (a adminAPIHandlers) DataUsageInfoHandler(w http.ResponseWriter, r *http.Re
 }
 
 func lriToLockEntry(l lockRequesterInfo, now time.Time, resource, server string) *madmin.LockEntry {
+	t := time.Unix(0, l.Timestamp)
 	entry := &madmin.LockEntry{
-		Timestamp:  l.Timestamp,
-		Elapsed:    now.Sub(l.Timestamp),
+		Timestamp:  t,
+		Elapsed:    now.Sub(t),
 		Resource:   resource,
 		ServerList: []string{server},
 		Source:     l.Source,
@@ -1035,7 +1064,7 @@ func (a adminAPIHandlers) StartProfilingHandler(w http.ResponseWriter, r *http.R
 	// Start profiling on remote servers.
 	var hostErrs []NotificationPeerErr
 	for _, profiler := range profiles {
-		hostErrs = append(hostErrs, globalNotificationSys.StartProfiling(profiler)...)
+		hostErrs = append(hostErrs, globalNotificationSys.StartProfiling(ctx, profiler)...)
 
 		// Start profiling locally as well.
 		prof, err := startProfiler(profiler)
@@ -1116,7 +1145,11 @@ func (a adminAPIHandlers) ProfileHandler(w http.ResponseWriter, r *http.Request)
 
 	// Start profiling on remote servers.
 	for _, profiler := range profiles {
-		globalNotificationSys.StartProfiling(profiler)
+		// Limit start time to max 10s.
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		globalNotificationSys.StartProfiling(ctx, profiler)
+		// StartProfiling blocks, so we can cancel now.
+		cancel()
 
 		// Start profiling locally as well.
 		prof, err := startProfiler(profiler)
@@ -1131,6 +1164,10 @@ func (a adminAPIHandlers) ProfileHandler(w http.ResponseWriter, r *http.Request)
 	for {
 		select {
 		case <-ctx.Done():
+			// Stop remote profiles
+			go globalNotificationSys.DownloadProfilingData(GlobalContext, io.Discard)
+
+			// Stop local
 			globalProfilerMu.Lock()
 			defer globalProfilerMu.Unlock()
 			for k, v := range globalProfiler {
@@ -2186,7 +2223,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
 	writeSuccessResponseHeadersOnly(w)
 }
 
-// KMSKeyStatusHandler - GET /minio/admin/v3/kms/status
+// KMSStatusHandler - GET /minio/admin/v3/kms/status
 func (a adminAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -2330,6 +2367,7 @@ func getPoolsInfo(ctx context.Context, allDisks []madmin.Disk) (map[int]map[int]
 }
 
 func getServerInfo(ctx context.Context, pools, metrics bool, r *http.Request) madmin.InfoMessage {
+	const operationTimeout = 10 * time.Second
 	ldap := madmin.LDAP{}
 	if globalIAMSys.LDAPConfig.Enabled() {
 		ldapConn, err := globalIAMSys.LDAPConfig.LDAP.Connect()
@@ -2370,7 +2408,9 @@ func getServerInfo(ctx context.Context, pools, metrics bool, r *http.Request) ma
 		mode = madmin.ItemOnline
 
 		// Load data usage
-		dataUsageInfo, err := loadDataUsageFromBackend(ctx, objectAPI)
+		ctx2, cancel := context.WithTimeout(ctx, operationTimeout)
+		dataUsageInfo, err := loadDataUsageFromBackend(ctx2, objectAPI)
+		cancel()
 		if err == nil {
 			buckets = madmin.Buckets{Count: dataUsageInfo.BucketsCount}
 			objects = madmin.Objects{Count: dataUsageInfo.ObjectsTotalCount}
@@ -2404,17 +2444,23 @@ func getServerInfo(ctx context.Context, pools, metrics bool, r *http.Request) ma
 		}
 
 		if pools {
-			poolsInfo, _ = getPoolsInfo(ctx, allDisks)
+			ctx2, cancel := context.WithTimeout(ctx, operationTimeout)
+			poolsInfo, _ = getPoolsInfo(ctx2, allDisks)
+			cancel()
 		}
 	}
 
 	domain := globalDomainNames
 	services := madmin.Services{
-		KMSStatus:     fetchKMSStatus(ctx),
 		LDAP:          ldap,
 		Logger:        log,
 		Audit:         audit,
 		Notifications: notifyTarget,
+	}
+	{
+		ctx2, cancel := context.WithTimeout(ctx, operationTimeout)
+		services.KMSStatus = fetchKMSStatus(ctx2)
+		cancel()
 	}
 
 	return madmin.InfoMessage{
@@ -3049,7 +3095,7 @@ func targetStatus(ctx context.Context, h logger.Target) madmin.Status {
 	return madmin.Status{Status: string(madmin.ItemOffline)}
 }
 
-// fetchLoggerDetails return log info
+// fetchLoggerInfo return log info
 func fetchLoggerInfo(ctx context.Context) ([]madmin.Logger, []madmin.Audit) {
 	var loggerInfo []madmin.Logger
 	var auditloggerInfo []madmin.Audit

@@ -83,6 +83,8 @@ func TestMain(m *testing.M) {
 		SecretKey: auth.DefaultSecretKey,
 	}
 
+	globalNodeAuthToken, _ = authenticateNode(auth.DefaultAccessKey, auth.DefaultSecretKey)
+
 	// disable ENVs which interfere with tests.
 	for _, env := range []string{
 		crypto.EnvKMSAutoEncryption,
@@ -100,7 +102,7 @@ func TestMain(m *testing.M) {
 	// Disable printing console messages during tests.
 	color.Output = io.Discard
 	// Disable Error logging in testing.
-	logger.DisableErrorLog = true
+	logger.DisableLog = true
 
 	// Uncomment the following line to see trace logs during unit tests.
 	// logger.AddTarget(console.New())
@@ -349,7 +351,9 @@ func initTestServerWithBackend(ctx context.Context, t TestErrHandler, testServer
 	// Test Server needs to start before formatting of disks.
 	// Get credential.
 	credentials := globalActiveCred
-
+	if !globalReplicationPool.IsSet() {
+		globalReplicationPool.Set(nil)
+	}
 	testServer.Obj = objLayer
 	testServer.rawDiskPaths = disks
 	testServer.Disks = mustGetPoolEndpoints(0, disks...)
@@ -1634,7 +1638,7 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Object API Nil Test expected to fail with %d, but failed with %d", accessDenied, rec.Code)))
 	}
 
-	// HEAD HTTTP request doesn't contain response body.
+	// HEAD HTTP request doesn't contain response body.
 	if anonReq.Method != http.MethodHead {
 		// read the response body.
 		var actualContent []byte

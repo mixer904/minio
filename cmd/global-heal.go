@@ -150,6 +150,11 @@ type healEntryResult struct {
 
 // healErasureSet lists and heals all objects in a specific erasure set
 func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, tracker *healingTracker) error {
+	bgSeq, found := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
+	if !found {
+		return errors.New("no local healing sequence initialized, unable to heal the drive")
+	}
+
 	scanMode := madmin.HealNormalScan
 
 	// Make sure to copy since `buckets slice`
@@ -162,12 +167,21 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		return errServerNotInitialized
 	}
 
+	started := tracker.Started
+	if started.IsZero() || started.Equal(timeSentinel) {
+		healingLogIf(ctx, fmt.Errorf("unexpected tracker healing start time found: %v", started))
+		started = time.Time{}
+	}
+
+	// Final tracer update before quitting
+	defer func() {
+		tracker.setObject("")
+		tracker.setBucket("")
+		healingLogIf(ctx, tracker.update(ctx))
+	}()
+
 	for _, bucket := range healBuckets {
-		_, err := objAPI.HealBucket(ctx, bucket, madmin.HealOpts{
-			Recreate: true,
-			ScanMode: scanMode,
-		})
-		if err != nil {
+		if err := bgSeq.healBucket(objAPI, bucket, true); err != nil {
 			// Log bucket healing error if any, we shall retry again.
 			healingLogIf(ctx, err)
 		}
@@ -193,7 +207,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		numHealers = uint64(v)
 	}
 
-	healingLogEvent(ctx, fmt.Sprintf("Healing drive '%s' - use %d parallel workers.", tracker.disk.String(), numHealers))
+	healingLogEvent(ctx, "Healing drive '%s' - use %d parallel workers.", tracker.disk.String(), numHealers)
 
 	jt, _ := workers.New(int(numHealers))
 
@@ -226,7 +240,11 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 
 	// Collect updates to tracker from concurrent healEntry calls
 	results := make(chan healEntryResult, 1000)
-	defer close(results)
+	quitting := make(chan struct{})
+	defer func() {
+		close(results)
+		<-quitting
+	}()
 
 	go func() {
 		for res := range results {
@@ -240,6 +258,9 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 
 			tracker.updateProgress(res.success, res.skipped, res.bytes)
 		}
+
+		healingLogIf(ctx, tracker.update(ctx))
+		close(quitting)
 	}()
 
 	var retErr error
@@ -264,10 +285,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		tracker.setBucket(bucket)
 		// Heal current bucket again in case if it is failed
 		// in the beginning of erasure set healing
-		if _, err := objAPI.HealBucket(ctx, bucket, madmin.HealOpts{
-			Recreate: true,
-			ScanMode: scanMode,
-		}); err != nil {
+		if err := bgSeq.healBucket(objAPI, bucket, true); err != nil {
 			// Set this such that when we return this function
 			// we let the caller retry this disk again for the
 			// buckets that failed healing.
@@ -366,6 +384,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				}
 				return false
 			case results <- result:
+				bgSeq.countScanned(madmin.HealItemObject)
 				return true
 			}
 		}
@@ -416,8 +435,10 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 						return
 					}
 					result = healEntryFailure(0)
+					bgSeq.countFailed(madmin.HealItemObject)
 					healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, entry.name, err))
 				} else {
+					bgSeq.countHealed(madmin.HealItemObject)
 					result = healEntrySuccess(uint64(res.ObjectSize))
 				}
 
@@ -427,13 +448,10 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 
 			var versionNotFound int
 			for _, version := range fivs.Versions {
-				// Ignore a version with a modtime newer than healing start time.
-				if version.ModTime.After(tracker.Started) {
-					continue
-				}
-
-				// Apply lifecycle rules on the objects that are expired.
-				if filterLifecycle(bucket, version.Name, version) {
+				// Ignore healing a version if:
+				// - It is uploaded after the drive healing is started
+				// - An object that is already expired by ILM rule.
+				if !started.IsZero() && version.ModTime.After(started) || filterLifecycle(bucket, version.Name, version) {
 					versionNotFound++
 					if !send(healEntrySkipped(uint64(version.Size))) {
 						return
@@ -453,15 +471,26 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 						versionNotFound++
 						continue
 					}
-					// If not deleted, assume they failed.
+				} else {
+					// Look for the healing results
+					if res.After.Drives[tracker.DiskIndex].State != madmin.DriveStateOk {
+						err = fmt.Errorf("unexpected after heal state: %s", res.After.Drives[tracker.DiskIndex].State)
+					}
+				}
+
+				if err == nil {
+					bgSeq.countHealed(madmin.HealItemObject)
+					result = healEntrySuccess(uint64(version.Size))
+				} else {
+					bgSeq.countFailed(madmin.HealItemObject)
 					result = healEntryFailure(uint64(version.Size))
 					if version.VersionID != "" {
-						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s-v(%s): %w", bucket, version.Name, version.VersionID, err))
+						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s (version-id=%s): %w",
+							bucket, version.Name, version.VersionID, err))
 					} else {
-						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, version.Name, err))
+						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w",
+							bucket, version.Name, err))
 					}
-				} else {
-					result = healEntrySuccess(uint64(res.ObjectSize))
 				}
 
 				if !send(result) {
@@ -509,7 +538,11 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				jt.Take()
 				go healEntry(bucket, *entry)
 			},
-			finished: nil,
+			finished: func(errs []error) {
+				if countErrs(errs, nil) != len(errs) {
+					retErr = fmt.Errorf("one or more errors reported during listing: %v", errors.Join(errs...))
+				}
+			},
 		})
 		jt.Wait() // synchronize all the concurrent heal jobs
 		if err != nil {
@@ -517,7 +550,10 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			// we let the caller retry this disk again for the
 			// buckets it failed to list.
 			retErr = err
-			healingLogIf(ctx, fmt.Errorf("listing failed with: %v on bucket: %v", err, bucket))
+		}
+
+		if retErr != nil {
+			healingLogIf(ctx, fmt.Errorf("listing failed with: %v on bucket: %v", retErr, bucket))
 			continue
 		}
 
@@ -530,10 +566,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			healingLogIf(ctx, tracker.update(ctx))
 		}
 	}
-
-	tracker.setObject("")
-	tracker.setBucket("")
-
 	if retErr != nil {
 		return retErr
 	}

@@ -91,9 +91,6 @@ func init() {
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	globalBatchJobsMetrics = batchJobMetrics{metrics: make(map[string]*batchJobInfo)}
-	go globalBatchJobsMetrics.purgeJobMetrics()
-
 	t, _ := minioVersionToReleaseTime(Version)
 	if !t.IsZero() {
 		globalVersionUnix = uint64(t.Unix())
@@ -137,6 +134,9 @@ func minioConfigToConsoleFeatures() {
 	}
 	if value := env.Get(config.EnvBrowserRedirectURL, ""); value != "" {
 		os.Setenv("CONSOLE_BROWSER_REDIRECT_URL", value)
+	}
+	if value := env.Get(config.EnvConsoleDebugLogLevel, ""); value != "" {
+		os.Setenv("CONSOLE_DEBUG_LOGLEVEL", value)
 	}
 	// pass the console subpath configuration
 	if globalBrowserRedirectURL != nil {
@@ -461,25 +461,27 @@ func handleCommonArgs(ctxt serverCtxt) {
 	certsDir := ctxt.CertsDir
 	certsSet := ctxt.certsDirSet
 
-	if consoleAddr == "" {
-		p, err := xnet.GetFreePort()
-		if err != nil {
-			logger.FatalIf(err, "Unable to get free port for Console UI on the host")
+	if globalBrowserEnabled {
+		if consoleAddr == "" {
+			p, err := xnet.GetFreePort()
+			if err != nil {
+				logger.FatalIf(err, "Unable to get free port for Console UI on the host")
+			}
+			// hold the port
+			l, err := net.Listen("TCP", fmt.Sprintf(":%s", p.String()))
+			if err == nil {
+				defer l.Close()
+			}
+			consoleAddr = net.JoinHostPort("", p.String())
 		}
-		// hold the port
-		l, err := net.Listen("TCP", fmt.Sprintf(":%s", p.String()))
-		if err == nil {
-			defer l.Close()
+
+		if _, _, err := net.SplitHostPort(consoleAddr); err != nil {
+			logger.FatalIf(err, "Unable to start listening on console port")
 		}
-		consoleAddr = net.JoinHostPort("", p.String())
-	}
 
-	if _, _, err := net.SplitHostPort(consoleAddr); err != nil {
-		logger.FatalIf(err, "Unable to start listening on console port")
-	}
-
-	if consoleAddr == addr {
-		logger.FatalIf(errors.New("--console-address cannot be same as --address"), "Unable to start the server")
+		if consoleAddr == addr {
+			logger.FatalIf(errors.New("--console-address cannot be same as --address"), "Unable to start the server")
+		}
 	}
 
 	globalMinioHost, globalMinioPort = mustSplitHostPort(addr)
@@ -492,7 +494,9 @@ func handleCommonArgs(ctxt serverCtxt) {
 		globalDynamicAPIPort = true
 	}
 
-	globalMinioConsoleHost, globalMinioConsolePort = mustSplitHostPort(consoleAddr)
+	if globalBrowserEnabled {
+		globalMinioConsoleHost, globalMinioConsolePort = mustSplitHostPort(consoleAddr)
+	}
 
 	if globalMinioPort == globalMinioConsolePort {
 		logger.FatalIf(errors.New("--console-address port cannot be same as --address port"), "Unable to start the server")
@@ -685,16 +689,6 @@ func loadEnvVarsFromFiles() {
 		}
 	}
 
-	if env.IsSet(kms.EnvKMSSecretKeyFile) {
-		kmsSecret, err := readFromSecret(env.Get(kms.EnvKMSSecretKeyFile, ""))
-		if err != nil {
-			logger.Fatal(err, "Unable to read the KMS secret key inherited from secret file")
-		}
-		if kmsSecret != "" {
-			os.Setenv(kms.EnvKMSSecretKey, kmsSecret)
-		}
-	}
-
 	if env.IsSet(config.EnvConfigEnvFile) {
 		ekvs, err := minioEnvironFromFile(env.Get(config.EnvConfigEnvFile, ""))
 		if err != nil && !os.IsNotExist(err) {
@@ -706,12 +700,16 @@ func loadEnvVarsFromFiles() {
 	}
 }
 
-func serverHandleEnvVars() {
+func serverHandleEarlyEnvVars() {
 	var err error
 	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
 		logger.Fatal(config.ErrInvalidBrowserValue(err), "Invalid MINIO_BROWSER value in environment variable")
 	}
+}
+
+func serverHandleEnvVars() {
+	var err error
 	if globalBrowserEnabled {
 		if redirectURL := env.Get(config.EnvBrowserRedirectURL, ""); redirectURL != "" {
 			u, err := xnet.ParseHTTPURL(redirectURL)
@@ -768,7 +766,7 @@ func serverHandleEnvVars() {
 	if len(domains) != 0 {
 		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
 			if _, ok := dns2.IsDomainName(domainName); !ok {
-				logger.Fatal(config.ErrInvalidDomainValue(nil).Msg("Unknown value `%s`", domainName),
+				logger.Fatal(config.ErrInvalidDomainValue(nil).Msgf("Unknown value `%s`", domainName),
 					"Invalid MINIO_DOMAIN value in environment variable")
 			}
 			globalDomainNames = append(globalDomainNames, domainName)
@@ -777,7 +775,7 @@ func serverHandleEnvVars() {
 		lcpSuf := lcpSuffix(globalDomainNames)
 		for _, domainName := range globalDomainNames {
 			if domainName == lcpSuf && len(globalDomainNames) > 1 {
-				logger.Fatal(config.ErrOverlappingDomainValue(nil).Msg("Overlapping domains `%s` not allowed", globalDomainNames),
+				logger.Fatal(config.ErrOverlappingDomainValue(nil).Msgf("Overlapping domains `%s` not allowed", globalDomainNames),
 					"Invalid MINIO_DOMAIN value in environment variable")
 			}
 		}
@@ -843,6 +841,7 @@ func loadRootCredentials() {
 	// Check both cases and authenticate them if correctly defined
 	var user, password string
 	var hasCredentials bool
+	var legacyCredentials bool
 	//nolint:gocritic
 	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		user = env.Get(config.EnvRootUser, "")
@@ -851,6 +850,7 @@ func loadRootCredentials() {
 	} else if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 		user = env.Get(config.EnvAccessKey, "")
 		password = env.Get(config.EnvSecretKey, "")
+		legacyCredentials = true
 		hasCredentials = true
 	} else if globalServerCtxt.RootUser != "" && globalServerCtxt.RootPwd != "" {
 		user, password = globalServerCtxt.RootUser, globalServerCtxt.RootPwd
@@ -859,8 +859,13 @@ func loadRootCredentials() {
 	if hasCredentials {
 		cred, err := auth.CreateCredentials(user, password)
 		if err != nil {
-			logger.Fatal(config.ErrInvalidCredentials(err),
-				"Unable to validate credentials inherited from the shell environment")
+			if legacyCredentials {
+				logger.Fatal(config.ErrInvalidCredentials(err),
+					"Unable to validate credentials inherited from the shell environment")
+			} else {
+				logger.Fatal(config.ErrInvalidRootUserCredentials(err),
+					"Unable to validate credentials inherited from the shell environment")
+			}
 		}
 		if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 			msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
@@ -873,6 +878,12 @@ func loadRootCredentials() {
 		globalCredViaEnv = true
 	} else {
 		globalActiveCred = auth.DefaultCredentials
+	}
+
+	var err error
+	globalNodeAuthToken, err = authenticateNode(globalActiveCred.AccessKey, globalActiveCred.SecretKey)
+	if err != nil {
+		logger.Fatal(err, "Unable to generate internode credentials")
 	}
 }
 

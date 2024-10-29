@@ -427,6 +427,21 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 			cfgPath := pathJoin(bi.Name, cfgFile)
 			bucket := bi.Name
 			switch cfgFile {
+			case bucketPolicyConfig:
+				config, _, err := globalBucketMetadataSys.GetBucketPolicy(bucket)
+				if err != nil {
+					if errors.Is(err, BucketPolicyNotFound{Bucket: bucket}) {
+						continue
+					}
+					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
+					return
+				}
+				configData, err := json.Marshal(config)
+				if err != nil {
+					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
+					return
+				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
 			case bucketNotificationConfig:
 				config, err := globalBucketMetadataSys.GetNotificationConfig(bucket)
 				if err != nil {
@@ -796,11 +811,12 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 			}
 
 			bucketMap[bucket].NotificationConfigXML = configData
+			bucketMap[bucket].NotificationConfigUpdatedAt = updatedAt
 			rpt.SetStatus(bucket, fileName, nil)
 		case bucketPolicyConfig:
 			// Error out if Content-Length is beyond allowed size.
 			if sz > maxBucketPolicySize {
-				rpt.SetStatus(bucket, fileName, fmt.Errorf(ErrPolicyTooLarge.String()))
+				rpt.SetStatus(bucket, fileName, errors.New(ErrPolicyTooLarge.String()))
 				continue
 			}
 
@@ -818,7 +834,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 
 			// Version in policy must not be empty
 			if bucketPolicy.Version == "" {
-				rpt.SetStatus(bucket, fileName, fmt.Errorf(ErrPolicyInvalidVersion.String()))
+				rpt.SetStatus(bucket, fileName, errors.New(ErrPolicyInvalidVersion.String()))
 				continue
 			}
 

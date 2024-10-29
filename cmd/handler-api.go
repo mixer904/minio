@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/minio/minio/internal/config/api"
@@ -39,14 +40,14 @@ import (
 type apiConfig struct {
 	mu sync.RWMutex
 
-	requestsDeadline      time.Duration
-	requestsPool          chan struct{}
-	clusterDeadline       time.Duration
-	listQuorum            string
-	corsAllowOrigins      []string
-	replicationPriority   string
-	replicationMaxWorkers int
-	transitionWorkers     int
+	requestsPool           chan struct{}
+	clusterDeadline        time.Duration
+	listQuorum             string
+	corsAllowOrigins       []string
+	replicationPriority    string
+	replicationMaxWorkers  int
+	replicationMaxLWorkers int
+	transitionWorkers      int
 
 	staleUploadsExpiry          time.Duration
 	staleUploadsCleanupInterval time.Duration
@@ -61,7 +62,6 @@ type apiConfig struct {
 const (
 	cgroupV1MemLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 	cgroupV2MemLimitFile = "/sys/fs/cgroup/memory.max"
-	cgroupMemNoLimit     = 9223372036854771712
 )
 
 func cgroupMemLimit() (limit uint64) {
@@ -78,10 +78,8 @@ func cgroupMemLimit() (limit uint64) {
 		// but still, no need to interpret more
 		return 0
 	}
-	if limit == cgroupMemNoLimit {
-		// No limit set, It's the highest positive signed 64-bit
-		// integer (2^63-1), rounded down to multiples of 4096 (2^12),
-		// the most common page size on x86 systems - for cgroup_limits.
+	if limit >= 100*humanize.TiByte {
+		// No limit set, or unreasonably high. Ignore
 		return 0
 	}
 	return limit
@@ -163,18 +161,18 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int, legacy bool) {
 		// but this shouldn't last long.
 		t.requestsPool = make(chan struct{}, apiRequestsMaxPerNode)
 	}
-	t.requestsDeadline = cfg.RequestsDeadline
 	listQuorum := cfg.ListQuorum
 	if listQuorum == "" {
 		listQuorum = "strict"
 	}
 	t.listQuorum = listQuorum
-	if globalReplicationPool != nil &&
-		(cfg.ReplicationPriority != t.replicationPriority || cfg.ReplicationMaxWorkers != t.replicationMaxWorkers) {
-		globalReplicationPool.ResizeWorkerPriority(cfg.ReplicationPriority, cfg.ReplicationMaxWorkers)
+	if r := globalReplicationPool.GetNonBlocking(); r != nil &&
+		(cfg.ReplicationPriority != t.replicationPriority || cfg.ReplicationMaxWorkers != t.replicationMaxWorkers || cfg.ReplicationMaxLWorkers != t.replicationMaxLWorkers) {
+		r.ResizeWorkerPriority(cfg.ReplicationPriority, cfg.ReplicationMaxWorkers, cfg.ReplicationMaxLWorkers)
 	}
 	t.replicationPriority = cfg.ReplicationPriority
 	t.replicationMaxWorkers = cfg.ReplicationMaxWorkers
+	t.replicationMaxLWorkers = cfg.ReplicationMaxLWorkers
 
 	// N B api.transition_workers will be deprecated
 	if globalTransitionState != nil {
@@ -183,13 +181,22 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int, legacy bool) {
 	t.transitionWorkers = cfg.TransitionWorkers
 
 	t.staleUploadsExpiry = cfg.StaleUploadsExpiry
-	t.staleUploadsCleanupInterval = cfg.StaleUploadsCleanupInterval
 	t.deleteCleanupInterval = cfg.DeleteCleanupInterval
 	t.enableODirect = cfg.EnableODirect
 	t.gzipObjects = cfg.GzipObjects
 	t.rootAccess = cfg.RootAccess
 	t.syncEvents = cfg.SyncEvents
 	t.objectMaxVersions = cfg.ObjectMaxVersions
+
+	if t.staleUploadsCleanupInterval != cfg.StaleUploadsCleanupInterval {
+		t.staleUploadsCleanupInterval = cfg.StaleUploadsCleanupInterval
+
+		// signal that cleanup interval has changed
+		select {
+		case staleUploadsCleanupIntervalChangedCh <- struct{}{}:
+		default: // in case the channel is blocked...
+		}
+	}
 }
 
 func (t *apiConfig) odirectEnabled() bool {
@@ -288,19 +295,15 @@ func (t *apiConfig) getRequestsPoolCapacity() int {
 	return cap(t.requestsPool)
 }
 
-func (t *apiConfig) getRequestsPool() (chan struct{}, time.Duration) {
+func (t *apiConfig) getRequestsPool() chan struct{} {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	if t.requestsPool == nil {
-		return nil, 10 * time.Second
+		return nil
 	}
 
-	if t.requestsDeadline <= 0 {
-		return t.requestsPool, 10 * time.Second
-	}
-
-	return t.requestsPool, t.requestsDeadline
+	return t.requestsPool
 }
 
 // maxClients throttles the S3 API calls
@@ -323,16 +326,8 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 		}
 
 		globalHTTPStats.addRequestsInQueue(1)
-		pool, deadline := globalAPIConfig.getRequestsPool()
+		pool := globalAPIConfig.getRequestsPool()
 		if pool == nil {
-			globalHTTPStats.addRequestsInQueue(-1)
-			f.ServeHTTP(w, r)
-			return
-		}
-
-		// No deadline to wait, there is nothing to queue
-		// perform the API call immediately.
-		if deadline <= 0 {
 			globalHTTPStats.addRequestsInQueue(-1)
 			f.ServeHTTP(w, r)
 			return
@@ -342,8 +337,8 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 			tc.FuncName = "s3.MaxClients"
 		}
 
-		deadlineTimer := time.NewTimer(deadline)
-		defer deadlineTimer.Stop()
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(cap(pool)))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(cap(pool)-len(pool)))
 
 		ctx := r.Context()
 		select {
@@ -355,7 +350,13 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			f.ServeHTTP(w, r)
-		case <-deadlineTimer.C:
+		case <-r.Context().Done():
+			globalHTTPStats.addRequestsInQueue(-1)
+			// When the client disconnects before getting the S3 handler
+			// status code response, set the status code to 499 so this request
+			// will be properly audited and traced.
+			w.WriteHeader(499)
+		default:
 			globalHTTPStats.addRequestsInQueue(-1)
 			if contextCanceled(ctx) {
 				w.WriteHeader(499)
@@ -365,12 +366,7 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 			writeErrorResponse(ctx, w,
 				errorCodes.ToAPIErr(ErrTooManyRequests),
 				r.URL)
-		case <-r.Context().Done():
-			globalHTTPStats.addRequestsInQueue(-1)
-			// When the client disconnects before getting the S3 handler
-			// status code response, set the status code to 499 so this request
-			// will be properly audited and traced.
-			w.WriteHeader(499)
+
 		}
 	}
 }
@@ -381,14 +377,16 @@ func (t *apiConfig) getReplicationOpts() replicationPoolOpts {
 
 	if t.replicationPriority == "" {
 		return replicationPoolOpts{
-			Priority:   "auto",
-			MaxWorkers: WorkerMaxLimit,
+			Priority:    "auto",
+			MaxWorkers:  WorkerMaxLimit,
+			MaxLWorkers: LargeWorkerCount,
 		}
 	}
 
 	return replicationPoolOpts{
-		Priority:   t.replicationPriority,
-		MaxWorkers: t.replicationMaxWorkers,
+		Priority:    t.replicationPriority,
+		MaxWorkers:  t.replicationMaxWorkers,
+		MaxLWorkers: t.replicationMaxLWorkers,
 	}
 }
 

@@ -751,12 +751,6 @@ func isErrSignatureDoesNotMatch(err error) bool {
 	return errors.As(err, &signatureDoesNotMatch)
 }
 
-// isErrObjectNameInvalid - Check if error type is ObjectNameInvalid.
-func isErrObjectNameInvalid(err error) bool {
-	var invalidObject ObjectNameInvalid
-	return errors.As(err, &invalidObject)
-}
-
 // PreConditionFailed - Check if copy precondition failed
 type PreConditionFailed struct{}
 
@@ -793,4 +787,21 @@ func (e ReplicationPermissionCheck) Error() string {
 func isReplicationPermissionCheck(err error) bool {
 	_, ok := err.(ReplicationPermissionCheck)
 	return ok
+}
+
+// DataMovementOverwriteErr - captures the error when a data movement activity
+// like rebalance incorrectly tries to overwrite an object.
+type DataMovementOverwriteErr GenericError
+
+func (de DataMovementOverwriteErr) Error() string {
+	objInfoStr := fmt.Sprintf("bucket=%s object=%s", de.Bucket, de.Object)
+	if de.VersionID != "" {
+		objInfoStr = fmt.Sprintf("%s version-id=%s", objInfoStr, de.VersionID)
+	}
+	return fmt.Sprintf("invalid data movement operation, source and destination pool are the same for %s", objInfoStr)
+}
+
+func isDataMovementOverWriteErr(err error) bool {
+	var de DataMovementOverwriteErr
+	return errors.As(err, &de)
 }

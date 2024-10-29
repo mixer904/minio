@@ -190,7 +190,7 @@ func (a adminAPIHandlers) AttachDetachPolicyLDAP(w http.ResponseWriter, r *http.
 //
 // PUT /minio/admin/v3/idp/ldap/add-service-account
 func (a adminAPIHandlers) AddServiceAccountLDAP(w http.ResponseWriter, r *http.Request) {
-	ctx, cred, opts, createReq, targetUser, APIError := commonAddServiceAccount(r)
+	ctx, cred, opts, createReq, targetUser, APIError := commonAddServiceAccount(r, true)
 	if APIError.Code != "" {
 		writeErrorResponseJSON(ctx, w, APIError, r.URL)
 		return
@@ -499,7 +499,7 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 
 	dnList := r.Form["userDNs"]
 	isAll := r.Form.Get("all") == "true"
-	onlySelf := !isAll && len(dnList) == 0
+	selfOnly := !isAll && len(dnList) == 0
 
 	if isAll && len(dnList) > 0 {
 		// This should be checked on client side, so return generic error
@@ -527,7 +527,7 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 			dn = foundResult.NormDN
 		}
 		if dn == cred.ParentUser || dnList[0] == cred.ParentUser {
-			onlySelf = true
+			selfOnly = true
 		}
 	}
 
@@ -538,13 +538,13 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,
-		DenyOnly:        onlySelf,
+		DenyOnly:        selfOnly,
 	}) {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
 		return
 	}
 
-	if onlySelf && len(dnList) == 0 {
+	if selfOnly && len(dnList) == 0 {
 		selfDN := cred.AccessKey
 		if cred.ParentUser != "" {
 			selfDN = cred.ParentUser
@@ -552,7 +552,7 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 		dnList = append(dnList, selfDN)
 	}
 
-	accessKeyMap := make(map[string]madmin.ListAccessKeysLDAPResp)
+	var ldapUserList []string
 	if isAll {
 		ldapUsers, err := globalIAMSys.ListLDAPUsers(ctx)
 		if err != nil {
@@ -560,7 +560,7 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 			return
 		}
 		for user := range ldapUsers {
-			accessKeyMap[user] = madmin.ListAccessKeysLDAPResp{}
+			ldapUserList = append(ldapUserList, user)
 		}
 	} else {
 		for _, userDN := range dnList {
@@ -573,7 +573,7 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 			if foundResult == nil {
 				continue
 			}
-			accessKeyMap[foundResult.NormDN] = madmin.ListAccessKeysLDAPResp{}
+			ldapUserList = append(ldapUserList, foundResult.NormDN)
 		}
 	}
 
@@ -598,47 +598,46 @@ func (a adminAPIHandlers) ListAccessKeysLDAPBulk(w http.ResponseWriter, r *http.
 		return
 	}
 
-	for dn, accessKeys := range accessKeyMap {
+	accessKeyMap := make(map[string]madmin.ListAccessKeysLDAPResp)
+	for _, internalDN := range ldapUserList {
+		externalDN := globalIAMSys.LDAPConfig.DecodeDN(internalDN)
+		accessKeys := madmin.ListAccessKeysLDAPResp{}
 		if listSTSKeys {
-			stsKeys, err := globalIAMSys.ListSTSAccounts(ctx, dn)
+			stsKeys, err := globalIAMSys.ListSTSAccounts(ctx, internalDN)
 			if err != nil {
 				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 				return
 			}
 			for _, sts := range stsKeys {
-				expiryTime := sts.Expiration
 				accessKeys.STSKeys = append(accessKeys.STSKeys, madmin.ServiceAccountInfo{
 					AccessKey:  sts.AccessKey,
-					Expiration: &expiryTime,
+					Expiration: &sts.Expiration,
 				})
 			}
 			// if only STS keys, skip if user has no STS keys
 			if !listServiceAccounts && len(stsKeys) == 0 {
-				delete(accessKeyMap, dn)
 				continue
 			}
 		}
 
 		if listServiceAccounts {
-			serviceAccounts, err := globalIAMSys.ListServiceAccounts(ctx, dn)
+			serviceAccounts, err := globalIAMSys.ListServiceAccounts(ctx, internalDN)
 			if err != nil {
 				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 				return
 			}
 			for _, svc := range serviceAccounts {
-				expiryTime := svc.Expiration
 				accessKeys.ServiceAccounts = append(accessKeys.ServiceAccounts, madmin.ServiceAccountInfo{
 					AccessKey:  svc.AccessKey,
-					Expiration: &expiryTime,
+					Expiration: &svc.Expiration,
 				})
 			}
 			// if only service accounts, skip if user has no service accounts
 			if !listSTSKeys && len(serviceAccounts) == 0 {
-				delete(accessKeyMap, dn)
 				continue
 			}
 		}
-		accessKeyMap[dn] = accessKeys
+		accessKeyMap[externalDN] = accessKeys
 	}
 
 	data, err := json.Marshal(accessKeyMap)

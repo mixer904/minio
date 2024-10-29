@@ -208,6 +208,20 @@ func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string,
 	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath, opts)
 }
 
+func (d *naughtyDisk) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte) error {
+	if err := d.calcError(); err != nil {
+		return err
+	}
+	return d.disk.RenamePart(ctx, srcVolume, srcPath, dstVolume, dstPath, meta)
+}
+
+func (d *naughtyDisk) ReadParts(ctx context.Context, bucket string, partMetaPaths ...string) ([]*ObjectPartInfo, error) {
+	if err := d.calcError(); err != nil {
+		return nil, err
+	}
+	return d.disk.ReadParts(ctx, bucket, partMetaPaths...)
+}
+
 func (d *naughtyDisk) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error {
 	if err := d.calcError(); err != nil {
 		return err
@@ -220,6 +234,13 @@ func (d *naughtyDisk) CheckParts(ctx context.Context, volume string, path string
 		return nil, err
 	}
 	return d.disk.CheckParts(ctx, volume, path, fi)
+}
+
+func (d *naughtyDisk) DeleteBulk(ctx context.Context, volume string, paths ...string) (err error) {
+	if err := d.calcError(); err != nil {
+		return err
+	}
+	return d.disk.DeleteBulk(ctx, volume, paths...)
 }
 
 func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, deleteOpts DeleteOptions) (err error) {

@@ -115,6 +115,7 @@ var (
 	signalServiceRPC               = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerSignalService, grid.NewMSS, grid.NewNoPayload)
 	stopRebalanceRPC               = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerStopRebalance, grid.NewMSS, grid.NewNoPayload)
 	updateMetacacheListingRPC      = grid.NewSingleHandler[*metacache, *metacache](grid.HandlerUpdateMetacacheListing, func() *metacache { return &metacache{} }, func() *metacache { return &metacache{} })
+	cleanupUploadIDCacheMetaRPC    = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerClearUploadID, grid.NewMSS, grid.NewNoPayload)
 
 	// STREAMS
 	// Set an output capacity of 100 for consoleLog and listenRPC
@@ -469,7 +470,7 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoP
 		return np, grid.NewRemoteErr(errors.New("Bucket name is missing"))
 	}
 
-	globalReplicationStats.Delete(bucketName)
+	globalReplicationStats.Load().Delete(bucketName)
 	globalBucketMetadataSys.Remove(bucketName)
 	globalBucketTargetSys.Delete(bucketName)
 	globalEventNotifier.RemoveNotification(bucketName)
@@ -483,12 +484,12 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoP
 
 // GetAllBucketStatsHandler - fetches bucket replication stats for all buckets from this peer.
 func (s *peerRESTServer) GetAllBucketStatsHandler(mss *grid.MSS) (*BucketStatsMap, *grid.RemoteErr) {
-	replicationStats := globalReplicationStats.GetAll()
+	replicationStats := globalReplicationStats.Load().GetAll()
 	bucketStatsMap := make(map[string]BucketStats, len(replicationStats))
 	for k, v := range replicationStats {
 		bucketStatsMap[k] = BucketStats{
 			ReplicationStats: v,
-			ProxyStats:       globalReplicationStats.getProxyStats(k),
+			ProxyStats:       globalReplicationStats.Load().getProxyStats(k),
 		}
 	}
 	return &BucketStatsMap{Stats: bucketStatsMap, Timestamp: time.Now()}, nil
@@ -501,11 +502,14 @@ func (s *peerRESTServer) GetBucketStatsHandler(vars *grid.MSS) (*BucketStats, *g
 	if bucketName == "" {
 		return nil, grid.NewRemoteErrString("Bucket name is missing")
 	}
-
+	st := globalReplicationStats.Load()
+	if st == nil {
+		return &BucketStats{}, nil
+	}
 	bs := BucketStats{
-		ReplicationStats: globalReplicationStats.Get(bucketName),
-		QueueStats:       ReplicationQueueStats{Nodes: []ReplQNodeStats{globalReplicationStats.getNodeQueueStats(bucketName)}},
-		ProxyStats:       globalReplicationStats.getProxyStats(bucketName),
+		ReplicationStats: st.Get(bucketName),
+		QueueStats:       ReplicationQueueStats{Nodes: []ReplQNodeStats{st.getNodeQueueStats(bucketName)}},
+		ProxyStats:       st.getProxyStats(bucketName),
 	}
 	return &bs, nil
 }
@@ -516,9 +520,11 @@ func (s *peerRESTServer) GetSRMetricsHandler(mss *grid.MSS) (*SRMetricsSummary, 
 	if objAPI == nil {
 		return nil, grid.NewRemoteErr(errServerNotInitialized)
 	}
-
-	sm := globalReplicationStats.getSRMetricsForNode()
-	return &sm, nil
+	if st := globalReplicationStats.Load(); st != nil {
+		sm := st.getSRMetricsForNode()
+		return &sm, nil
+	}
+	return &SRMetricsSummary{}, nil
 }
 
 // LoadBucketMetadataHandler - reloads in memory bucket metadata
@@ -630,7 +636,7 @@ func (s *peerRESTServer) VerifyBinaryHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	if lrTime.Sub(currentReleaseTime) <= 0 {
-		s.writeErrorResponse(w, fmt.Errorf("server is already running the latest version: %s", Version))
+		s.writeErrorResponse(w, fmt.Errorf("server is running the latest version: %s", Version))
 		return
 	}
 
@@ -664,7 +670,7 @@ var errUnsupportedSignal = fmt.Errorf("unsupported signal")
 
 func waitingDrivesNode() map[string]madmin.DiskMetrics {
 	globalLocalDrivesMu.RLock()
-	localDrives := cloneDrives(globalLocalDrives)
+	localDrives := cloneDrives(globalLocalDrivesMap)
 	globalLocalDrivesMu.RUnlock()
 
 	errs := make([]error, len(localDrives))
@@ -895,6 +901,26 @@ func (s *peerRESTServer) ReloadPoolMetaHandler(mss *grid.MSS) (np grid.NoPayload
 
 	if err := pools.ReloadPoolMeta(context.Background()); err != nil {
 		return np, grid.NewRemoteErr(err)
+	}
+
+	return
+}
+
+func (s *peerRESTServer) HandlerClearUploadID(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return np, grid.NewRemoteErr(errServerNotInitialized)
+	}
+
+	pools, ok := objAPI.(*erasureServerPools)
+	if !ok {
+		return
+	}
+
+	// No need to return errors, this is not a highly strict operation.
+	uploadID := mss.Get(peerRESTUploadID)
+	if uploadID != "" {
+		pools.ClearUploadID(uploadID)
 	}
 
 	return
@@ -1173,7 +1199,7 @@ func (s *peerRESTServer) GetReplicationMRFHandler(w http.ResponseWriter, r *http
 	vars := mux.Vars(r)
 	bucketName := vars[peerRESTBucket]
 	ctx := newContext(r, w, "GetReplicationMRF")
-	re, err := globalReplicationPool.getMRF(ctx, bucketName)
+	re, err := globalReplicationPool.Get().getMRF(ctx, bucketName)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
@@ -1386,6 +1412,7 @@ func registerPeerRESTHandlers(router *mux.Router, gm *grid.Manager) {
 	logger.FatalIf(signalServiceRPC.Register(gm, server.SignalServiceHandler), "unable to register handler")
 	logger.FatalIf(stopRebalanceRPC.Register(gm, server.StopRebalanceHandler), "unable to register handler")
 	logger.FatalIf(updateMetacacheListingRPC.Register(gm, server.UpdateMetacacheListingHandler), "unable to register handler")
+	logger.FatalIf(cleanupUploadIDCacheMetaRPC.Register(gm, server.HandlerClearUploadID), "unable to register handler")
 
 	logger.FatalIf(gm.RegisterStreamingHandler(grid.HandlerTrace, grid.StreamHandler{
 		Handle:      server.TraceHandler,

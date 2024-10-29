@@ -90,6 +90,11 @@ func (er erasureObjects) defaultWQuorum() int {
 	return dataCount
 }
 
+// defaultRQuorum read quorum based on setDriveCount and defaultParityCount
+func (er erasureObjects) defaultRQuorum() int {
+	return er.setDriveCount - er.defaultParityCount
+}
+
 func diskErrToDriveState(err error) (state string) {
 	switch {
 	case errors.Is(err, errDiskNotFound) || errors.Is(err, context.DeadlineExceeded):
@@ -198,11 +203,9 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) (disks
 			di.State = diskErrToDriveState(err)
 			di.FreeInodes = info.FreeInodes
 			di.UsedInodes = info.UsedInodes
-			if info.Healing {
-				if hi := disks[index].Healing(); hi != nil {
-					hd := hi.toHealingDisk()
-					di.HealInfo = &hd
-				}
+			if hi := disks[index].Healing(); hi != nil {
+				hd := hi.toHealingDisk()
+				di.HealInfo = &hd
 			}
 			di.Metrics = &madmin.DiskMetrics{
 				LastMinute:              make(map[string]madmin.TimedAction, len(info.Metrics.LastMinute)),
@@ -548,9 +551,6 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				var root dataUsageEntry
 				if r := cache.root(); r != nil {
 					root = cache.flatten(*r)
-					if root.ReplicationStats.empty() {
-						root.ReplicationStats = nil
-					}
 				}
 				select {
 				case <-ctx.Done():

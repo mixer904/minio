@@ -761,6 +761,15 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 		return nil
 	}
 
+	countOKDrives := func(drives []madmin.HealDriveInfo) (count int) {
+		for _, drive := range drives {
+			if drive.State == madmin.DriveStateOk {
+				count++
+			}
+		}
+		return count
+	}
+
 	// task queued, now wait for the response.
 	select {
 	case res := <-task.respCh:
@@ -781,6 +790,11 @@ func (h *healSequence) queueHealTask(source healSource, healType madmin.HealItem
 		if res.err != nil {
 			res.result.Detail = res.err.Error()
 		}
+		if res.result.ParityBlocks > 0 && res.result.DataBlocks > 0 && res.result.DataBlocks > res.result.ParityBlocks {
+			if got := countOKDrives(res.result.After.Drives); got < res.result.ParityBlocks {
+				res.result.Detail = fmt.Sprintf("quorum loss - expected %d minimum, got drive states in OK %d", res.result.ParityBlocks, got)
+			}
+		}
 		return h.pushHealResultItem(res.result)
 	case <-h.ctx.Done():
 		return nil
@@ -792,18 +806,20 @@ func (h *healSequence) healDiskMeta(objAPI ObjectLayer) error {
 	return h.healMinioSysMeta(objAPI, minioConfigPrefix)()
 }
 
-func (h *healSequence) healItems(objAPI ObjectLayer, bucketsOnly bool) error {
+func (h *healSequence) healItems(objAPI ObjectLayer) error {
 	if h.clientToken == bgHealingUUID {
 		// For background heal do nothing.
 		return nil
 	}
 
-	if err := h.healDiskMeta(objAPI); err != nil {
-		return err
+	if h.bucket == "" { // heal internal meta only during a site-wide heal
+		if err := h.healDiskMeta(objAPI); err != nil {
+			return err
+		}
 	}
 
 	// Heal buckets and objects
-	return h.healBuckets(objAPI, bucketsOnly)
+	return h.healBuckets(objAPI)
 }
 
 // traverseAndHeal - traverses on-disk data and performs healing
@@ -814,8 +830,7 @@ func (h *healSequence) healItems(objAPI ObjectLayer, bucketsOnly bool) error {
 // has to wait until a safe point is reached, such as between scanning
 // two objects.
 func (h *healSequence) traverseAndHeal(objAPI ObjectLayer) {
-	bucketsOnly := false // Heals buckets and objects also.
-	h.traverseAndHealDoneCh <- h.healItems(objAPI, bucketsOnly)
+	h.traverseAndHealDoneCh <- h.healItems(objAPI)
 	xioutil.SafeClose(h.traverseAndHealDoneCh)
 }
 
@@ -842,14 +857,14 @@ func (h *healSequence) healMinioSysMeta(objAPI ObjectLayer, metaPrefix string) f
 }
 
 // healBuckets - check for all buckets heal or just particular bucket.
-func (h *healSequence) healBuckets(objAPI ObjectLayer, bucketsOnly bool) error {
+func (h *healSequence) healBuckets(objAPI ObjectLayer) error {
 	if h.isQuitting() {
 		return errHealStopSignalled
 	}
 
 	// 1. If a bucket was specified, heal only the bucket.
 	if h.bucket != "" {
-		return h.healBucket(objAPI, h.bucket, bucketsOnly)
+		return h.healBucket(objAPI, h.bucket, false)
 	}
 
 	buckets, err := objAPI.ListBuckets(h.ctx, BucketOptions{})
@@ -863,7 +878,7 @@ func (h *healSequence) healBuckets(objAPI ObjectLayer, bucketsOnly bool) error {
 	})
 
 	for _, bucket := range buckets {
-		if err = h.healBucket(objAPI, bucket.Name, bucketsOnly); err != nil {
+		if err = h.healBucket(objAPI, bucket.Name, false); err != nil {
 			return err
 		}
 	}
