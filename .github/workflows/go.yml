@@ -12,6 +12,9 @@ on:
   release:
     types: [created]
 
+env:
+  DEVELOPMENT:
+    GOGET: RELEASE.2024-10-13T13-34-11Z
 
 jobs:
 
