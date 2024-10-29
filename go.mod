@@ -52,6 +52,7 @@ require (
 	github.com/minio/madmin-go/v3 v3.0.70
 	github.com/minio/minio-go/v7 v7.0.77
 	github.com/minio/mux v1.9.0
+	github.com/minio/pkg/v2 v2.0.19
 	github.com/minio/pkg/v3 v3.0.20
 	github.com/minio/selfupdate v0.6.0
 	github.com/minio/simdjson-go v0.4.5
@@ -59,7 +60,7 @@ require (
 	github.com/minio/xxml v0.0.3
 	github.com/minio/zipindex v0.3.1
 	github.com/mitchellh/go-homedir v1.1.0
-	github.com/mixer904/minio-pkg v0.1.3
+	github.com/mixer904/minio-pkg v0.1.4
 	github.com/nats-io/nats-server/v2 v2.9.23
 	github.com/nats-io/nats.go v1.37.0
 	github.com/nats-io/stan.go v0.10.4
@@ -213,7 +214,6 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
-	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pires/go-proxyproto v0.7.0 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/posener/complete v1.2.3 // indirect
