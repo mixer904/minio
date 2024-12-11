@@ -48,21 +48,7 @@ const ftpMaxWriteOffset = 100 << 20
 type sftpDriver struct {
 	permissions *ssh.Permissions
 	endpoint    string
-	connection  *ssh.ServerConn
-}
-
-type CustomTransport struct {
-	Transport http.RoundTripper
-	port      string
-	ip        string
-}
-
-// RoundTrip implementiert die RoundTripper-Schnittstelle.
-func (c *CustomTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	// Füge die Header aus CustomTransport hinzu.
-	r.Header.Add("X-Real-Port", c.port)
-	r.Header.Add("X-Real-IP", c.ip)
-	return c.Transport.RoundTrip(r)
+	remoteIP    string
 }
 
 //msgp:ignore sftpMetrics
@@ -107,8 +93,13 @@ func (m *sftpMetrics) log(s *sftp.Request, user string) func(sz int64, err error
 // - sftp.Filewrite
 // - sftp.Filelist
 // - sftp.Filecmd
-func NewSFTPDriver(perms *ssh.Permissions, conn *ssh.ServerConn) sftp.Handlers {
-	handler := &sftpDriver{endpoint: fmt.Sprintf("127.0.0.1:%s", globalMinioPort), permissions: perms, connection: conn}
+func NewSFTPDriver(perms *ssh.Permissions, remoteIP string) sftp.Handlers {
+	handler := &sftpDriver{
+		endpoint:    fmt.Sprintf("127.0.0.1:%s", globalMinioPort),
+		permissions: perms,
+		remoteIP:    remoteIP,
+		connection: conn,
+	}
 	return sftp.Handlers{
 		FileGet:  handler,
 		FilePut:  handler,
@@ -117,31 +108,31 @@ func NewSFTPDriver(perms *ssh.Permissions, conn *ssh.ServerConn) sftp.Handlers {
 	}
 }
 
+type forwardForTransport struct {
+	tr  http.RoundTripper
+	fwd string
+}
+
+func (f forwardForTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r.Header.Set("X-Forwarded-For", f.fwd)
+	return f.tr.RoundTrip(r)
+}
+
 func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
 	mcreds := credentials.NewStaticV4(
 		f.permissions.CriticalOptions["AccessKey"],
 		f.permissions.CriticalOptions["SecretKey"],
 		f.permissions.CriticalOptions["SessionToken"],
 	)
-	var port = ""
-	var ip = ""
-	switch addr := f.connection.RemoteAddr().(type) {
-	case *net.UDPAddr:
-		port = strconv.Itoa(addr.Port)
-		ip = addr.IP.String()
-	case *net.TCPAddr:
-		port = strconv.Itoa(addr.Port)
-		ip = addr.IP.String()
-	}
-	customTransport := &CustomTransport{
-		Transport: globalRemoteFTPClientTransport,
-		ip:        ip,
-		port:      port,
+	// Set X-Forwarded-For on all requests.
+	tr := http.RoundTripper(globalRemoteFTPClientTransport)
+	if f.remoteIP != "" {
+		tr = forwardForTransport{tr: tr, fwd: f.remoteIP}
 	}
 	return minio.New(f.endpoint, &minio.Options{
 		Creds:     mcreds,
 		Secure:    globalIsTLS,
-		Transport: customTransport,
+		Transport: tr,
 	})
 }
 

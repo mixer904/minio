@@ -32,7 +32,6 @@ import (
 	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/sync/errgroup"
-	"golang.org/x/exp/slices"
 )
 
 //go:generate stringer -type=healingMetric -trimprefix=healingMetric $GOFILE
@@ -45,7 +44,8 @@ const (
 	healingMetricCheckAbandonedParts
 )
 
-func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string, scanMode madmin.HealScanMode, healEntry func(string, metaCacheEntry, madmin.HealScanMode) error) error {
+// List a prefix or a single object versions and heal
+func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string, recursive bool, scanMode madmin.HealScanMode, healEntry func(string, metaCacheEntry, madmin.HealScanMode) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -78,11 +78,14 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 		bucket:         bucket,
 		path:           path,
 		filterPrefix:   filterPrefix,
-		recursive:      true,
+		recursive:      recursive,
 		forwardTo:      "",
 		minDisks:       1,
 		reportNotFound: false,
 		agreed: func(entry metaCacheEntry) {
+			if !recursive && prefix != entry.name {
+				return
+			}
 			if err := healEntry(bucket, entry, scanMode); err != nil {
 				cancel()
 			}
@@ -94,7 +97,9 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 				// proceed to heal nonetheless.
 				entry, _ = entries.firstFound()
 			}
-
+			if !recursive && prefix != entry.name {
+				return
+			}
 			if err := healEntry(bucket, *entry, scanMode); err != nil {
 				cancel()
 				return
@@ -149,7 +154,10 @@ var errLegacyXLMeta = errors.New("legacy XL meta")
 
 var errOutdatedXLMeta = errors.New("outdated XL meta")
 
-var errPartMissingOrCorrupt = errors.New("part missing or corrupt")
+var (
+	errPartCorrupt = errors.New("part corrupt")
+	errPartMissing = errors.New("part missing")
+)
 
 // Only heal on disks where we are sure that healing is needed. We can expand
 // this list as and when we figure out more errors can be added to this list safely.
@@ -169,11 +177,11 @@ func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestM
 		if !meta.Deleted && !meta.IsRemote() {
 			// If xl.meta was read fine but there may be problem with the part.N files.
 			for _, partErr := range partsErrs {
-				if slices.Contains([]int{
-					checkPartFileNotFound,
-					checkPartFileCorrupt,
-				}, partErr) {
-					return true, errPartMissingOrCorrupt
+				if partErr == checkPartFileNotFound {
+					return true, errPartMissing
+				}
+				if partErr == checkPartFileCorrupt {
+					return true, errPartCorrupt
 				}
 			}
 		}
@@ -252,6 +260,21 @@ func (er *erasureObjects) auditHealObject(ctx context.Context, bucket, object, v
 	}
 
 	auditLogInternal(ctx, opts)
+}
+
+func objectErrToDriveState(reason error) string {
+	switch {
+	case reason == nil:
+		return madmin.DriveStateOk
+	case IsErr(reason, errDiskNotFound):
+		return madmin.DriveStateOffline
+	case IsErr(reason, errFileNotFound, errFileVersionNotFound, errVolumeNotFound, errPartMissing, errOutdatedXLMeta, errLegacyXLMeta):
+		return madmin.DriveStateMissing
+	case IsErr(reason, errFileCorrupt, errPartCorrupt):
+		return madmin.DriveStateCorrupt
+	default:
+		return fmt.Sprintf("%s (%s)", madmin.DriveStateUnknown, reason.Error())
+	}
 }
 
 // Heals an object by re-writing corrupt/missing erasure blocks.
@@ -379,18 +402,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 			disksToHealCount++
 		}
 
-		driveState := ""
-		switch {
-		case reason == nil:
-			driveState = madmin.DriveStateOk
-		case IsErr(reason, errDiskNotFound):
-			driveState = madmin.DriveStateOffline
-		case IsErr(reason, errFileNotFound, errFileVersionNotFound, errVolumeNotFound, errPartMissingOrCorrupt, errOutdatedXLMeta, errLegacyXLMeta):
-			driveState = madmin.DriveStateMissing
-		default:
-			// all remaining cases imply corrupt data/metadata
-			driveState = madmin.DriveStateCorrupt
-		}
+		driveState := objectErrToDriveState(reason)
 
 		result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",
@@ -817,13 +829,7 @@ func (er *erasureObjects) defaultHealResult(lfi FileInfo, storageDisks []Storage
 			})
 			continue
 		}
-		driveState := madmin.DriveStateCorrupt
-		switch errs[index] {
-		case errFileNotFound, errVolumeNotFound:
-			driveState = madmin.DriveStateMissing
-		case nil:
-			driveState = madmin.DriveStateOk
-		}
+		driveState := objectErrToDriveState(errs[index])
 		result.Before.Drives = append(result.Before.Drives, madmin.HealDriveInfo{
 			UUID:     "",
 			Endpoint: storageEndpoints[index].String(),

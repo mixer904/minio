@@ -60,6 +60,10 @@ test-ilm: install-race
 	@echo "Running ILM tests"
 	@env bash $(PWD)/docs/bucket/replication/setup_ilm_expiry_replication.sh
 
+test-ilm-transition: install-race
+	@echo "Running ILM tiering tests with healing"
+	@env bash $(PWD)/docs/bucket/lifecycle/setup_ilm_transition.sh
+
 test-pbac: install-race
 	@echo "Running bucket policies tests"
 	@env bash $(PWD)/docs/iam/policies/pbac-tests.sh
@@ -144,6 +148,10 @@ test-site-replication-minio: install-race ## verify automatic site replication
 test-multipart: install-race ## test multipart
 	@echo "Test multipart behavior when part files are missing"
 	@(env bash $(PWD)/buildscripts/multipart-quorum-test.sh)
+
+test-timeout: install-race ## test multipart
+	@echo "Test server timeout"
+	@(env bash $(PWD)/buildscripts/test-timeout.sh)
 
 verify: install-race ## verify minio various setups
 	@echo "Verifying build with race"
