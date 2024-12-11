@@ -23,11 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -98,7 +96,6 @@ func NewSFTPDriver(perms *ssh.Permissions, remoteIP string) sftp.Handlers {
 		endpoint:    fmt.Sprintf("127.0.0.1:%s", globalMinioPort),
 		permissions: perms,
 		remoteIP:    remoteIP,
-		connection: conn,
 	}
 	return sftp.Handlers{
 		FileGet:  handler,
