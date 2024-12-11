@@ -60,7 +60,7 @@ require (
 	github.com/minio/xxml v0.0.3
 	github.com/minio/zipindex v0.4.0
 	github.com/mitchellh/go-homedir v1.1.0
-	github.com/mixer904/minio-pkg v0.1.5
+	github.com/mixer904/minio-pkg v0.1.4
 	github.com/nats-io/nats-server/v2 v2.9.23
 	github.com/nats-io/nats.go v1.37.0
 	github.com/nats-io/stan.go v0.10.4
