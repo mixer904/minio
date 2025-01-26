@@ -22,6 +22,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"github.com/minio/pkg/v3/logger/message/audit"
 	"net"
 	"os"
 	"strconv"
@@ -32,7 +33,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
 	xldap "github.com/minio/pkg/v3/ldap"
-	xsftp "github.com/minio/pkg/v3/sftp"
+	xsftp "github.com/mixer904/minio-pkg/sftp"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -127,11 +128,44 @@ var supportedMACs = []string{
 }
 
 func sshPubKeyAuth(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	return authenticateSSHConnection(c, key, nil)
+	r, err := authenticateSSHConnection(c, key, nil)
+	if err != nil {
+		logAuthError(c, err)
+	}
+	return r, err
 }
 
 func sshPasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-	return authenticateSSHConnection(c, nil, pass)
+	r, err := authenticateSSHConnection(c, nil, pass)
+	if err != nil {
+		logAuthError(c, err)
+	}
+	return r, err
+}
+
+func logAuthError(c ssh.ConnMetadata, error error) {
+	var ip = ""
+	switch addr := c.RemoteAddr().(type) {
+	case *net.UDPAddr:
+		ip = addr.IP.String()
+	case *net.TCPAddr:
+		ip = addr.IP.String()
+	}
+	entry := &audit.Entry{
+		AccessKey:    c.User(),
+		RemoteHost:   ip,
+		DeploymentID: globalDeploymentID(),
+		UserAgent:    "sftp",
+		Time:         time.Now(),
+		Event:        error.Error(),
+		Trigger:      "incoming",
+		Version:      "1",
+	}
+	entry.API.Name = "Login"
+	entry.API.StatusCode = 401
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, logger.GetContextAuditKey(), entry)
+	defer logger.AuditLog(ctx, nil, nil, nil)
 }
 
 func authenticateSSHConnection(c ssh.ConnMetadata, key ssh.PublicKey, pass []byte) (*ssh.Permissions, error) {
