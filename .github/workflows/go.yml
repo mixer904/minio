@@ -1,42 +1,43 @@
-name: Functional Tests
 
-on:
-  pull_request:
-    branches:
-      - master
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
 
-# This ensures that previous jobs for the PR are canceled when the PR is
-# updated.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
-  cancel-in-progress: true
+name: Go
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
+
+on:
+  release:
+    types: [created]
+
+env:
+  MINIO_RELEASE: RELEASE.2024-10-13T13-34-11Z
 
 jobs:
+
   build:
-    name: Go ${{ matrix.go-version }} on ${{ matrix.os }} - healing
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        go-version: [1.23.x]
-        os: [ubuntu-latest]
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+
+      #- name: Set up Go
+      #  uses: actions/setup-go@v4
+      #  with:
+      #    go-version: '1.20'
+
+      #- name: Get Deps
+      #  run: go get -v ./...
+
+      #- name: Build
+      #  run: mkdir dist && go build -o dist -v ./... && ls -al dist
+
+      - name: deploy
+        uses: wangyoucao577/go-release-action@v1
         with:
-          go-version: ${{ matrix.go-version }}
-          check-latest: true
-      - name: Build on ${{ matrix.os }}
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          CGO_ENABLED: 0
-          GO111MODULE: on
-          MINIO_KMS_SECRET_KEY: "my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw="
-          MINIO_KMS_AUTO_ENCRYPTION: on
-        run: |
-          sudo sysctl net.ipv6.conf.all.disable_ipv6=0
-          sudo sysctl net.ipv6.conf.default.disable_ipv6=0
-          make verify
-          make test-timeout
+          asset_name: minio
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          pre_command: go get
+          goos: linux
+          goarch: amd64
