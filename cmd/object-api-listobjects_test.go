@@ -26,6 +26,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
 func TestListObjectsVersionedFolders(t *testing.T) {
@@ -163,14 +166,14 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 					testCase.prefix, "marker:", testCase.marker, "delimiter:",
 					testCase.delimiter, "maxkeys:", testCase.maxKeys)
 
-				resultV, err = obj.ListObjectVersions(context.Background(), testCase.bucketName,
+				resultV, err = obj.ListObjectVersions(t.Context(), testCase.bucketName,
 					testCase.prefix, testCase.marker, "", testCase.delimiter, testCase.maxKeys)
 			} else {
 				t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
 					testCase.prefix, "marker:", testCase.marker, "delimiter:",
 					testCase.delimiter, "maxkeys:", testCase.maxKeys)
 
-				resultL, err = obj.ListObjects(context.Background(), testCase.bucketName,
+				resultL, err = obj.ListObjects(t.Context(), testCase.bucketName,
 					testCase.prefix, testCase.marker, testCase.delimiter, testCase.maxKeys)
 			}
 			if err != nil && testCase.shouldPass {
@@ -389,7 +392,6 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
-
 	}
 
 	// Formulating the result data set to be expected from ListObjects call inside the tests,
@@ -945,7 +947,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
 			t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:", testCase.prefix, "marker:", testCase.marker, "delimiter:", testCase.delimiter, "maxkeys:", testCase.maxKeys)
-			result, err := obj.ListObjects(context.Background(), testCase.bucketName,
+			result, err := obj.ListObjects(t.Context(), testCase.bucketName,
 				testCase.prefix, testCase.marker, testCase.delimiter, int(testCase.maxKeys))
 			if err != nil && testCase.shouldPass {
 				t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
@@ -1014,7 +1016,6 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 						t.Errorf("Test %d: %s: Expected NextMarker to be empty since listing is not truncated, but instead found `%v`", i+1, instanceType, result.NextMarker)
 					}
 				}
-
 			}
 		})
 	}
@@ -1166,7 +1167,6 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
-
 	}
 
 	// Formualting the result data set to be expected from ListObjects call inside the tests,
@@ -1678,7 +1678,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 	for i, testCase := range testCases {
 		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
-			result, err := obj.ListObjectVersions(context.Background(), testCase.bucketName,
+			result, err := obj.ListObjectVersions(t.Context(), testCase.bucketName,
 				testCase.prefix, testCase.marker, "", testCase.delimiter, int(testCase.maxKeys))
 			if err != nil && testCase.shouldPass {
 				t.Errorf("%s:  Expected to pass, but failed with: <ERROR> %s", instanceType, err.Error())
@@ -1785,12 +1785,10 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
-
 	}
 
 	// Formulating the result data set to be expected from ListObjects call inside the tests,
 	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
-
 	resultCases := []ListObjectsInfo{
 		{
 			Objects: []ObjectInfo{
@@ -1835,7 +1833,7 @@ func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestEr
 			var foundPrefixes []string
 			marker := ""
 			for {
-				result, err := obj.ListObjects(context.Background(), testCase.bucketName,
+				result, err := obj.ListObjects(t.Context(), testCase.bucketName,
 					testCase.prefix, marker, testCase.delimiter, testCase.page)
 				if err != nil {
 					t.Fatalf("Test %d: %s: Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
@@ -1910,7 +1908,7 @@ func BenchmarkListObjects(b *testing.B) {
 
 	bucket := "ls-benchmark-bucket"
 	// Create a bucket.
-	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
+	err := obj.MakeBucket(b.Context(), bucket, MakeBucketOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1918,7 +1916,7 @@ func BenchmarkListObjects(b *testing.B) {
 	// Insert objects to be listed and benchmarked later.
 	for i := 0; i < 20000; i++ {
 		key := "obj" + strconv.Itoa(i)
-		_, err = obj.PutObject(context.Background(), bucket, key, mustGetPutObjReader(b, bytes.NewBufferString(key), int64(len(key)), "", ""), ObjectOptions{})
+		_, err = obj.PutObject(b.Context(), bucket, key, mustGetPutObjReader(b, bytes.NewBufferString(key), int64(len(key)), "", ""), ObjectOptions{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1928,9 +1926,127 @@ func BenchmarkListObjects(b *testing.B) {
 
 	// List the buckets over and over and over.
 	for i := 0; i < b.N; i++ {
-		_, err = obj.ListObjects(context.Background(), bucket, "", "obj9000", "", -1)
+		_, err = obj.ListObjects(b.Context(), bucket, "", "obj9000", "", -1)
 		if err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func TestListObjectsWithILM(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsWithILM)
+}
+
+func testListObjectsWithILM(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	// Prepare lifecycle expiration workers
+	es := newExpiryState(t1.Context(), obj, 0)
+	globalExpiryState = es
+
+	t, _ := t1.(*testing.T)
+
+	objContent := "test-content"
+	objMd5 := md5.Sum([]byte(objContent))
+
+	uploads := []struct {
+		bucket     string
+		expired    int
+		notExpired int
+	}{
+		{"test-list-ilm-nothing-expired", 0, 6},
+		{"test-list-ilm-all-expired", 6, 0},
+		{"test-list-ilm-all-half-expired", 3, 3},
+	}
+
+	oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour)
+
+	lifecycleBytes := []byte(`
+<LifecycleConfiguration>
+	<Rule>
+		<Status>Enabled</Status>
+		<Expiration>
+			<Days>1</Days>
+		</Expiration>
+	</Rule>
+</LifecycleConfiguration>
+`)
+
+	lifecycleConfig, err := lifecycle.ParseLifecycleConfig(bytes.NewReader(lifecycleBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, upload := range uploads {
+		err := obj.MakeBucket(context.Background(), upload.bucket, MakeBucketOptions{})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+
+		metadata, err := globalBucketMetadataSys.Get(upload.bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata.lifecycleConfig = lifecycleConfig
+		globalBucketMetadataSys.Set(upload.bucket, metadata)
+		defer globalBucketMetadataSys.Remove(upload.bucket)
+
+		// Upload objects which modtime as one week ago, supposed to be expired by ILM
+		for range upload.expired {
+			_, err := obj.PutObject(context.Background(), upload.bucket, randString(32),
+				mustGetPutObjReader(t,
+					bytes.NewBufferString(objContent),
+					int64(len(objContent)),
+					hex.EncodeToString(objMd5[:]),
+					""),
+				ObjectOptions{MTime: oneWeekAgo},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Upload objects which current time as modtime, not expired by ILM
+		for range upload.notExpired {
+			_, err := obj.PutObject(context.Background(), upload.bucket, randString(32),
+				mustGetPutObjReader(t,
+					bytes.NewBufferString(objContent),
+					int64(len(objContent)),
+					hex.EncodeToString(objMd5[:]),
+					""),
+				ObjectOptions{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		for _, maxKeys := range []int{1, 10, 49} {
+			// Test ListObjects V2
+			totalObjs, didRuns := 0, 0
+			marker := ""
+			for {
+				didRuns++
+				if didRuns > 1000 {
+					t.Fatal("too many runs")
+					return
+				}
+				result, err := obj.ListObjectsV2(context.Background(), upload.bucket, "", marker, "", maxKeys, false, "")
+				if err != nil {
+					t.Fatalf("Test %d: %s: Expected to pass, but failed with: <ERROR> %s", i, instanceType, err.Error())
+				}
+				totalObjs += len(result.Objects)
+				if !result.IsTruncated {
+					break
+				}
+				if marker != "" && marker == result.NextContinuationToken {
+					t.Fatalf("infinite loop marker: %s", result.NextContinuationToken)
+				}
+				marker = result.NextContinuationToken
+			}
+
+			if totalObjs != upload.notExpired {
+				t.Fatalf("Test %d: %s: max-keys=%d, %d objects are expected to be seen, but %d found instead (didRuns=%d)",
+					i+1, instanceType, maxKeys, upload.notExpired, totalObjs, didRuns)
+			}
 		}
 	}
 }

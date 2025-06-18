@@ -42,7 +42,7 @@ func TestResourceListSorting(t *testing.T) {
 
 // Tests presigned v2 signature.
 func TestDoesPresignedV2SignatureMatch(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	obj, fsDir, err := prepareFS(ctx)
@@ -159,13 +159,12 @@ func TestDoesPresignedV2SignatureMatch(t *testing.T) {
 				t.Errorf("(%d) expected to get success, instead got %s", i, niceError(errCode))
 			}
 		}
-
 	}
 }
 
 // TestValidateV2AuthHeader - Tests validate the logic of V2 Authorization header validator.
 func TestValidateV2AuthHeader(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	obj, fsDir, err := prepareFS(ctx)
@@ -239,7 +238,7 @@ func TestValidateV2AuthHeader(t *testing.T) {
 }
 
 func TestDoesPolicySignatureV2Match(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	obj, fsDir, err := prepareFS(ctx)

@@ -22,7 +22,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"github.com/minio/pkg/v3/logger/message/audit"
+	"github.com/minio/madmin-go/v3/logger/audit"
 	"net"
 	"os"
 	"strconv"
@@ -63,7 +63,7 @@ var (
 
 // if the sftp parameter --trusted-user-ca-key is set, then
 // the final form of the key file will be set as this variable.
-var caPublicKey ssh.PublicKey
+var globalSFTPTrustedCAPubkey ssh.PublicKey
 
 // https://cs.opensource.google/go/x/crypto/+/refs/tags/v0.22.0:ssh/common.go;l=46
 // preferredKexAlgos specifies the default preference for key-exchange
@@ -195,8 +195,8 @@ internalAuth:
 		return nil, errNoSuchUser
 	}
 
-	if caPublicKey != nil && pass == nil {
-		err := validateKey(c, key)
+	if globalSFTPTrustedCAPubkey != nil && pass == nil {
+		err := validateClientKeyIsTrusted(c, key)
 		if err != nil {
 			return nil, errAuthentication
 		}
@@ -208,7 +208,6 @@ internalAuth:
 		if subtle.ConstantTimeCompare([]byte(ui.Credentials.SecretKey), pass) != 1 {
 			return nil, errAuthentication
 		}
-
 	}
 
 	copts := map[string]string{
@@ -257,14 +256,11 @@ func processLDAPAuthentication(key ssh.PublicKey, pass []byte, user string) (per
 		if err != nil {
 			return nil, err
 		}
-
 	} else if key != nil {
-
 		lookupResult, targetGroups, err = globalIAMSys.LDAPConfig.LookupUserDN(user)
 		if err != nil {
 			return nil, err
 		}
-
 	}
 
 	if lookupResult == nil {
@@ -294,7 +290,16 @@ func processLDAPAuthentication(key ssh.PublicKey, pass []byte, user string) (per
 				return nil, errAuthentication
 			}
 		}
+		// Save each attribute to claims.
 		claims[ldapAttribPrefix+attribKey] = attribValue[0]
+	}
+
+	if key != nil {
+		// If a key was provided, we expect the user to have an sshPublicKey
+		// attribute.
+		if _, ok := claims[ldapAttribPrefix+"sshPublicKey"]; !ok {
+			return nil, errAuthentication
+		}
 	}
 
 	expiryDur, err := globalIAMSys.LDAPConfig.GetExpiryDuration("")
@@ -348,8 +353,8 @@ func processLDAPAuthentication(key ssh.PublicKey, pass []byte, user string) (per
 	}, nil
 }
 
-func validateKey(c ssh.ConnMetadata, clientKey ssh.PublicKey) (err error) {
-	if caPublicKey == nil {
+func validateClientKeyIsTrusted(c ssh.ConnMetadata, clientKey ssh.PublicKey) (err error) {
+	if globalSFTPTrustedCAPubkey == nil {
 		return errors.New("public key authority validation requested but no ca public key specified.")
 	}
 
@@ -369,7 +374,7 @@ func validateKey(c ssh.ConnMetadata, clientKey ssh.PublicKey) (err error) {
 	// and that certificate type is correct.
 	checker := ssh.CertChecker{}
 	checker.IsUserAuthority = func(k ssh.PublicKey) bool {
-		return subtle.ConstantTimeCompare(caPublicKey.Marshal(), k.Marshal()) == 1
+		return subtle.ConstantTimeCompare(globalSFTPTrustedCAPubkey.Marshal(), k.Marshal()) == 1
 	}
 
 	_, err = checker.Authenticate(c, clientKey)
@@ -466,7 +471,7 @@ func startSFTPServer(args []string) {
 			allowMACs = filterAlgos(arg, strings.Split(tokens[1], ","), supportedMACs)
 		case "trusted-user-ca-key":
 			userCaKeyFile = tokens[1]
-		case "password-auth":
+		case "disable-password-auth":
 			disablePassAuth, _ = strconv.ParseBool(tokens[1])
 		}
 	}
@@ -495,7 +500,7 @@ func startSFTPServer(args []string) {
 			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not accessible: %v", err), "unable to start SFTP server")
 		}
 
-		caPublicKey, _, _, _, err = ssh.ParseAuthorizedKey(keyBytes)
+		globalSFTPTrustedCAPubkey, _, _, _, err = ssh.ParseAuthorizedKey(keyBytes)
 		if err != nil {
 			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not parseable: %v", err), "unable to start SFTP server")
 		}

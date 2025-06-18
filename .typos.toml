@@ -1,11 +1,5 @@
 [files]
-extend-exclude = [
-    ".git/",
-    "docs/",
-    "CREDITS",
-    "go.mod",
-    "go.sum",
-]
+extend-exclude = [".git/", "docs/", "CREDITS", "go.mod", "go.sum"]
 ignore-hidden = false
 
 [default]
@@ -20,6 +14,7 @@ extend-ignore-re = [
     'http\.Header\{"X-Amz-Server-Side-Encryptio":',
     "ZoEoZdLlzVbOlT9rbhD7ZN7TLyiYXSAlB79uGEge",
     "ERRO:",
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$", # ignore line
 ]
 
 [default.extend-words]
@@ -40,3 +35,11 @@ extend-ignore-re = [
 "TestGetPartialObjectMisAligned" = "TestGetPartialObjectMisAligned"
 "thr" = "thr"
 "toi" = "toi"
+
+[type.go]
+extend-ignore-identifiers-re = [
+    # Variants of `typ` used to mean `type` in golang as it is otherwise a
+    # keyword - some of these (like typ1 -> type1) can be fixed, but probably
+    # not worth the effort.
+    "[tT]yp[0-9]*",
+]

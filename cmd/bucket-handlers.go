@@ -344,11 +344,9 @@ func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.R
 				Created: dnsRecords[0].CreationDate,
 			})
 		}
-
 		sort.Slice(bucketsInfo, func(i, j int) bool {
 			return bucketsInfo[i].Name < bucketsInfo[j].Name
 		})
-
 	} else {
 		// Invoke the list buckets.
 		var err error
@@ -561,7 +559,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			}, goi, opts, gerr)
 			if dsc.ReplicateAny() {
 				if object.VersionID != "" {
-					object.VersionPurgeStatus = Pending
+					object.VersionPurgeStatus = replication.VersionPurgePending
 					object.VersionPurgeStatuses = dsc.PendingStatus()
 				} else {
 					object.DeleteMarkerReplicationStatus = dsc.PendingStatus()
@@ -671,7 +669,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			continue
 		}
 
-		if replicateDeletes && (dobj.DeleteMarkerReplicationStatus() == replication.Pending || dobj.VersionPurgeStatus() == Pending) {
+		if replicateDeletes && (dobj.DeleteMarkerReplicationStatus() == replication.Pending || dobj.VersionPurgeStatus() == replication.VersionPurgePending) {
 			// copy so we can re-add null ID.
 			dobj := dobj
 			if isDirObject(dobj.ObjectName) && dobj.VersionID == "" {
@@ -841,7 +839,6 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 			}
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
-
 		}
 		apiErr := ErrBucketAlreadyExists
 		if !globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(sr)...)).IsEmpty() {
@@ -1090,6 +1087,14 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 
 		// we have found the File part of the request we are done processing multipart-form
 		break
+	}
+
+	// check if have a file
+	if reader == nil {
+		apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
+		apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, errors.New("The file or text content is missing"))
+		writeErrorResponse(ctx, w, apiErr, r.URL)
+		return
 	}
 
 	if keyName, ok := formValues["Key"]; !ok {

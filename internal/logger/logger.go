@@ -34,9 +34,9 @@ import (
 
 	"github.com/minio/highwayhash"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/color"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // HighwayHash key for logging in anonymous mode
@@ -75,7 +75,10 @@ var matchingFuncNames = [...]string{
 var (
 	quietFlag, jsonFlag, anonFlag bool
 	// Custom function to format error
-	errorFmtFunc func(string, error, bool) string
+	// can be registered by RegisterError
+	errorFmtFunc = func(introMsg string, err error, jsonFlag bool) string {
+		return fmt.Sprintf("msg: %s\n err:%s", introMsg, err)
+	}
 )
 
 // EnableQuiet - turns quiet option on.

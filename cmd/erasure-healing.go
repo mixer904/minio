@@ -55,10 +55,6 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 		return errors.New("listAndHeal: No non-healing drives found")
 	}
 
-	expectedDisks := len(disks)/2 + 1
-	fallbackDisks := disks[expectedDisks:]
-	disks = disks[:expectedDisks]
-
 	// How to resolve partial results.
 	resolver := metadataResolutionParams{
 		dirQuorum: 1,
@@ -75,7 +71,6 @@ func (er erasureObjects) listAndHeal(ctx context.Context, bucket, prefix string,
 
 	lopts := listPathRawOptions{
 		disks:          disks,
-		fallbackDisks:  fallbackDisks,
 		bucket:         bucket,
 		path:           path,
 		filterPrefix:   filterPrefix,
@@ -584,7 +579,6 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 				readers[i] = newBitrotReader(disk, copyPartsMetadata[i].Data, bucket, partPath, tillOffset, checksumAlgo,
 					checksumInfo.Hash, erasure.ShardSize())
 				prefer[i] = disk.Hostname() == ""
-
 			}
 			writers := make([]io.Writer, len(outDatedDisks))
 			for i, disk := range outDatedDisks {
@@ -609,7 +603,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 			// later to the final location.
 			err = erasure.Heal(ctx, writers, readers, partSize, prefer)
 			closeBitrotReaders(readers)
-			closeBitrotWriters(writers)
+			closeErrs := closeBitrotWriters(writers)
 			if err != nil {
 				return result, err
 			}
@@ -629,6 +623,13 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 					continue
 				}
 
+				// A non-nil stale disk which got error on Close()
+				if closeErrs[i] != nil {
+					outDatedDisks[i] = nil
+					disksToHealCount--
+					continue
+				}
+
 				partsMetadata[i].DataDir = dstDataDir
 				partsMetadata[i].AddObjectPart(partNumber, "", partSize, partActualSize, partModTime, partIdx, partChecksums)
 				if len(inlineBuffers) > 0 && inlineBuffers[i] != nil {
@@ -643,9 +644,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object 
 			if disksToHealCount == 0 {
 				return result, fmt.Errorf("all drives had write errors, unable to heal %s/%s", bucket, object)
 			}
-
 		}
-
 	}
 
 	defer er.deleteAll(context.Background(), minioMetaTmpBucket, tmpID)
@@ -939,12 +938,12 @@ func isObjectDirDangling(errs []error) (ok bool) {
 	var foundNotEmpty int
 	var otherFound int
 	for _, readErr := range errs {
-		switch {
-		case readErr == nil:
+		switch readErr {
+		case nil:
 			found++
-		case readErr == errFileNotFound || readErr == errVolumeNotFound:
+		case errFileNotFound, errVolumeNotFound:
 			notFound++
-		case readErr == errVolumeNotEmpty:
+		case errVolumeNotEmpty:
 			foundNotEmpty++
 		default:
 			otherFound++

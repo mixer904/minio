@@ -45,6 +45,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/sync/errgroup"
 	"github.com/minio/pkg/v3/wildcard"
+	"github.com/minio/pkg/v3/workers"
 	"github.com/puzpuzpuz/xsync/v3"
 )
 
@@ -1248,89 +1249,42 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	ctx = lkctx.Context()
 	defer multiDeleteLock.Unlock(lkctx)
 
-	// Fetch location of up to 10 objects concurrently.
-	poolObjIdxMap := map[int][]ObjectToDelete{}
-	origIndexMap := map[int][]int{}
+	dObjectsByPool := make([][]DeletedObject, len(z.serverPools))
+	dErrsByPool := make([][]error, len(z.serverPools))
 
-	// Always perform 1/10th of the number of objects per delete
-	concurrent := len(objects) / 10
-	if concurrent <= 10 {
-		// if we cannot get 1/10th then choose the number of
-		// objects as concurrent.
-		concurrent = len(objects)
-	}
-
-	var mu sync.Mutex
-	eg := errgroup.WithNErrs(len(objects)).WithConcurrency(concurrent)
-	for j, obj := range objects {
-		j := j
-		obj := obj
+	eg := errgroup.WithNErrs(len(z.serverPools)).WithConcurrency(len(z.serverPools))
+	for i, pool := range z.serverPools {
+		i := i
+		pool := pool
 		eg.Go(func() error {
-			pinfo, _, err := z.getPoolInfoExistingWithOpts(ctx, bucket, obj.ObjectName, ObjectOptions{
-				NoLock: true,
-			})
-			if err != nil {
-				if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-					derrs[j] = err
-				}
-				dobjects[j] = DeletedObject{
-					ObjectName: decodeDirObject(obj.ObjectName),
-					VersionID:  obj.VersionID,
-				}
-				return nil
-			}
-
-			// Delete marker already present we are not going to create new delete markers.
-			if pinfo.ObjInfo.DeleteMarker && obj.VersionID == "" {
-				dobjects[j] = DeletedObject{
-					DeleteMarker:          pinfo.ObjInfo.DeleteMarker,
-					DeleteMarkerVersionID: pinfo.ObjInfo.VersionID,
-					DeleteMarkerMTime:     DeleteMarkerMTime{pinfo.ObjInfo.ModTime},
-					ObjectName:            decodeDirObject(pinfo.ObjInfo.Name),
-				}
-				return nil
-			}
-
-			idx := pinfo.Index
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			poolObjIdxMap[idx] = append(poolObjIdxMap[idx], obj)
-			origIndexMap[idx] = append(origIndexMap[idx], j)
+			dObjectsByPool[i], dErrsByPool[i] = pool.DeleteObjects(ctx, bucket, objects, opts)
 			return nil
-		}, j)
+		}, i)
 	}
-
 	eg.Wait() // wait to check all the pools.
 
-	if len(poolObjIdxMap) > 0 {
-		// Delete concurrently in all server pools.
-		var wg sync.WaitGroup
-		wg.Add(len(z.serverPools))
-		for idx, pool := range z.serverPools {
-			go func(idx int, pool *erasureSets) {
-				defer wg.Done()
-				objs := poolObjIdxMap[idx]
-				if len(objs) == 0 {
-					return
-				}
-				orgIndexes := origIndexMap[idx]
-				deletedObjects, errs := pool.DeleteObjects(ctx, bucket, objs, opts)
-				mu.Lock()
-				for i, derr := range errs {
-					if derr != nil {
-						derrs[orgIndexes[i]] = derr
-					}
-					deletedObjects[i].ObjectName = decodeDirObject(deletedObjects[i].ObjectName)
-					dobjects[orgIndexes[i]] = deletedObjects[i]
-				}
-				mu.Unlock()
-			}(idx, pool)
+	for i := range dobjects {
+		// Iterate over pools
+		for pool := range z.serverPools {
+			if dErrsByPool[pool][i] == nil && dObjectsByPool[pool][i].found {
+				// A fast exit when the object is found and removed
+				dobjects[i] = dObjectsByPool[pool][i]
+				derrs[i] = nil
+				break
+			}
+			if derrs[i] == nil {
+				// No error related to this object is found, assign this pool result
+				// whether it is nil because there is no object found or because of
+				// some other errors such erasure quorum errors.
+				dobjects[i] = dObjectsByPool[pool][i]
+				derrs[i] = dErrsByPool[pool][i]
+			}
 		}
-		wg.Wait()
 	}
 
+	for i := range dobjects {
+		dobjects[i].ObjectName = decodeDirObject(dobjects[i].ObjectName)
+	}
 	return dobjects, derrs
 }
 
@@ -1576,10 +1530,8 @@ func (z *erasureServerPools) listObjectsGeneric(ctx context.Context, bucket, pre
 		}
 
 		if loi.IsTruncated && merged.lastSkippedEntry > loi.NextMarker {
-			// An object hidden by ILM was found during a truncated listing. Since the number of entries
-			// fetched from drives is limited by max-keys, we should use the last ILM filtered entry
-			// as a continuation token if it is lexially higher than the last visible object so that the
-			// next call of WalkDir() with the max-keys can reach new objects not seen previously.
+			// An object hidden by ILM was found during a truncated listing. Set the next marker
+			// as the last skipped entry if it is lexically higher loi.NextMarker as an optimization
 			loi.NextMarker = merged.lastSkippedEntry
 		}
 
@@ -1757,7 +1709,9 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 		}
 
 		z.mpCache.Range(func(_ string, mp MultipartInfo) bool {
-			poolResult.Uploads = append(poolResult.Uploads, mp)
+			if mp.Bucket == bucket {
+				poolResult.Uploads = append(poolResult.Uploads, mp)
+			}
 			return true
 		})
 		sort.Slice(poolResult.Uploads, func(i int, j int) bool {
@@ -2514,7 +2468,7 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var poolErrs [][]error
+	poolErrs := make([][]error, len(z.serverPools))
 	for idx, erasureSet := range z.serverPools {
 		if opts.Pool != nil && *opts.Pool != idx {
 			continue
@@ -2523,20 +2477,20 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 			continue
 		}
 		errs := make([]error, len(erasureSet.sets))
-		var wg sync.WaitGroup
+		wk, _ := workers.New(3)
 		for idx, set := range erasureSet.sets {
 			if opts.Set != nil && *opts.Set != idx {
 				continue
 			}
-			wg.Add(1)
+			wk.Take()
 			go func(idx int, set *erasureObjects) {
-				defer wg.Done()
+				defer wk.Give()
 
 				errs[idx] = set.listAndHeal(ctx, bucket, prefix, opts.Recursive, opts.ScanMode, healEntry)
 			}(idx, set)
 		}
-		wg.Wait()
-		poolErrs = append(poolErrs, errs)
+		wk.Wait()
+		poolErrs[idx] = errs
 	}
 	for _, errs := range poolErrs {
 		for _, err := range errs {

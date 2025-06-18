@@ -47,7 +47,6 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/ioutil"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/trie"
@@ -129,7 +128,7 @@ func IsValidBucketName(bucket string) bool {
 		// 'label' in AWS terminology and if the bucket looks
 		// like an IP address.
 		isNotNumber := false
-		for i := 0; i < len(piece); i++ {
+		for i := range len(piece) {
 			switch {
 			case (piece[i] >= 'a' && piece[i] <= 'z' ||
 				piece[i] == '-'):
@@ -146,7 +145,7 @@ func IsValidBucketName(bucket string) bool {
 		allNumbers = allNumbers && !isNotNumber
 	}
 	// Does the bucket name look like an IP address?
-	return !(len(pieces) == 4 && allNumbers)
+	return len(pieces) != 4 || !allNumbers
 }
 
 // IsValidObjectName verifies an object name in accordance with Amazon's
@@ -255,11 +254,11 @@ func concat(ss ...string) string {
 	}
 	// create & allocate the memory in advance.
 	n := 0
-	for i := 0; i < length; i++ {
+	for i := range length {
 		n += len(ss[i])
 	}
 	b := make([]byte, 0, n)
-	for i := 0; i < length; i++ {
+	for i := range length {
 		b = append(b, ss[i]...)
 	}
 	return unsafe.String(unsafe.SliceData(b), n)
@@ -885,7 +884,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h 
 					return nil, err
 				}
 				if decryptSkip > 0 {
-					inputReader = ioutil.NewSkipReader(inputReader, decryptSkip)
+					inputReader = xioutil.NewSkipReader(inputReader, decryptSkip)
 				}
 				oi.Size = decLength
 			}
@@ -970,7 +969,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h 
 
 			// Apply the skipLen and limit on the
 			// decrypted stream
-			decReader = io.LimitReader(ioutil.NewSkipReader(decReader, skipLen), decRangeLength)
+			decReader = io.LimitReader(xioutil.NewSkipReader(decReader, skipLen), decRangeLength)
 
 			// Assemble the GetObjectReader
 			r = &GetObjectReader{

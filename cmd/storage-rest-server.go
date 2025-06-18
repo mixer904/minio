@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/grid"
 	"github.com/tinylib/msgp/msgp"
 
@@ -674,7 +675,7 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 	versions := make([]FileInfoVersions, totalVersions)
 	decoder := msgpNewReader(r.Body)
 	defer readMsgpReaderPoolPut(decoder)
-	for i := 0; i < totalVersions; i++ {
+	for i := range totalVersions {
 		dst := &versions[i]
 		if err := dst.DecodeMsg(decoder); err != nil {
 			s.writeErrorResponse(w, err)
@@ -727,7 +728,7 @@ func (s *storageRESTServer) RenamePartHandler(p *RenamePartHandlerParams) (grid.
 	if !s.checkID(p.DiskID) {
 		return grid.NewNPErr(errDiskNotFound)
 	}
-	return grid.NewNPErr(s.getStorage().RenamePart(context.Background(), p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath, p.Meta))
+	return grid.NewNPErr(s.getStorage().RenamePart(context.Background(), p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath, p.Meta, p.SkipParent))
 }
 
 // CleanAbandonedDataHandler - Clean unused data directories.
@@ -831,7 +832,7 @@ func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func
 				// Response not ready, write a filler byte.
 				write([]byte{32})
 				if canWrite {
-					w.(http.Flusher).Flush()
+					xhttp.Flush(w)
 				}
 			case err := <-doneCh:
 				if err != nil {
@@ -905,7 +906,7 @@ func keepHTTPResponseAlive(w http.ResponseWriter) func(error) {
 				// Response not ready, write a filler byte.
 				write([]byte{32})
 				if canWrite {
-					w.(http.Flusher).Flush()
+					xhttp.Flush(w)
 				}
 			case err := <-doneCh:
 				if err != nil {
@@ -1025,7 +1026,7 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 				// Response not ready, write a filler byte.
 				write([]byte{32})
 				if canWrite {
-					w.(http.Flusher).Flush()
+					xhttp.Flush(w)
 				}
 			case err := <-doneCh:
 				if err != nil {
@@ -1043,7 +1044,7 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 				write(tmp[:])
 				write(block)
 				if canWrite {
-					w.(http.Flusher).Flush()
+					xhttp.Flush(w)
 				}
 			}
 		}
@@ -1051,17 +1052,10 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 	return &h
 }
 
-var poolBuf8k = sync.Pool{
-	New: func() interface{} {
+var poolBuf8k = bpool.Pool[*[]byte]{
+	New: func() *[]byte {
 		b := make([]byte, 8192)
 		return &b
-	},
-}
-
-var poolBuf128k = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 128<<10)
-		return b
 	},
 }
 
@@ -1071,9 +1065,10 @@ var poolBuf128k = sync.Pool{
 func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 	var tmp [1]byte
 	// 8K copy buffer, reused for less allocs...
-	bufp := poolBuf8k.Get().(*[]byte)
+	bufp := poolBuf8k.Get()
 	buf := *bufp
 	defer poolBuf8k.Put(bufp)
+
 	for {
 		_, err := io.ReadFull(respBody, tmp[:])
 		if err != nil {
@@ -1161,7 +1156,7 @@ func checkDiskFatalErrs(errs []error) error {
 	}
 
 	if countErrs(errs, errFileAccessDenied) == len(errs) {
-		return errDiskAccessDenied
+		return errFileAccessDenied
 	}
 
 	if countErrs(errs, errDiskNotDir) == len(errs) {
@@ -1438,7 +1433,6 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 					}
 				}
 			}(endpoint)
-
 		}
 	}
 }

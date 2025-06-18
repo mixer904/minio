@@ -130,7 +130,7 @@ func newMuxStream(ctx context.Context, msg message, c *Connection, handler Strea
 	// Fill outbound block.
 	// Each token represents a message that can be sent to the client without blocking.
 	// The client will refill the tokens as they confirm delivery of the messages.
-	for i := 0; i < outboundCap; i++ {
+	for range outboundCap {
 		m.outBlock <- struct{}{}
 	}
 
@@ -388,6 +388,5 @@ func (m *muxServer) close() {
 	if m.outBlock != nil {
 		xioutil.SafeClose(m.outBlock)
 		m.outBlock = nil
-
 	}
 }

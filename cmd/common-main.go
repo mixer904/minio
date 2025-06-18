@@ -47,6 +47,7 @@ import (
 	"github.com/minio/console/api/operations"
 	consoleoauth2 "github.com/minio/console/pkg/auth/idp/oauth2"
 	consoleCerts "github.com/minio/console/pkg/certs"
+	"github.com/minio/kms-go/kes"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -382,7 +383,7 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 	}
 
 	// Check "no-compat" flag from command line argument.
-	ctxt.StrictS3Compat = !(ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat"))
+	ctxt.StrictS3Compat = !ctx.IsSet("no-compat") && !ctx.GlobalIsSet("no-compat")
 
 	switch {
 	case ctx.IsSet("config-dir"):
@@ -717,9 +718,7 @@ func serverHandleEnvVars() {
 				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value in environment variable")
 			}
 			// Look for if URL has invalid values and return error.
-			if !((u.Scheme == "http" || u.Scheme == "https") &&
-				u.Opaque == "" &&
-				!u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
+			if !isValidURLEndpoint((*url.URL)(u)) {
 				err := fmt.Errorf("URL contains unexpected resources, expected URL to be one of http(s)://console.example.com or as a subpath via API endpoint http(s)://minio.example.com/minio format: %v", u)
 				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value is environment variable")
 			}
@@ -734,9 +733,7 @@ func serverHandleEnvVars() {
 			logger.Fatal(err, "Invalid MINIO_SERVER_URL value in environment variable")
 		}
 		// Look for if URL has invalid values and return error.
-		if !((u.Scheme == "http" || u.Scheme == "https") &&
-			(u.Path == "/" || u.Path == "") && u.Opaque == "" &&
-			!u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
+		if !isValidURLEndpoint((*url.URL)(u)) {
 			err := fmt.Errorf("URL contains unexpected resources, expected URL to be of http(s)://minio.example.com format: %v", u)
 			logger.Fatal(err, "Invalid MINIO_SERVER_URL value is environment variable")
 		}
@@ -835,55 +832,83 @@ func serverHandleEnvVars() {
 	globalEnableSyncBoot = env.Get("MINIO_SYNC_BOOT", config.EnableOff) == config.EnableOn
 }
 
-func loadRootCredentials() {
+func loadRootCredentials() auth.Credentials {
 	// At this point, either both environment variables
 	// are defined or both are not defined.
 	// Check both cases and authenticate them if correctly defined
 	var user, password string
-	var hasCredentials bool
 	var legacyCredentials bool
 	//nolint:gocritic
 	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		user = env.Get(config.EnvRootUser, "")
 		password = env.Get(config.EnvRootPassword, "")
-		hasCredentials = true
 	} else if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 		user = env.Get(config.EnvAccessKey, "")
 		password = env.Get(config.EnvSecretKey, "")
 		legacyCredentials = true
-		hasCredentials = true
 	} else if globalServerCtxt.RootUser != "" && globalServerCtxt.RootPwd != "" {
 		user, password = globalServerCtxt.RootUser, globalServerCtxt.RootPwd
-		hasCredentials = true
 	}
-	if hasCredentials {
-		cred, err := auth.CreateCredentials(user, password)
-		if err != nil {
-			if legacyCredentials {
-				logger.Fatal(config.ErrInvalidCredentials(err),
-					"Unable to validate credentials inherited from the shell environment")
-			} else {
-				logger.Fatal(config.ErrInvalidRootUserCredentials(err),
-					"Unable to validate credentials inherited from the shell environment")
-			}
+	if user == "" || password == "" {
+		return auth.Credentials{}
+	}
+	cred, err := auth.CreateCredentials(user, password)
+	if err != nil {
+		if legacyCredentials {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the shell environment")
+		} else {
+			logger.Fatal(config.ErrInvalidRootUserCredentials(err),
+				"Unable to validate credentials inherited from the shell environment")
 		}
-		if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
-			msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
-				"         Please use %s and %s",
-				config.EnvAccessKey, config.EnvSecretKey,
-				config.EnvRootUser, config.EnvRootPassword)
-			logger.Info(color.RedBold(msg))
-		}
-		globalActiveCred = cred
-		globalCredViaEnv = true
-	} else {
-		globalActiveCred = auth.DefaultCredentials
+	}
+	if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
+		msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
+			"         Please use %s and %s",
+			config.EnvAccessKey, config.EnvSecretKey,
+			config.EnvRootUser, config.EnvRootPassword)
+		logger.Info(color.RedBold(msg))
+	}
+	globalCredViaEnv = true
+	return cred
+}
+
+// autoGenerateRootCredentials generates root credentials deterministically if
+// a KMS is configured, no manual credentials have been specified and if root
+// access is disabled.
+func autoGenerateRootCredentials() auth.Credentials {
+	if GlobalKMS == nil {
+		return globalActiveCred
 	}
 
-	var err error
-	globalNodeAuthToken, err = authenticateNode(globalActiveCred.AccessKey, globalActiveCred.SecretKey)
+	aKey, err := GlobalKMS.MAC(GlobalContext, &kms.MACRequest{Message: []byte("root access key")})
+	if IsErrIgnored(err, kes.ErrNotAllowed, kms.ErrNotSupported, errors.ErrUnsupported, kms.ErrPermission) {
+		// If we don't have permission to compute the HMAC, don't change the cred.
+		return globalActiveCred
+	}
 	if err != nil {
-		logger.Fatal(err, "Unable to generate internode credentials")
+		logger.Fatal(err, "Unable to generate root access key using KMS")
+	}
+
+	sKey, err := GlobalKMS.MAC(GlobalContext, &kms.MACRequest{Message: []byte("root secret key")})
+	if err != nil {
+		// Here, we must have permission. Otherwise, we would have failed earlier.
+		logger.Fatal(err, "Unable to generate root secret key using KMS")
+	}
+
+	accessKey, err := auth.GenerateAccessKey(20, bytes.NewReader(aKey))
+	if err != nil {
+		logger.Fatal(err, "Unable to generate root access key")
+	}
+	secretKey, err := auth.GenerateSecretKey(32, bytes.NewReader(sKey))
+	if err != nil {
+		logger.Fatal(err, "Unable to generate root secret key")
+	}
+
+	logger.Info("Automatically generated root access key and secret key with the KMS")
+	return auth.Credentials{
+		AccessKey: accessKey,
+		SecretKey: secretKey,
 	}
 }
 
@@ -915,7 +940,7 @@ func handleKMSConfig() {
 }
 
 func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secureConn bool, err error) {
-	if !(isFile(getPublicCertFile()) && isFile(getPrivateKeyFile())) {
+	if !isFile(getPublicCertFile()) || !isFile(getPrivateKeyFile()) {
 		return nil, nil, false, nil
 	}
 

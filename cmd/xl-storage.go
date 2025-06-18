@@ -43,6 +43,7 @@ import (
 	"github.com/klauspost/filepathx"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 
@@ -552,7 +553,8 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 	}
 
 	// Check if the current bucket has replication configuration
-	if rcfg, _, err := globalBucketMetadataSys.GetReplicationConfig(ctx, cache.Info.Name); err == nil {
+	var rcfg *replication.Config
+	if rcfg, _, err = globalBucketMetadataSys.GetReplicationConfig(ctx, cache.Info.Name); err == nil {
 		if rcfg.HasActiveRules("", true) {
 			tgts, err := globalBucketTargetSys.ListBucketTargets(ctx, cache.Info.Name)
 			if err == nil {
@@ -562,6 +564,13 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 				}
 			}
 		}
+	}
+
+	// Check if bucket is object locked.
+	lr, err := globalBucketObjectLockSys.Get(cache.Info.Name)
+	if err != nil {
+		scannerLogOnceIf(ctx, err, cache.Info.Name)
+		return cache, err
 	}
 
 	vcfg, _ := globalBucketVersioningSys.Get(cache.Info.Name)
@@ -614,6 +623,11 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 			return sizeSummary{}, errSkipFile
 		}
 
+		versioned := vcfg != nil && vcfg.Versioned(item.objectPath())
+		objInfos := make([]ObjectInfo, len(fivs.Versions))
+		for i, fi := range fivs.Versions {
+			objInfos[i] = fi.ToObjectInfo(item.bucket, item.objectPath(), versioned)
+		}
 		sizeS := sizeSummary{}
 		for _, tier := range globalTierConfigMgr.ListTiers() {
 			if sizeS.tiers == nil {
@@ -626,35 +640,14 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 			sizeS.tiers[storageclass.RRS] = tierStats{}
 		}
 
-		done := globalScannerMetrics.time(scannerMetricApplyAll)
-		objInfos, err := item.applyVersionActions(ctx, objAPI, fivs.Versions, globalExpiryState)
-		done()
-
 		if err != nil {
 			res["err"] = err.Error()
 			return sizeSummary{}, errSkipFile
 		}
 
-		versioned := vcfg != nil && vcfg.Versioned(item.objectPath())
-
-		var objDeleted bool
-		for _, oi := range objInfos {
-			done = globalScannerMetrics.time(scannerMetricApplyVersion)
-			var sz int64
-			objDeleted, sz = item.applyActions(ctx, objAPI, oi, &sizeS)
-			done()
-
-			// DeleteAllVersionsAction: The object and all its
-			// versions are expired and
-			// doesn't contribute toward data usage.
-			if objDeleted {
-				break
-			}
-			actualSz, err := oi.GetActualSize()
-			if err != nil {
-				continue
-			}
-
+		var objPresent bool
+		item.applyActions(ctx, objAPI, objInfos, lr, &sizeS, func(oi ObjectInfo, sz, actualSz int64, sizeS *sizeSummary) {
+			objPresent = true
 			if oi.DeleteMarker {
 				sizeS.deleteMarkers++
 			}
@@ -667,7 +660,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 			// tracking deleted transitioned objects
 			switch {
 			case oi.DeleteMarker, oi.TransitionedObject.FreeVersion:
-				continue
+				return
 			}
 			tier := oi.StorageClass
 			if tier == "" {
@@ -681,12 +674,12 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 					sizeS.tiers[tier] = st.add(oi.tierStats())
 				}
 			}
-		}
+		})
 
 		// apply tier sweep action on free versions
 		for _, freeVersion := range fivs.FreeVersions {
 			oi := freeVersion.ToObjectInfo(item.bucket, item.objectPath(), versioned)
-			done = globalScannerMetrics.time(scannerMetricTierObjSweep)
+			done := globalScannerMetrics.time(scannerMetricTierObjSweep)
 			globalExpiryState.enqueueFreeVersion(oi)
 			done()
 		}
@@ -722,7 +715,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 				}
 			}
 		}
-		if objDeleted {
+		if !objPresent {
 			// we return errIgnoreFileContrib to signal this function's
 			// callers to skip this object's contribution towards
 			// usage.
@@ -1716,7 +1709,7 @@ func (s *xlStorage) ReadVersion(ctx context.Context, origvolume, volume, path, v
 				// If written with header we are fine.
 				return fi, nil
 			}
-			if fi.Size == 0 || !(fi.VersionID != "" && fi.VersionID != nullVersionID) {
+			if fi.Size == 0 || (fi.VersionID == "" || fi.VersionID == nullVersionID) {
 				// If versioned we have no conflicts.
 				fi.SetInlineData()
 				return fi, nil
@@ -2166,10 +2159,10 @@ func (s *xlStorage) writeAllDirect(ctx context.Context, filePath string, fileSiz
 	var bufp *[]byte
 	switch {
 	case fileSize <= xioutil.SmallBlock:
-		bufp = xioutil.ODirectPoolSmall.Get().(*[]byte)
+		bufp = xioutil.ODirectPoolSmall.Get()
 		defer xioutil.ODirectPoolSmall.Put(bufp)
 	default:
-		bufp = xioutil.ODirectPoolLarge.Get().(*[]byte)
+		bufp = xioutil.ODirectPoolLarge.Get()
 		defer xioutil.ODirectPoolLarge.Put(bufp)
 	}
 
@@ -2924,7 +2917,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 
 // RenamePart - rename part path to destination path atomically, this is meant to be used
 // only with multipart API
-func (s *xlStorage) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte) (err error) {
+func (s *xlStorage) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte, skipParent string) (err error) {
 	srcVolumeDir, err := s.getVolDir(srcVolume)
 	if err != nil {
 		return err
@@ -2971,12 +2964,22 @@ func (s *xlStorage) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolum
 	if err = checkPathLength(dstFilePath); err != nil {
 		return err
 	}
+	// when skipParent is from rpc. it’s ok for not adding another rpc HandlerID like HandlerRenamePart2
+	// For this case, skipParent is empty, destBaseDir is equal to dstVolumeDir, that behavior is the same as the previous one
+	destBaseDir := pathutil.Join(dstVolumeDir, skipParent)
+	if err = checkPathLength(destBaseDir); err != nil {
+		return err
+	}
 
-	if err = renameAll(srcFilePath, dstFilePath, dstVolumeDir); err != nil {
+	if err = renameAll(srcFilePath, dstFilePath, destBaseDir); err != nil {
 		if isSysErrNotEmpty(err) || isSysErrNotDir(err) {
 			return errFileAccessDenied
 		}
-		return osErrToFileErr(err)
+		err = osErrToFileErr(err)
+		if errors.Is(err, errFileNotFound) || errors.Is(err, errFileAccessDenied) {
+			return errUploadIDNotFound
+		}
+		return err
 	}
 
 	if err = s.WriteAll(ctx, dstVolume, dstPath+".meta", meta); err != nil {
@@ -3024,7 +3027,7 @@ func (s *xlStorage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolum
 	srcIsDir := HasSuffix(srcPath, SlashSeparator)
 	dstIsDir := HasSuffix(dstPath, SlashSeparator)
 	// Either src and dst have to be directories or files, else return error.
-	if !(srcIsDir && dstIsDir || !srcIsDir && !dstIsDir) {
+	if (!srcIsDir || !dstIsDir) && (srcIsDir || dstIsDir) {
 		return errFileAccessDenied
 	}
 	srcFilePath := pathutil.Join(srcVolumeDir, srcPath)
@@ -3373,9 +3376,7 @@ func (s *xlStorage) CleanAbandonedData(ctx context.Context, volume string, path 
 	}
 
 	// Clear and repopulate
-	for k := range foundDirs {
-		delete(foundDirs, k)
-	}
+	clear(foundDirs)
 
 	// Populate into map
 	for _, k := range dirs {

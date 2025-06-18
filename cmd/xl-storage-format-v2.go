@@ -26,12 +26,12 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/uuid"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/config/storageclass"
@@ -703,18 +703,17 @@ func (j xlMetaV2Object) ToFileInfo(volume, path string, allParts bool) (FileInfo
 const metaDataReadDefault = 4 << 10
 
 // Return used metadata byte slices here.
-var metaDataPool = sync.Pool{New: func() interface{} { return make([]byte, 0, metaDataReadDefault) }}
+var metaDataPool = bpool.Pool[[]byte]{New: func() []byte { return make([]byte, 0, metaDataReadDefault) }}
 
 // metaDataPoolGet will return a byte slice with capacity at least metaDataReadDefault.
 // It will be length 0.
 func metaDataPoolGet() []byte {
-	return metaDataPool.Get().([]byte)[:0]
+	return metaDataPool.Get()[:0]
 }
 
 // metaDataPoolPut will put an unused small buffer back into the pool.
 func metaDataPoolPut(buf []byte) {
 	if cap(buf) >= metaDataReadDefault && cap(buf) < metaDataReadDefault*4 {
-		//nolint:staticcheck // SA6002 we are fine with the tiny alloc
 		metaDataPool.Put(buf)
 	}
 }
@@ -826,7 +825,7 @@ func decodeXLHeaders(buf []byte) (versions int, headerV, metaV uint8, b []byte, 
 		return 0, 0, 0, buf, err
 	}
 	if hdrVer > xlHeaderVersion {
-		return 0, 0, 0, buf, fmt.Errorf("decodeXLHeaders: Unknown xl header version %d", metaVer)
+		return 0, 0, 0, buf, fmt.Errorf("decodeXLHeaders: Unknown xl header version %d", hdrVer)
 	}
 	if metaVer > xlMetaVersion {
 		return 0, 0, 0, buf, fmt.Errorf("decodeXLHeaders: Unknown xl meta version %d", metaVer)
@@ -847,7 +846,7 @@ func decodeXLHeaders(buf []byte) (versions int, headerV, metaV uint8, b []byte, 
 // Any non-nil error is returned.
 func decodeVersions(buf []byte, versions int, fn func(idx int, hdr, meta []byte) error) (err error) {
 	var tHdr, tMeta []byte // Zero copy bytes
-	for i := 0; i < versions; i++ {
+	for i := range versions {
 		tHdr, buf, err = msgp.ReadBytesZC(buf)
 		if err != nil {
 			return err
@@ -1385,13 +1384,13 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		updateVersion = fi.MarkDeleted
 	} else {
 		// for replication scenario
-		if fi.Deleted && fi.VersionPurgeStatus() != Complete {
+		if fi.Deleted && fi.VersionPurgeStatus() != replication.VersionPurgeComplete {
 			if !fi.VersionPurgeStatus().Empty() || fi.DeleteMarkerReplicationStatus().Empty() {
 				updateVersion = true
 			}
 		}
 		// object or delete-marker versioned delete is not complete
-		if !fi.VersionPurgeStatus().Empty() && fi.VersionPurgeStatus() != Complete {
+		if !fi.VersionPurgeStatus().Empty() && fi.VersionPurgeStatus() != replication.VersionPurgeComplete {
 			updateVersion = true
 		}
 	}
@@ -1459,7 +1458,7 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 				return "", err
 			}
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)
-			if fi.MarkDeleted && (fi.VersionPurgeStatus().Empty() || (fi.VersionPurgeStatus() != Complete)) {
+			if fi.MarkDeleted && (fi.VersionPurgeStatus().Empty() || (fi.VersionPurgeStatus() != replication.VersionPurgeComplete)) {
 				err = x.addVersion(ventry)
 			} else if fi.Deleted && uv.String() == emptyUUID {
 				return "", x.addVersion(ventry)
@@ -1982,7 +1981,6 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 			if !latest.header.FreeVersion() {
 				nVersions++
 			}
-
 		} else {
 			// Find latest.
 			var latestCount int
