@@ -22,7 +22,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"github.com/minio/pkg/v3/logger/message/audit"
+	"github.com/minio/madmin-go/v3/logger/audit"
 	"net"
 	"os"
 	"strconv"
