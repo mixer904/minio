@@ -76,19 +76,17 @@ func TestGetHistogramMetrics_BucketCount(t *testing.T) {
 		// Send observations once every 1ms, to simulate delay between
 		// observations. This is to test the channel based
 		// synchronization used internally.
-		select {
-		case <-ticker.C:
-			ttfbHist.With(prometheus.Labels{"api": obs.label}).Observe(obs.val)
-		}
+		<-ticker.C
+		ttfbHist.With(prometheus.Labels{"api": obs.label}).Observe(obs.val)
 	}
 
-	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false)
+	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false, false)
 	// additional labels for +Inf for all histogram metrics
 	if expPoints := len(labels) * (len(histBuckets) + 1); expPoints != len(metrics) {
 		t.Fatalf("Expected %v data points when toLowerAPILabels=false but got %v", expPoints, len(metrics))
 	}
 
-	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true)
+	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true, false)
 	// additional labels for +Inf for all histogram metrics
 	if expPoints := len(labels) * (len(histBuckets) + 1); expPoints != len(metrics) {
 		t.Fatalf("Expected %v data points when toLowerAPILabels=true but got %v", expPoints, len(metrics))
@@ -137,14 +135,12 @@ func TestGetHistogramMetrics_Values(t *testing.T) {
 		// Send observations once every 1ms, to simulate delay between
 		// observations. This is to test the channel based
 		// synchronization used internally.
-		select {
-		case <-ticker.C:
-			ttfbHist.With(prometheus.Labels{"api": obs.label}).Observe(obs.val)
-		}
+		<-ticker.C
+		ttfbHist.With(prometheus.Labels{"api": obs.label}).Observe(obs.val)
 	}
 
 	// Accumulate regular-cased API label metrics for 'PutObject' for deeper verification
-	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false)
+	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false, false)
 	capitalPutObjects := make([]MetricV2, 0, len(histBuckets)+1)
 	for _, metric := range metrics {
 		if value := metric.VariableLabels["api"]; value == "PutObject" {
@@ -181,7 +177,7 @@ func TestGetHistogramMetrics_Values(t *testing.T) {
 	}
 
 	// Accumulate lower-cased API label metrics for 'copyobject' for deeper verification
-	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true)
+	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true, false)
 	lowerCopyObjects := make([]MetricV2, 0, len(histBuckets)+1)
 	for _, metric := range metrics {
 		if value := metric.VariableLabels["api"]; value == "copyobject" {

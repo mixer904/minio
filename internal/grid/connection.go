@@ -1041,7 +1041,7 @@ func (c *Connection) readStream(ctx context.Context, conn net.Conn, cancel conte
 		// Handle merged messages.
 		messages := int(m.Seq)
 		c.inMessages.Add(int64(messages))
-		for i := 0; i < messages; i++ {
+		for range messages {
 			if atomic.LoadUint32((*uint32)(&c.state)) != StateConnected {
 				return
 			}
@@ -1511,7 +1511,6 @@ func (c *Connection) handlePing(ctx context.Context, m message) {
 		pong := pongMsg{NotFound: true, T: ping.T}
 		gridLogIf(ctx, c.queueMsg(m, &pong))
 	}
-	return
 }
 
 func (c *Connection) handleDisconnectClientMux(m message) {
@@ -1626,24 +1625,28 @@ func (c *Connection) handleMuxServerMsg(ctx context.Context, m message) {
 			Msg: nil,
 			Err: RemoteErr(m.Payload),
 		})
+		if v.cancelFn != nil {
+			v.cancelFn(RemoteErr(m.Payload))
+		}
 		PutByteBuffer(m.Payload)
-	} else if m.Payload != nil {
+		v.close()
+		c.outgoing.Delete(m.MuxID)
+		return
+	}
+	// Return payload.
+	if m.Payload != nil {
 		v.response(m.Seq, Response{
 			Msg: m.Payload,
 			Err: nil,
 		})
 	}
+	// Close when EOF.
 	if m.Flags&FlagEOF != 0 {
-		if v.cancelFn != nil && m.Flags&FlagPayloadIsErr == 0 {
-			// We must obtain the lock before calling cancelFn
-			// Otherwise others may pick up the error before close is called.
-			v.respMu.Lock()
-			v.cancelFn(errStreamEOF)
-			v.closeLocked()
-			v.respMu.Unlock()
-		} else {
-			v.close()
-		}
+		// We must obtain the lock before closing
+		// Otherwise others may pick up the error before close is called.
+		v.respMu.Lock()
+		v.closeLocked()
+		v.respMu.Unlock()
 		if debugReqs {
 			fmt.Println(m.MuxID, c.String(), "handleMuxServerMsg: DELETING MUX")
 		}
@@ -1748,20 +1751,20 @@ func (c *Connection) debugMsg(d debugMsg, args ...any) {
 	case debugSetConnPingDuration:
 		c.connMu.Lock()
 		defer c.connMu.Unlock()
-		c.connPingInterval = args[0].(time.Duration)
+		c.connPingInterval, _ = args[0].(time.Duration)
 		if c.connPingInterval < time.Second {
 			panic("CONN ping interval too low")
 		}
 	case debugSetClientPingDuration:
 		c.connMu.Lock()
 		defer c.connMu.Unlock()
-		c.clientPingInterval = args[0].(time.Duration)
+		c.clientPingInterval, _ = args[0].(time.Duration)
 	case debugAddToDeadline:
-		c.addDeadline = args[0].(time.Duration)
+		c.addDeadline, _ = args[0].(time.Duration)
 	case debugIsOutgoingClosed:
 		// params: muxID uint64, isClosed func(bool)
-		muxID := args[0].(uint64)
-		resp := args[1].(func(b bool))
+		muxID, _ := args[0].(uint64)
+		resp, _ := args[1].(func(b bool))
 		mid, ok := c.outgoing.Load(muxID)
 		if !ok || mid == nil {
 			resp(true)
@@ -1772,7 +1775,8 @@ func (c *Connection) debugMsg(d debugMsg, args ...any) {
 		mid.respMu.Unlock()
 	case debugBlockInboundMessages:
 		c.connMu.Lock()
-		block := (<-chan struct{})(args[0].(chan struct{}))
+		a, _ := args[0].(chan struct{})
+		block := (<-chan struct{})(a)
 		c.blockMessages.Store(&block)
 		c.connMu.Unlock()
 	}

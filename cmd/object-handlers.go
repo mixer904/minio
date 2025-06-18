@@ -408,7 +408,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			perr   error
 		)
 
-		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
+		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && (gr == nil || !gr.ObjInfo.DeleteMarker) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
 				globalReplicationStats.Load().incProxy(bucket, getObjectAPI, false)
@@ -521,7 +521,8 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
+		cs, _ := objInfo.decryptChecksums(opts.PartNumber, r.Header)
+		hash.AddChecksumHeader(w, cs)
 	}
 
 	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {
@@ -536,8 +537,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	setHeadGetRespHeaders(w, r.Form)
 
-	var iw io.Writer
-	iw = w
+	var iw io.Writer = w
 
 	statusCodeWritten := false
 	httpWriter := xioutil.WriteOnClose(iw)
@@ -632,7 +632,7 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	w.Header().Del(xhttp.ContentType)
 
 	if _, ok := opts.ObjectAttributes[xhttp.Checksum]; ok {
-		chkSums := objInfo.decryptChecksums(0, r.Header)
+		chkSums, _ := objInfo.decryptChecksums(0, r.Header)
 		// AWS does not appear to append part number on this API call.
 		if len(chkSums) > 0 {
 			OA.Checksum = &objectAttributesChecksum{
@@ -706,8 +706,6 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
 	})
-
-	return
 }
 
 // GetObjectHandler - GET Object
@@ -945,7 +943,8 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
+		cs, _ := objInfo.decryptChecksums(opts.PartNumber, r.Header)
+		hash.AddChecksumHeader(w, cs)
 	}
 
 	// Set standard object headers.
@@ -1536,7 +1535,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
 			srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
 		}
-
 	}
 
 	srcInfo.UserDefined = filterReplicationStatusMetadata(srcInfo.UserDefined)
@@ -1629,7 +1627,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		srcInfo.metadataOnly && srcOpts.VersionID == "" &&
 		!crypto.Requested(r.Header) &&
 		!crypto.IsSourceEncrypted(srcInfo.UserDefined) {
-
 		// If x-amz-metadata-directive is not set to REPLACE then we need
 		// to error out if source and destination are same.
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidCopyDest), r.URL)
@@ -1853,7 +1850,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	case authTypeStreamingUnsignedTrailer:
 		// Initialize stream chunked reader with optional trailers.
-		rd, s3Err = newUnsignedV4ChunkedReader(r, true)
+		rd, s3Err = newUnsignedV4ChunkedReader(r, true, r.Header.Get(xhttp.Authorization) != "")
 		if s3Err != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 			return
@@ -2229,8 +2226,15 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		putObject = objectAPI.PutObject
 	)
 
-	// Check if put is allowed
-	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
+	var opts untarOptions
+	opts.ignoreDirs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreDirs), "true")
+	opts.ignoreErrs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreErrors), "true")
+	opts.prefixAll = r.Header.Get(xhttp.MinIOSnowballPrefix)
+	if opts.prefixAll != "" {
+		opts.prefixAll = trimLeadingSlash(pathJoin(opts.prefixAll, slashSeparator))
+	}
+	// Check if put is allow for specified prefix.
+	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, opts.prefixAll, r, policy.PutObjectAction); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
@@ -2298,7 +2302,10 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 	putObjectTar := func(reader io.Reader, info os.FileInfo, object string) error {
 		size := info.Size()
-
+		if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+			return errors.New(errorCodes.ToAPIErr(s3Err).Code)
+		}
 		metadata := map[string]string{
 			xhttp.AmzStorageClass: sc, // save same storage-class as incoming stream.
 		}
@@ -2334,7 +2341,7 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 		if r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() {
 			if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.ReplicateObjectAction); s3Err != ErrNone {
-				return err
+				return errors.New(errorCodes.ToAPIErr(s3Err).Code)
 			}
 			metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
 			metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
@@ -2398,7 +2405,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		if dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(metadata, "", "", replication.ObjectReplicationType, opts)); dsc.ReplicateAny() {
 			metadata[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
 			metadata[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
-
 		}
 
 		var objectEncryptionKey crypto.ObjectKey
@@ -2479,14 +2485,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		}
 
 		return nil
-	}
-
-	var opts untarOptions
-	opts.ignoreDirs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreDirs), "true")
-	opts.ignoreErrs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreErrors), "true")
-	opts.prefixAll = r.Header.Get(xhttp.MinIOSnowballPrefix)
-	if opts.prefixAll != "" {
-		opts.prefixAll = trimLeadingSlash(pathJoin(opts.prefixAll, slashSeparator))
 	}
 
 	if err = untar(ctx, hreader, putObjectTar, opts); err != nil {
@@ -2674,7 +2672,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		Host:         handlers.GetSourceIP(r),
 	})
 
-	if objInfo.ReplicationStatus == replication.Pending || objInfo.VersionPurgeStatus == Pending {
+	if objInfo.ReplicationStatus == replication.Pending || objInfo.VersionPurgeStatus == replication.VersionPurgePending {
 		dmVersionID := ""
 		versionID := ""
 		if objInfo.DeleteMarker {
@@ -2880,9 +2878,9 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	cred, owner, s3Err := validateSignature(getRequestAuthType(r), r)
-	if s3Err != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+	// Check permissions to perform this object retention operation
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectRetentionAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
@@ -2908,6 +2906,7 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		writeErrorResponse(ctx, w, apiErr, r.URL)
 		return
 	}
+
 	reqInfo := logger.GetReqInfo(ctx)
 	reqInfo.SetTags("retention", objRetention.String())
 
@@ -2921,7 +2920,7 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		MTime:     opts.MTime,
 		VersionID: opts.VersionID,
 		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
-			if err := enforceRetentionBypassForPut(ctx, r, *oi, objRetention, cred, owner); err != nil {
+			if err := enforceRetentionBypassForPut(ctx, r, *oi, objRetention, reqInfo.Cred, reqInfo.Owner); err != nil {
 				return dsc, err
 			}
 			if objRetention.Mode.Valid() {

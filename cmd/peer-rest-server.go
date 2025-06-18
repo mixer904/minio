@@ -37,15 +37,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/bucket/bandwidth"
-	b "github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/grid"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // To abstract a node over network.
@@ -1035,7 +1034,7 @@ func (s *peerRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 // GetBandwidth gets the bandwidth for the buckets requested.
 func (s *peerRESTServer) GetBandwidth(params *grid.URLValues) (*bandwidth.BucketBandwidthReport, *grid.RemoteErr) {
 	buckets := params.Values().Get("buckets")
-	selectBuckets := b.SelectBuckets(buckets)
+	selectBuckets := bandwidth.SelectBuckets(buckets)
 	return globalBucketMonitor.GetReport(selectBuckets), nil
 }
 
@@ -1308,6 +1307,7 @@ func (s *peerRESTServer) HeadBucketHandler(mss *grid.MSS) (info *VolInfo, nerr *
 	return &VolInfo{
 		Name:    bucketInfo.Name,
 		Created: bucketInfo.Created,
+		Deleted: bucketInfo.Deleted, // needed for site replication
 	}, nil
 }
 

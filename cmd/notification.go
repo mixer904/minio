@@ -123,7 +123,7 @@ func (g *NotificationGroup) Go(ctx context.Context, f func() error, index int, a
 		}
 
 		retryCount := g.retryCount
-		for i := 0; i < retryCount; i++ {
+		for i := range retryCount {
 			g.errs[index].Err = nil
 			if err := f(); err != nil {
 				g.errs[index].Err = err
@@ -1184,7 +1184,6 @@ func (sys *NotificationSys) GetPeerOnlineCount() (nodesOnline, nodesOffline int)
 			defer wg.Done()
 			nodesOnlineIndex[idx] = client.restClient.HealthCheckFn()
 		}(idx, client)
-
 	}
 	wg.Wait()
 

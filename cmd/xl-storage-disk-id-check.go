@@ -159,7 +159,7 @@ func (e *lockedLastMinuteLatency) addSize(value time.Duration, sz int64) {
 			a.Total = atomic.LoadInt64(&old.Total)
 			a.N = atomic.LoadInt64(&old.N)
 			e.mu.Lock()
-			e.lastMinuteLatency.addAll(t-1, a)
+			e.addAll(t-1, a)
 			e.mu.Unlock()
 			acc = newAcc
 		} else {
@@ -177,7 +177,7 @@ func (e *lockedLastMinuteLatency) addSize(value time.Duration, sz int64) {
 func (e *lockedLastMinuteLatency) total() AccElem {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.lastMinuteLatency.getTotal()
+	return e.getTotal()
 }
 
 func newXLStorageDiskIDCheck(storage *xlStorage, healthCheck bool) *xlStorageDiskIDCheck {
@@ -456,7 +456,7 @@ func (p *xlStorageDiskIDCheck) ReadFileStream(ctx context.Context, volume, path 
 	})
 }
 
-func (p *xlStorageDiskIDCheck) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte) (err error) {
+func (p *xlStorageDiskIDCheck) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte, skipParent string) (err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricRenamePart, srcVolume, srcPath, dstVolume, dstPath)
 	if err != nil {
 		return err
@@ -464,7 +464,9 @@ func (p *xlStorageDiskIDCheck) RenamePart(ctx context.Context, srcVolume, srcPat
 	defer done(0, &err)
 
 	w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
-	return w.Run(func() error { return p.storage.RenamePart(ctx, srcVolume, srcPath, dstVolume, dstPath, meta) })
+	return w.Run(func() error {
+		return p.storage.RenamePart(ctx, srcVolume, srcPath, dstVolume, dstPath, meta, skipParent)
+	})
 }
 
 func (p *xlStorageDiskIDCheck) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {

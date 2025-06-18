@@ -42,7 +42,6 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/event"
-	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/hash/sha256"
@@ -130,7 +129,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 				break
 			}
 		}
-		if !(ssecRep && sourceReplReq) {
+		if !ssecRep || !sourceReplReq {
 			if err = setEncryptionMetadata(r, bucket, object, encMetadata); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -216,7 +215,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 
 	checksumType := hash.NewChecksumHeader(r.Header)
 	if checksumType.Is(hash.ChecksumInvalid) {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequestParameter), r.URL)
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidChecksum), r.URL)
 		return
 	} else if checksumType.IsSet() && !checksumType.Is(hash.ChecksumTrailing) {
 		opts.WantChecksum = &hash.Checksum{Type: checksumType}
@@ -527,9 +526,8 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 
 		partEncryptionKey := objectEncryptionKey.DerivePartKey(uint32(partID))
 		encReader, err := sio.EncryptReader(reader, sio.Config{
-			Key:          partEncryptionKey[:],
-			CipherSuites: fips.DARECiphers(),
-			Nonce:        &nonce,
+			Key:   partEncryptionKey[:],
+			Nonce: &nonce,
 		})
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -682,7 +680,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		}
 	case authTypeStreamingUnsignedTrailer:
 		// Initialize stream signature verifier.
-		reader, s3Error = newUnsignedV4ChunkedReader(r, true)
+		reader, s3Error = newUnsignedV4ChunkedReader(r, true, r.Header.Get(xhttp.Authorization) != "")
 		if s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return
@@ -803,7 +801,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 			}
 		}
 
-		if !(sourceReplReq && crypto.SSEC.IsEncrypted(mi.UserDefined)) {
+		if !sourceReplReq || !crypto.SSEC.IsEncrypted(mi.UserDefined) {
 			// Calculating object encryption key
 			key, err = decryptObjectMeta(key, bucket, object, mi.UserDefined)
 			if err != nil {
@@ -825,9 +823,8 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 			copy(nonce[:], tmp[:12])
 
 			reader, err = sio.EncryptReader(in, sio.Config{
-				Key:          partEncryptionKey[:],
-				CipherSuites: fips.DARECiphers(),
-				Nonce:        &nonce,
+				Key:   partEncryptionKey[:],
+				Nonce: &nonce,
 			})
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)

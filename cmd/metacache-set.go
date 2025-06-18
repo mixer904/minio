@@ -174,6 +174,31 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 	}
 }
 
+func (o *listPathOptions) shouldSkip(ctx context.Context, entry metaCacheEntry) (yes bool) {
+	if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
+		return true
+	}
+	if o.Marker != "" && entry.name < o.Marker {
+		return true
+	}
+	if !strings.HasPrefix(entry.name, o.Prefix) {
+		return true
+	}
+	if o.Separator != "" && entry.isDir() && !strings.Contains(strings.TrimPrefix(entry.name, o.Prefix), o.Separator) {
+		return true
+	}
+	if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
+		return true
+	}
+	if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
+		return true
+	}
+	if o.Lifecycle != nil || o.Replication.Config != nil {
+		return triggerExpiryAndRepl(ctx, *o, entry)
+	}
+	return false
+}
+
 // gatherResults will collect all results on the input channel and filter results according
 // to the options or to the current bucket ILM expiry rules.
 // Caller should close the channel when done.
@@ -199,26 +224,9 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 				resCh = nil
 				continue
 			}
-			if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
+			if yes := o.shouldSkip(ctx, entry); yes {
+				results.lastSkippedEntry = entry.name
 				continue
-			}
-			if o.Marker != "" && entry.name < o.Marker {
-				continue
-			}
-			if !strings.HasPrefix(entry.name, o.Prefix) {
-				continue
-			}
-			if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
-				continue
-			}
-			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
-				continue
-			}
-			if o.Lifecycle != nil || o.Replication.Config != nil {
-				if skipped := triggerExpiryAndRepl(ctx, *o, entry); skipped == true {
-					results.lastSkippedEntry = entry.name
-					continue
-				}
 			}
 			if o.Limit > 0 && results.len() >= o.Limit {
 				// We have enough and we have more.
@@ -1110,7 +1118,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 					continue
 				}
 				hasErr++
-				errs[i] = err
+				errs[i] = fmt.Errorf("drive: %s returned err: %v", disks[i], err)
 				continue
 			}
 			// If no current, add it.
@@ -1159,18 +1167,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			if opts.finished != nil {
 				opts.finished(errs)
 			}
-			var combinedErr []string
-			for i, err := range errs {
-				if err != nil {
-					if disks[i] != nil {
-						combinedErr = append(combinedErr,
-							fmt.Sprintf("drive %s returned: %s", disks[i], err))
-					} else {
-						combinedErr = append(combinedErr, err.Error())
-					}
-				}
-			}
-			return errors.New(strings.Join(combinedErr, ", "))
+			return errors.Join(errs...)
 		}
 
 		// Break if all at EOF or error.

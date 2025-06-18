@@ -845,7 +845,11 @@ func (store *IAMStoreSys) PolicyDBGet(name string, groups ...string) ([]string, 
 		if err != nil {
 			return nil, err
 		}
-		return val.([]string), nil
+		res, ok := val.([]string)
+		if !ok {
+			return nil, errors.New("unexpected policy type")
+		}
+		return res, nil
 	}
 	return getPolicies()
 }
@@ -1218,7 +1222,6 @@ func (store *IAMStoreSys) PolicyDBUpdate(ctx context.Context, name string, isGro
 			cache.iamGroupPolicyMap.Delete(name)
 		}
 	} else {
-
 		if err = store.saveMappedPolicy(ctx, name, userType, isGroup, newPolicyMapping); err != nil {
 			return
 		}
@@ -1620,7 +1623,6 @@ func (store *IAMStoreSys) MergePolicies(policyName string) (string, policy.Polic
 			policies = append(policies, policy)
 			toMerge = append(toMerge, p.Policy)
 		}
-
 	}
 
 	return strings.Join(policies, ","), policy.MergePolicies(toMerge...)
@@ -2030,6 +2032,50 @@ func (store *IAMStoreSys) SetTempUser(ctx context.Context, accessKey string, cre
 	return u.UpdatedAt, nil
 }
 
+// RevokeTokens - revokes all temporary credentials, or those with matching type,
+// associated with the parent user.
+func (store *IAMStoreSys) RevokeTokens(ctx context.Context, parentUser string, tokenRevokeType string) error {
+	if parentUser == "" {
+		return errInvalidArgument
+	}
+
+	cache := store.lock()
+	defer store.unlock()
+
+	secret, err := getTokenSigningKey()
+	if err != nil {
+		return err
+	}
+
+	var revoked bool
+	for _, ui := range cache.iamSTSAccountsMap {
+		if ui.Credentials.ParentUser != parentUser {
+			continue
+		}
+		if tokenRevokeType != "" {
+			claims, err := getClaimsFromTokenWithSecret(ui.Credentials.SessionToken, secret)
+			if err != nil {
+				continue // skip if token is invalid
+			}
+			// skip if token type is given and does not match
+			if v, _ := claims.Lookup(tokenRevokeTypeClaim); v != tokenRevokeType {
+				continue
+			}
+		}
+		if err := store.deleteUserIdentity(ctx, ui.Credentials.AccessKey, stsUser); err != nil {
+			return err
+		}
+		delete(cache.iamSTSAccountsMap, ui.Credentials.AccessKey)
+		revoked = true
+	}
+
+	if revoked {
+		cache.updatedAt = time.Now()
+	}
+
+	return nil
+}
+
 // DeleteUsers - given a set of users or access keys, deletes them along with
 // any derived credentials (STS or service accounts) and any associated policy
 // mappings.
@@ -2101,7 +2147,7 @@ func (store *IAMStoreSys) getParentUsers(cache *iamCache) map[string]ParentUserI
 		cred := ui.Credentials
 		// Only consider service account or STS credentials with
 		// non-empty session tokens.
-		if !(cred.IsServiceAccount() || cred.IsTemp()) ||
+		if (!cred.IsServiceAccount() && !cred.IsTemp()) ||
 			cred.SessionToken == "" {
 			continue
 		}
@@ -2731,6 +2777,31 @@ func (store *IAMStoreSys) ListSTSAccounts(ctx context.Context, accessKey string)
 	return stsAccounts, nil
 }
 
+// ListAccessKeys - lists all access keys (sts/service accounts)
+func (store *IAMStoreSys) ListAccessKeys(ctx context.Context) ([]auth.Credentials, error) {
+	cache := store.rlock()
+	defer store.runlock()
+
+	accessKeys := store.getSTSAndServiceAccounts(cache)
+	for i, accessKey := range accessKeys {
+		accessKeys[i].SecretKey = ""
+		if accessKey.IsTemp() {
+			secret, err := getTokenSigningKey()
+			if err != nil {
+				return nil, err
+			}
+			claims, err := getClaimsFromTokenWithSecret(accessKey.SessionToken, secret)
+			if err != nil {
+				continue // ignore invalid session tokens
+			}
+			accessKeys[i].Claims = claims.MapClaims
+		}
+		accessKeys[i].SessionToken = ""
+	}
+
+	return accessKeys, nil
+}
+
 // AddUser - adds/updates long term user account to storage.
 func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) (updatedAt time.Time, err error) {
 	cache := store.lock()
@@ -2793,6 +2864,10 @@ func (store *IAMStoreSys) GetSTSAndServiceAccounts() []auth.Credentials {
 	cache := store.rlock()
 	defer store.runlock()
 
+	return store.getSTSAndServiceAccounts(cache)
+}
+
+func (store *IAMStoreSys) getSTSAndServiceAccounts(cache *iamCache) []auth.Credentials {
 	var res []auth.Credentials
 	for _, u := range cache.iamUsersMap {
 		cred := u.Credentials
@@ -2917,7 +2992,10 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error 
 		return err
 	}
 
-	newCache := val.(*iamCache)
+	newCache, ok := val.(*iamCache)
+	if !ok {
+		return nil
+	}
 
 	cache := store.lock()
 	defer store.unlock()

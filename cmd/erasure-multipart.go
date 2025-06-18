@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2023 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -527,7 +527,7 @@ func (er erasureObjects) NewMultipartUpload(ctx context.Context, bucket, object 
 }
 
 // renamePart - renames multipart part to its relevant location under uploadID.
-func (er erasureObjects) renamePart(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry, dstBucket, dstEntry string, optsMeta []byte, writeQuorum int) ([]StorageAPI, error) {
+func (er erasureObjects) renamePart(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry, dstBucket, dstEntry string, optsMeta []byte, writeQuorum int, skipParent string) ([]StorageAPI, error) {
 	paths := []string{
 		dstEntry,
 		dstEntry + ".meta",
@@ -545,7 +545,7 @@ func (er erasureObjects) renamePart(ctx context.Context, disks []StorageAPI, src
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			return disks[index].RenamePart(ctx, srcBucket, srcEntry, dstBucket, dstEntry, optsMeta)
+			return disks[index].RenamePart(ctx, srcBucket, srcEntry, dstBucket, dstEntry, optsMeta, skipParent)
 		}, index)
 	}
 
@@ -668,9 +668,12 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	}
 
 	n, err := erasure.Encode(ctx, toEncode, writers, buffer, writeQuorum)
-	closeBitrotWriters(writers)
+	closeErrs := closeBitrotWriters(writers)
 	if err != nil {
 		return pi, toObjectErr(err, bucket, object)
+	}
+	if closeErr := reduceWriteQuorumErrs(ctx, closeErrs, objectOpIgnoredErrs, writeQuorum); closeErr != nil {
+		return pi, toObjectErr(closeErr, bucket, object)
 	}
 
 	// Should return IncompleteBody{} error when reader has fewer bytes
@@ -751,8 +754,11 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	ctx = rlkctx.Context()
 	defer uploadIDRLock.RUnlock(rlkctx)
 
-	onlineDisks, err = er.renamePart(ctx, onlineDisks, minioMetaTmpBucket, tmpPartPath, minioMetaMultipartBucket, partPath, partFI, writeQuorum)
+	onlineDisks, err = er.renamePart(ctx, onlineDisks, minioMetaTmpBucket, tmpPartPath, minioMetaMultipartBucket, partPath, partFI, writeQuorum, uploadIDPath)
 	if err != nil {
+		if errors.Is(err, errUploadIDNotFound) {
+			return pi, toObjectErr(errUploadIDNotFound, bucket, object, uploadID)
+		}
 		if errors.Is(err, errFileNotFound) {
 			// An in-quorum errFileNotFound means that client stream
 			// prematurely closed and we do not find any xl.meta or
@@ -925,7 +931,19 @@ func (er erasureObjects) ListObjectParts(ctx context.Context, bucket, object, up
 	}
 
 	start := objectPartIndexNums(partNums, partNumberMarker)
-	if start != -1 {
+	if partNumberMarker > 0 && start == -1 {
+		// Marker not present among what is present on the
+		// server, we return an empty list.
+		return result, nil
+	}
+
+	if partNumberMarker > 0 && start != -1 {
+		if start+1 >= len(partNums) {
+			// Marker indicates that we are the end
+			// of the list, so we simply return empty
+			return result, nil
+		}
+
 		partNums = partNums[start+1:]
 	}
 
@@ -1049,7 +1067,6 @@ func readParts(ctx context.Context, disks []StorageAPI, bucket string, partMetaP
 				PartNumber: partNumbers[pidx],
 			}.Error(),
 		}
-
 	}
 	return partInfosInQuorum, nil
 }
@@ -1464,7 +1481,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		}
 	}
 
-	for i := 0; i < len(onlineDisks); i++ {
+	for i := range len(onlineDisks) {
 		if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
 			// Object info is the same in all disks, so we can pick
 			// the first meta from online disk

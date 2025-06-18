@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"path"
 	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -502,7 +504,7 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 
 	// count the number of offline disks
 	offline := 0
-	for i := 0; i < len(errs); i++ {
+	for i := range len(errs) {
 		var found bool
 		switch {
 		case errors.Is(errs[i], errDiskNotFound):
@@ -811,8 +813,6 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 				PoolIndex: er.poolIndex,
 			})
 		}
-
-		return
 	}()
 
 	validResp := 0
@@ -1176,9 +1176,13 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 	}
 
 	n, erasureErr := erasure.Encode(ctx, data, writers, buffer, writeQuorum)
-	closeBitrotWriters(writers)
+	closeErrs := closeBitrotWriters(writers)
 	if erasureErr != nil {
 		return ObjectInfo{}, toObjectErr(erasureErr, minioMetaBucket, key)
+	}
+
+	if closeErr := reduceWriteQuorumErrs(ctx, closeErrs, objectOpIgnoredErrs, writeQuorum); closeErr != nil {
+		return ObjectInfo{}, toObjectErr(closeErr, minioMetaBucket, key)
 	}
 
 	// Should return IncompleteBody{} error when reader has fewer bytes
@@ -1217,7 +1221,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		partsMetadata[index].SetInlineData()
 	}
 
-	for i := 0; i < len(onlineDisks); i++ {
+	for i := range len(onlineDisks) {
 		if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
 			// Object info is the same in all disks, so we can pick
 			// the first meta from online disk
@@ -1423,9 +1427,13 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		bugLogIf(ctx, err)
 	}
 	n, erasureErr := erasure.Encode(ctx, toEncode, writers, buffer, writeQuorum)
-	closeBitrotWriters(writers)
+	closeErrs := closeBitrotWriters(writers)
 	if erasureErr != nil {
 		return ObjectInfo{}, toObjectErr(erasureErr, bucket, object)
+	}
+
+	if closeErr := reduceWriteQuorumErrs(ctx, closeErrs, objectOpIgnoredErrs, writeQuorum); closeErr != nil {
+		return ObjectInfo{}, toObjectErr(closeErr, bucket, object)
 	}
 
 	// Should return IncompleteBody{} error when reader has fewer bytes
@@ -1549,7 +1557,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	for i := 0; i < len(onlineDisks); i++ {
+	for i := range len(onlineDisks) {
 		if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
 			// Object info is the same in all disks, so we can pick
 			// the first meta from online disk
@@ -1566,7 +1574,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		if len(versions) == 0 {
 			// Whether a disk was initially or becomes offline
 			// during this upload, send it to the MRF list.
-			for i := 0; i < len(onlineDisks); i++ {
+			for i := range len(onlineDisks) {
 				if onlineDisks[i] != nil && onlineDisks[i].IsOnline() {
 					continue
 				}
@@ -1624,7 +1632,7 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
 	if !opts.NoAuditLog {
 		for _, obj := range objects {
-			auditObjectErasureSet(ctx, "DeleteObjects", obj.ObjectV.ObjectName, &er)
+			auditObjectErasureSet(ctx, "DeleteObjects", obj.ObjectName, &er)
 		}
 	}
 
@@ -1706,8 +1714,21 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 	}
 
 	dedupVersions := make([]FileInfoVersions, 0, len(versionsMap))
-	for _, version := range versionsMap {
-		dedupVersions = append(dedupVersions, version)
+	for _, fivs := range versionsMap {
+		// Removal of existing versions and adding a delete marker in the same
+		// request is supported. At the same time, we cannot allow adding
+		// two delete markers on top of any object. To avoid this situation,
+		// we will sort deletions to execute existing deletion first,
+		// then add only one delete marker if requested
+		sort.SliceStable(fivs.Versions, func(i, j int) bool {
+			return !fivs.Versions[i].Deleted
+		})
+		if idx := slices.IndexFunc(fivs.Versions, func(fi FileInfo) bool {
+			return fi.Deleted
+		}); idx > -1 {
+			fivs.Versions = fivs.Versions[:idx+1]
+		}
+		dedupVersions = append(dedupVersions, fivs)
 	}
 
 	// Initialize list of errors.
@@ -1732,12 +1753,6 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 					continue
 				}
 				for _, v := range dedupVersions[i].Versions {
-					if err == errFileNotFound || err == errFileVersionNotFound {
-						if !dobjects[v.Idx].DeleteMarker {
-							// Not delete marker, if not found, ok.
-							continue
-						}
-					}
 					delObjErrs[index][v.Idx] = err
 				}
 			}
@@ -1757,6 +1772,13 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 			}
 		}
 		err := reduceWriteQuorumErrs(ctx, diskErrs, objectOpIgnoredErrs, writeQuorums[objIndex])
+		if err == nil {
+			dobjects[objIndex].found = true
+		} else if isErrVersionNotFound(err) || isErrObjectNotFound(err) {
+			if !dobjects[objIndex].DeleteMarker {
+				err = nil
+			}
+		}
 		if objects[objIndex].VersionID != "" {
 			errs[objIndex] = toObjectErr(err, bucket, objects[objIndex].ObjectName, objects[objIndex].VersionID)
 		} else {
@@ -2010,7 +2032,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		if opts.VersionPurgeStatus().Empty() && opts.DeleteMarkerReplicationStatus().Empty() {
 			markDelete = false
 		}
-		if opts.VersionPurgeStatus() == Complete {
+		if opts.VersionPurgeStatus() == replication.VersionPurgeComplete {
 			markDelete = false
 		}
 		// now, since VersionPurgeStatus() is already set, we can let the

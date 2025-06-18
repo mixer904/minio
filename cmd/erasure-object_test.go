@@ -36,7 +36,7 @@ import (
 )
 
 func TestRepeatPutObjectPart(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	var objLayer ObjectLayer
@@ -50,7 +50,7 @@ func TestRepeatPutObjectPart(t *testing.T) {
 	}
 
 	// cleaning up of temporary test directories
-	defer objLayer.Shutdown(context.Background())
+	defer objLayer.Shutdown(t.Context())
 	defer removeRoots(disks)
 
 	err = objLayer.MakeBucket(ctx, "bucket1", MakeBucketOptions{})
@@ -91,7 +91,7 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 		{"bucket", "dir/obj", nil},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend
@@ -99,7 +99,7 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer xl.Shutdown(context.Background())
+	defer xl.Shutdown(t.Context())
 
 	err = xl.MakeBucket(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
@@ -131,8 +131,77 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	removeRoots(fsDirs)
 }
 
+func TestDeleteObjectsVersionedTwoPools(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDirs, err := prepareErasurePools()
+	if err != nil {
+		t.Fatal("Unable to initialize 'Erasure' object layer.", err)
+	}
+	// Remove all dirs.
+	for _, dir := range fsDirs {
+		defer os.RemoveAll(dir)
+	}
+
+	bucketName := "bucket"
+	objectName := "myobject"
+	err = obj.MakeBucket(ctx, bucketName, MakeBucketOptions{
+		VersioningEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	z, ok := obj.(*erasureServerPools)
+	if !ok {
+		t.Fatal("unexpected object layer type")
+	}
+
+	versions := make([]string, 2)
+	for i := range z.serverPools {
+		objInfo, err := z.serverPools[i].PutObject(ctx, bucketName, objectName,
+			mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), ObjectOptions{
+				Versioned: true,
+			})
+		if err != nil {
+			t.Fatalf("Erasure Object upload failed: <ERROR> %s", err)
+		}
+		versions[i] = objInfo.VersionID
+	}
+
+	// Remove and check the version in the second pool, then
+	// remove and check the version in the first pool
+	for testIdx, vid := range []string{versions[1], versions[0]} {
+		names := []ObjectToDelete{
+			{
+				ObjectV: ObjectV{
+					ObjectName: objectName,
+					VersionID:  vid,
+				},
+			},
+		}
+		_, delErrs := obj.DeleteObjects(ctx, bucketName, names, ObjectOptions{
+			Versioned: true,
+		})
+		for i := range delErrs {
+			if delErrs[i] != nil {
+				t.Errorf("Test %d: Failed to remove object `%v` with the error: `%v`", testIdx, names[i], delErrs[i])
+			}
+			_, statErr := obj.GetObjectInfo(ctx, bucketName, objectName, ObjectOptions{
+				VersionID: names[i].VersionID,
+			})
+			switch statErr.(type) {
+			case VersionNotFound:
+			default:
+				t.Errorf("Test %d: Object %s is not removed", testIdx, objectName)
+			}
+		}
+	}
+}
+
 func TestDeleteObjectsVersioned(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	obj, fsDirs, err := prepareErasure(ctx, 16)
@@ -177,7 +246,6 @@ func TestDeleteObjectsVersioned(t *testing.T) {
 				VersionID:  objInfo.VersionID,
 			},
 		}
-
 	}
 	names = append(names, ObjectToDelete{
 		ObjectV: ObjectV{
@@ -197,7 +265,7 @@ func TestDeleteObjectsVersioned(t *testing.T) {
 
 	for i, test := range testCases {
 		_, statErr := obj.GetObjectInfo(ctx, test.bucket, test.object, ObjectOptions{
-			VersionID: names[i].ObjectV.VersionID,
+			VersionID: names[i].VersionID,
 		})
 		switch statErr.(type) {
 		case VersionNotFound:
@@ -212,7 +280,7 @@ func TestDeleteObjectsVersioned(t *testing.T) {
 }
 
 func TestErasureDeleteObjectsErasureSet(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	obj, fsDirs, err := prepareErasureSets32(ctx)
@@ -285,7 +353,7 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -294,7 +362,7 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -354,7 +422,7 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -363,7 +431,7 @@ func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -414,7 +482,7 @@ func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
 }
 
 func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -423,7 +491,7 @@ func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -485,7 +553,7 @@ func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
 }
 
 func TestGetObjectNoQuorum(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -494,7 +562,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -594,7 +662,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 }
 
 func TestHeadObjectNoQuorum(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -603,7 +671,7 @@ func TestHeadObjectNoQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -671,7 +739,7 @@ func TestHeadObjectNoQuorum(t *testing.T) {
 }
 
 func TestPutObjectNoQuorum(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -681,7 +749,7 @@ func TestPutObjectNoQuorum(t *testing.T) {
 	}
 
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -734,7 +802,7 @@ func TestPutObjectNoQuorum(t *testing.T) {
 }
 
 func TestPutObjectNoQuorumSmall(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -744,7 +812,7 @@ func TestPutObjectNoQuorumSmall(t *testing.T) {
 	}
 
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
@@ -801,7 +869,7 @@ func TestPutObjectNoQuorumSmall(t *testing.T) {
 // Test PutObject twice, one small and another bigger
 // than small data threshold and checks reading them again
 func TestPutObjectSmallInlineData(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	const numberOfDisks = 4
@@ -813,7 +881,7 @@ func TestPutObjectSmallInlineData(t *testing.T) {
 	}
 
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	bucket := "bucket"
@@ -1063,7 +1131,7 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 
 // In some deployments, one object has data inlined in one disk and not inlined in other disks.
 func TestGetObjectInlineNotInline(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create a backend with 4 disks named disk{1...4}, this name convention
@@ -1083,7 +1151,7 @@ func TestGetObjectInlineNotInline(t *testing.T) {
 	}
 
 	// cleaning up of temporary test directories
-	defer objLayer.Shutdown(context.Background())
+	defer objLayer.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	// Create a testbucket
@@ -1124,7 +1192,7 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 		t.Skip()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	// Create an instance of xl backend.
@@ -1134,7 +1202,7 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 	}
 
 	// Cleanup backend directories.
-	defer obj.Shutdown(context.Background())
+	defer obj.Shutdown(t.Context())
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)

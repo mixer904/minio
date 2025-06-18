@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -15,11 +15,31 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//go:build fips && linux && amd64
-// +build fips,linux,amd64
+package bpool
 
-package fips
+import "sync"
 
-import _ "crypto/tls/fipsonly"
+// Pool is a single type sync.Pool with a few extra properties:
+// If New is not set Get may return the zero value of T.
+type Pool[T any] struct {
+	New func() T
+	p   sync.Pool
+}
 
-const enabled = true
+// Get will retuen a new T
+func (p *Pool[T]) Get() T {
+	v, ok := p.p.Get().(T)
+	if ok {
+		return v
+	}
+	if p.New == nil {
+		var t T
+		return t
+	}
+	return p.New()
+}
+
+// Put a used T.
+func (p *Pool[T]) Put(t T) {
+	p.p.Put(t)
+}
