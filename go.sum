@@ -531,8 +531,8 @@ github.com/minio/colorjson v1.0.8 h1:AS6gEQ1dTRYHmC4xuoodPDRILHP/9Wz5wYUGDQfPLpg
 github.com/minio/colorjson v1.0.8/go.mod h1:wrs39G/4kqNlGjwqHvPlAnXuc2tlPszo6JKdSBCLN8w=
 github.com/minio/console v1.7.6-0.20250114035017-b45e11ce7f1d h1:LG1zZSxD0jCBGFa6Og7yb7bfzriX74DpCrI5oBNoAkg=
 github.com/minio/console v1.7.6-0.20250114035017-b45e11ce7f1d/go.mod h1:3kSFAN3lf4ivO1AEKbRShC7836ms2H1qCF/UPOoTjso=
-github.com/minio/console v1.7.7-0.20250516212319-220a55500cc3 h1:8lBrtntYnTIkiyDkfgPr1/HgpDeGHFpACnG9OVdZFW0=
-github.com/minio/console v1.7.7-0.20250516212319-220a55500cc3/go.mod h1:Jxp/p3RZctdaavbfRrIirQLMPlZ4IFEjInE9lzDtFjI=
+github.com/minio/console v1.7.7-0.20250729174702-3d6c4cbf4869 h1:f8+TehcIhhDajRvSGb8NZhRqOhxChWcWWAzb52kjwIg=
+github.com/minio/console v1.7.7-0.20250729174702-3d6c4cbf4869/go.mod h1:hKNkzdKBKU84w5wXqMnkH74QocJGHW2zjvFtuGETDsc=
 github.com/minio/crc64nvme v1.0.1 h1:DHQPrYPdqK7jQG/Ls5CTBZWeex/2FMS3G5XGkycuFrY=
 github.com/minio/crc64nvme v1.0.1/go.mod h1:eVfm2fAzLlxMdUGc0EEBGSMmPwmXD5XiNRpnu9J3bvg=
 github.com/minio/csvparser v1.0.0 h1:xJEHcYK8ZAjeW4hNV9Zu30u+/2o4UyPnYgyjWp8b7ZU=

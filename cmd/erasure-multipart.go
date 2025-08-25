@@ -1161,6 +1161,7 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 				Err:    fmt.Errorf("checksum type mismatch. got %q (%s) expected %q (%s)", checksumType.String(), checksumType.ObjType(), opts.WantChecksum.Type.String(), opts.WantChecksum.Type.ObjType()),
 			}
 		}
+		checksumType |= hash.ChecksumMultipart | hash.ChecksumIncludesMultipart
 	}
 
 	var checksumCombined []byte
@@ -1509,17 +1510,10 @@ func (er erasureObjects) AbortMultipartUpload(ctx context.Context, bucket, objec
 		auditObjectErasureSet(ctx, "AbortMultipartUpload", object, &er)
 	}
 
-	// Validates if upload ID exists.
-	if _, _, err = er.checkUploadIDExists(ctx, bucket, object, uploadID, false); err != nil {
-		if errors.Is(err, errVolumeNotFound) {
-			return toObjectErr(err, bucket)
-		}
-		return toObjectErr(err, bucket, object, uploadID)
-	}
-
 	// Cleanup all uploaded parts.
-	er.deleteAll(ctx, minioMetaMultipartBucket, er.getUploadIDDir(bucket, object, uploadID))
+	defer er.deleteAll(ctx, minioMetaMultipartBucket, er.getUploadIDDir(bucket, object, uploadID))
 
-	// Successfully purged.
-	return nil
+	// Validates if upload ID exists.
+	_, _, err = er.checkUploadIDExists(ctx, bucket, object, uploadID, false)
+	return toObjectErr(err, bucket, object, uploadID)
 }
