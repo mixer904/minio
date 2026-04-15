@@ -658,6 +658,10 @@ OuterLoop:
 	}
 
 	if err != nil {
+		if serr, ok := err.(SelectError); ok && serr.ErrorCode() == "OverMaxRecordSize" {
+			_ = writer.FinishWithError(serr.ErrorCode(), serr.ErrorMessage())
+			return
+		}
 		_ = writer.FinishWithError("InternalError", err.Error())
 	}
 }

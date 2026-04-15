@@ -139,16 +139,53 @@ func (r *Reader) nextSplit(skip int, dst []byte) ([]byte, error) {
 			return dst, io.EOF
 		}
 	}
-	// Read until next line.
-	in, err := r.buf.ReadBytes('\n')
-	dst = append(dst, in...)
-	return dst, err
+
+	// Track how much of the last logical record is already present in the
+	// prefetched block so we enforce the 1 MiB record-size limit rather than a
+	// smaller implicit block-size limit.
+	tailLen := len(dst)
+	if i := bytes.LastIndexByte(dst, '\n'); i >= 0 {
+		tailLen = len(dst) - i - 1
+	}
+	tailStart := len(dst) - tailLen
+	if tailLen > maxCharsPerRecord {
+		return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+	}
+
+	// Read until the next line while keeping the last record within the S3
+	// Select 1 MiB record-size limit.
+	for {
+		in, err := r.buf.ReadSlice('\n')
+		switch err {
+		case nil:
+			if tailLen+len(in)-1 > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			return dst, nil
+		case bufio.ErrBufferFull:
+			if tailLen+len(in) > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			tailLen += len(in)
+		default:
+			if tailLen+len(in) > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			return dst, err
+		}
+	}
 }
 
 // csvSplitSize is the size of each block.
 // Blocks will read this much and find the first following newline.
 // 128KB appears to be a very reasonable default.
 const csvSplitSize = 128 << 10
+
+// S3 Select allows up to 1 MiB per input record.
+const maxCharsPerRecord = 1 << 20
 
 // startReaders will read the header if needed and spin up a parser
 // and a number of workers based on GOMAXPROCS.
@@ -234,6 +271,12 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
 		go func() {
 			for in := range r.input {
 				if len(in.input) == 0 {
+					if in.input != nil {
+						// Return empty pooled buffers as well. This happens on
+						// oversized line errors where parsing is intentionally skipped.
+						r.bufferPool.Put(in.input[:0])
+						in.input = nil
+					}
 					in.dst <- nil
 					continue
 				}
