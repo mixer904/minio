@@ -29,17 +29,21 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
+	idldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
 	"github.com/minio/pkg/v3/policy"
 	"github.com/minio/pkg/v3/wildcard"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -91,6 +95,15 @@ const (
 
 	// maximum supported STS session policy size
 	maxSTSSessionPolicySize = 2048
+
+	stsLDAPLoginBurst         = 10
+	stsLDAPLoginEntryTTL      = 15 * time.Minute
+	stsLDAPLoginRetryAfterSec = int((time.Minute / stsLDAPLoginBurst) / time.Second)
+)
+
+var (
+	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed")
+	globalSTSLDAPLoginRateLimiter = newSTSLDAPLoginRateLimiter(time.Minute/time.Duration(stsLDAPLoginBurst), stsLDAPLoginBurst, stsLDAPLoginEntryTTL)
 )
 
 type stsClaims map[string]any
@@ -252,6 +265,109 @@ func getTokenSigningKey() (string, error) {
 		return secretKey, nil
 	}
 	return secret, nil
+}
+
+type stsLDAPLoginRateLimiter struct {
+	source *stsLDAPLoginKeyLimiterSet
+	user   *stsLDAPLoginKeyLimiterSet
+}
+
+type stsLDAPLoginKeyLimiterSet struct {
+	mu          sync.Mutex
+	refillEvery time.Duration
+	burst       int
+	ttl         time.Duration
+	lastCleanup time.Time
+	entries     map[string]*stsLDAPLoginKeyLimiter
+}
+
+type stsLDAPLoginKeyLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+func newSTSLDAPLoginRateLimiter(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginRateLimiter {
+	return &stsLDAPLoginRateLimiter{
+		source: newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
+		user:   newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
+	}
+}
+
+func newSTSLDAPLoginKeyLimiterSet(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginKeyLimiterSet {
+	return &stsLDAPLoginKeyLimiterSet{
+		refillEvery: refillEvery,
+		burst:       burst,
+		ttl:         ttl,
+		entries:     make(map[string]*stsLDAPLoginKeyLimiter),
+	}
+}
+
+func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
+	now := UTCNow()
+	if sourceIP != "" && !l.source.Allow(now, sourceIP) {
+		return false
+	}
+
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username != "" && !l.user.Allow(now, username) {
+		return false
+	}
+
+	return true
+}
+
+func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.lastCleanup.IsZero() || now.Sub(l.lastCleanup) >= l.ttl {
+		l.cleanup(now)
+		l.lastCleanup = now
+	}
+
+	entry, ok := l.entries[key]
+	if !ok {
+		entry = &stsLDAPLoginKeyLimiter{
+			limiter:  rate.NewLimiter(rate.Every(l.refillEvery), l.burst),
+			lastSeen: now,
+		}
+		l.entries[key] = entry
+	} else {
+		entry.lastSeen = now
+	}
+
+	return entry.limiter.AllowN(now, 1)
+}
+
+func (l *stsLDAPLoginKeyLimiterSet) cleanup(now time.Time) {
+	for key, entry := range l.entries {
+		if now.Sub(entry.lastSeen) > l.ttl {
+			delete(l.entries, key)
+		}
+	}
+}
+
+func allowSTSLDAPLogin(r *http.Request) bool {
+	return globalSTSLDAPLoginRateLimiter.Allow(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
+}
+
+func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
+	if idldap.IsAuthError(err) {
+		return ErrSTSInvalidParameterValue, errLDAPAuthenticationFailed
+	}
+	return ErrSTSUpstreamError, nil
+}
+
+func writeSTSThrottledResponse(w http.ResponseWriter) {
+	stsErrorResponse := STSErrorResponse{}
+	stsErrorResponse.Error.Code = "ThrottlingException"
+	stsErrorResponse.Error.Message = "Request throttled, please retry later."
+	stsErrorResponse.RequestID = w.Header().Get(xhttp.AmzRequestID)
+
+	w.Header().Set("Retry-After", strconv.Itoa(stsLDAPLoginRetryAfterSec))
+
+	encodedErrorResponse := encodeResponse(stsErrorResponse)
+	writeResponse(w, http.StatusTooManyRequests, encodedErrorResponse, mimeXML)
 }
 
 // AssumeRole - implementation of AWS STS API AssumeRole to get temporary
@@ -690,10 +806,18 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 		return
 	}
 
+	if !allowSTSLDAPLogin(r) {
+		writeSTSThrottledResponse(w)
+		return
+	}
+
 	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
 	if err != nil {
-		err = fmt.Errorf("LDAP server error: %w", err)
-		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
+		errCode, errResp := ldapBindErrorToSTS(err)
+		if errCode == ErrSTSUpstreamError {
+			stsLogIf(ctx, err, logger.ErrorKind)
+		}
+		writeSTSErrorResponse(ctx, w, errCode, errResp)
 		return
 	}
 	ldapUserDN := lookupResult.NormDN
