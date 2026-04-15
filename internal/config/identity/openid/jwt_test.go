@@ -19,14 +19,19 @@ package openid
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,7 +93,101 @@ func initJWKSServer() *httptest.Server {
 	return server
 }
 
-func TestJWTHMACType(t *testing.T) {
+func mustGenerateRSAKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return privateKey
+}
+
+func mustMarshalRSAJWKS(t *testing.T, kid string, publicKey *rsa.PublicKey) []byte {
+	t.Helper()
+
+	jwks := map[string]any{
+		"keys": []map[string]string{
+			{
+				"kty": "RSA",
+				"kid": kid,
+				"alg": "RS256",
+				"n":   base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes()),
+				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes()),
+			},
+		},
+	}
+
+	body, err := json.Marshal(jwks)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return body
+}
+
+func initCountingJWKSServer(body []byte) (*httptest.Server, *atomic.Int32) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	return server, &hits
+}
+
+func newTestOpenIDConfig(t *testing.T, serverURL, clientID, clientSecret string) Config {
+	t.Helper()
+
+	u, err := xnet.ParseHTTPURL(serverURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	provider := providerCfg{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+	}
+	provider.JWKS.URL = u
+
+	return Config{
+		Enabled: true,
+		pubKeys: publicKeys{
+			RWMutex: &sync.RWMutex{},
+			pkMap:   map[string]crypto.PublicKey{},
+		},
+		arnProviderCfgsMap: map[arn.ARN]*providerCfg{
+			DummyRoleARN: &provider,
+		},
+		ProviderCfgs: map[string]*providerCfg{
+			"1": &provider,
+		},
+		closeRespFn: func(rc io.ReadCloser) {
+			rc.Close()
+		},
+	}
+}
+
+func mustSignRS256Token(t *testing.T, privateKey *rsa.PrivateKey, kid, audience, subject string) string {
+	t.Helper()
+
+	token := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, jwtgo.MapClaims{
+		"aud": audience,
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"sub": subject,
+	})
+	token.Header["kid"] = kid
+
+	tokenString, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return tokenString
+}
+
+func TestJWTRejectsHMACType(t *testing.T) {
 	server := initJWKSServer()
 	defer server.Close()
 
@@ -109,7 +208,6 @@ func TestJWTHMACType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Println(token)
 
 	u1, err := xnet.ParseHTTPURL(server.URL)
 	if err != nil {
@@ -118,12 +216,7 @@ func TestJWTHMACType(t *testing.T) {
 
 	pubKeys := publicKeys{
 		RWMutex: &sync.RWMutex{},
-		pkMap:   map[string]any{},
-	}
-	pubKeys.add("76b95ae5-33ef-4283-97b7-d2a85dc2d8f4", []byte("WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0"))
-
-	if len(pubKeys.pkMap) != 1 {
-		t.Fatalf("Expected 1 keys, got %d", len(pubKeys.pkMap))
+		pkMap:   map[string]crypto.PublicKey{},
 	}
 
 	provider := providerCfg{
@@ -145,9 +238,119 @@ func TestJWTHMACType(t *testing.T) {
 		},
 	}
 
-	var claims jwtgo.MapClaims
-	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+	if err = cfg.PopulatePublicKey(DummyRoleARN); err != nil {
 		t.Fatal(err)
+	}
+	if cfg.pubKeys.get(provider.ClientID) != nil {
+		t.Fatal("client secret must not be used as a JWT verification key")
+	}
+
+	var claims jwtgo.MapClaims
+	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err == nil {
+		t.Fatal("expected HS256 ID token to be rejected")
+	}
+}
+
+func TestJWTAcceptsRS256(t *testing.T) {
+	const (
+		clientID = "client-id"
+		keyID    = "rsa-kid"
+		subject  = "direct-rs256-user"
+	)
+
+	privateKey := mustGenerateRSAKey(t)
+	server, hits := initCountingJWKSServer(mustMarshalRSAJWKS(t, keyID, &privateKey.PublicKey))
+	defer server.Close()
+
+	cfg := newTestOpenIDConfig(t, server.URL, clientID, "unused-secret")
+	if err := cfg.PopulatePublicKey(DummyRoleARN); err != nil {
+		t.Fatal(err)
+	}
+
+	token := mustSignRS256Token(t, privateKey, keyID, clientID, subject)
+	claims := map[string]any{}
+	if err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+		t.Fatalf("expected RS256 ID token to be accepted, got: %v", err)
+	}
+	if got := claims["sub"]; got != subject {
+		t.Fatalf("expected sub claim %q, got %v", subject, got)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected only the initial JWKS fetch, got %d requests", hits.Load())
+	}
+}
+
+func TestJWTRetryRefreshesPublicKey(t *testing.T) {
+	const (
+		clientID = "client-id"
+		keyID    = "rotated-rsa-kid"
+		subject  = "retry-rs256-user"
+	)
+
+	privateKey := mustGenerateRSAKey(t)
+	server, hits := initCountingJWKSServer(mustMarshalRSAJWKS(t, keyID, &privateKey.PublicKey))
+	defer server.Close()
+
+	cfg := newTestOpenIDConfig(t, server.URL, clientID, "unused-secret")
+	token := mustSignRS256Token(t, privateKey, keyID, clientID, subject)
+
+	claims := map[string]any{}
+	if err := cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
+		t.Fatalf("expected retry path to refresh JWKS and accept the token, got: %v", err)
+	}
+	if got := claims["sub"]; got != subject {
+		t.Fatalf("expected sub claim %q, got %v", subject, got)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one JWKS refresh during retry, got %d requests", hits.Load())
+	}
+}
+
+func TestJWTRetryStillRejectsHMACType(t *testing.T) {
+	const (
+		clientID = "76b95ae5-33ef-4283-97b7-d2a85dc2d8f4"
+		secret   = "WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0"
+		rsaKeyID = "jwks-rsa-kid"
+	)
+
+	privateKey := mustGenerateRSAKey(t)
+	server, hits := initCountingJWKSServer(mustMarshalRSAJWKS(t, rsaKeyID, &privateKey.PublicKey))
+	defer server.Close()
+
+	cfg := newTestOpenIDConfig(t, server.URL, clientID, secret)
+
+	// Seed the old HMAC material explicitly to prove the retry parser still
+	// rejects HS256 before consulting the keyring.
+	cfg.pubKeys.add(clientID, []byte(secret))
+
+	jwt := &jwtgo.Token{
+		Method: jwtgo.SigningMethodHS256,
+		Claims: jwtgo.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+			Audience:  clientID,
+		},
+		Header: map[string]any{
+			"typ": "JWT",
+			"alg": jwtgo.SigningMethodHS256.Alg(),
+			"kid": clientID,
+		},
+	}
+
+	token, err := jwt.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claims := map[string]any{}
+	err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims)
+	if err == nil {
+		t.Fatal("expected HS256 token to be rejected on retry")
+	}
+	if !strings.Contains(err.Error(), "signing method HS256 is invalid") {
+		t.Fatalf("expected retry failure to come from ValidMethods, got: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one JWKS refresh before retry rejection, got %d requests", hits.Load())
 	}
 }
 
@@ -164,7 +367,7 @@ func TestJWT(t *testing.T) {
 
 	pubKeys := publicKeys{
 		RWMutex: &sync.RWMutex{},
-		pkMap:   map[string]any{},
+		pkMap:   map[string]crypto.PublicKey{},
 	}
 	err := pubKeys.parseAndAdd(bytes.NewBuffer([]byte(jsonkey)))
 	if err != nil {
