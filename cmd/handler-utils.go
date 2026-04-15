@@ -192,6 +192,16 @@ func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (
 
 // extractMetadata extracts metadata from map values.
 func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
+	return extractMetadataFromMimeWithReplication(ctx, v, m, false)
+}
+
+// extractReplicationMetadataFromMime restores replication-only metadata after the
+// caller has validated that the request is a trusted replication write.
+func extractReplicationMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
+	return extractMetadataFromMimeWithReplication(ctx, v, m, true)
+}
+
+func extractMetadataFromMimeWithReplication(ctx context.Context, v textproto.MIMEHeader, m map[string]string, allowReplication bool) error {
 	if v == nil {
 		bugLogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
@@ -208,6 +218,9 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
 		if ok {
 			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
+				if !allowReplication {
+					continue
+				}
 				m[v] = strings.Join(value, ",")
 			} else {
 				m[supportedHeader] = strings.Join(value, ",")
