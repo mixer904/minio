@@ -1,6 +1,6 @@
 module github.com/minio/minio
 
-go 1.26.1
+go 1.26.2
 
 // Use Georg Mangold's maintained Console fork while keeping upstream import paths.
 replace github.com/minio/console => github.com/georgmangold/console v1.9.1
