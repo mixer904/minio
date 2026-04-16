@@ -1939,7 +1939,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	case authTypeStreamingUnsignedTrailer:
 		// Initialize stream chunked reader with optional trailers.
-		rd, s3Err = newUnsignedV4ChunkedReader(r, true, r.Header.Get(xhttp.Authorization) != "")
+		rd, s3Err = newUnsignedV4ChunkedReader(r, true)
 		if s3Err != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 			return

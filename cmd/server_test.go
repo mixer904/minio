@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -128,6 +129,10 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestBucketSQSNotificationWebHook(c)
 	suite.TestBucketSQSNotificationAMQP(c)
 	suite.TestUnsignedCVE(c)
+	suite.TestUnsignedQueryStringCVE(c)
+	suite.TestUnsignedQueryStringCVEMultipart(c)
+	suite.TestUnsignedTrailerRejectsMultipleAuthSources(c)
+	suite.TestAnonymousUnsignedTrailer(c)
 	suite.TearDownSuite(c)
 }
 
@@ -374,24 +379,13 @@ func (s *TestSuiteCommon) TestUnsignedCVE(c *check) {
 	// assert the http response status code.
 	c.Assert(response.StatusCode, http.StatusOK)
 
-	req, err := http.NewRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-cve-object.txt"), nil)
+	now := UTCNow()
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-cve-object.txt"), []byte("foobar!\n"), now)
 	c.Assert(err, nil)
 
-	req.Body = io.NopCloser(bytes.NewReader([]byte("foobar!\n")))
-	req.Trailer = http.Header{}
-	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
-
-	now := UTCNow()
-
-	req = signer.StreamingUnsignedV4(req, "", 8, now)
-
 	maliciousHeaders := http.Header{
-		"Authorization":                []string{fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request, SignedHeaders=invalidheader, Signature=deadbeefdeadbeefdeadbeeddeadbeeddeadbeefdeadbeefdeadbeefdeadbeef", s.accessKey, now.Format(yyyymmdd))},
-		"User-Agent":                   []string{"A malicious request"},
-		"X-Amz-Decoded-Content-Length": []string{"8"},
-		"Content-Encoding":             []string{"aws-chunked"},
-		"X-Amz-Trailer":                []string{"x-amz-checksum-crc32"},
-		"x-amz-content-sha256":         []string{unsignedPayloadTrailer},
+		"Authorization": []string{fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request, SignedHeaders=invalidheader, Signature=deadbeefdeadbeefdeadbeeddeadbeeddeadbeefdeadbeefdeadbeefdeadbeef", s.accessKey, now.Format(yyyymmdd))},
+		"User-Agent":    []string{"A malicious request"},
 	}
 
 	for k, v := range maliciousHeaders {
@@ -407,6 +401,225 @@ func (s *TestSuiteCommon) TestUnsignedCVE(c *check) {
 
 	// assert the http response status code.
 	c.Assert(response.StatusCode, http.StatusBadRequest)
+}
+
+func (s *TestSuiteCommon) TestUnsignedQueryStringCVE(c *check) {
+	c.Helper()
+
+	// generate a random bucket Name.
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	// execute the request.
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+
+	// assert the http response status code.
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	now := UTCNow()
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-cve-presigned-object.txt"), []byte("foobar!\n"), now)
+	c.Assert(err, nil)
+
+	err = presignStreamingUnsignedTrailerRequest(req, s.accessKey, s.secretKey, 60, now)
+	c.Assert(err, nil)
+
+	// execute the request.
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	verifyError(c, response, "InvalidRequest", "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.", http.StatusBadRequest)
+}
+
+func (s *TestSuiteCommon) TestUnsignedQueryStringCVEMultipart(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	uploadID := s.mustStartMultipartUpload(c, bucketName, "test-cve-presigned-multipart.txt")
+	now := UTCNow()
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPartUploadURL(s.endPoint, bucketName, "test-cve-presigned-multipart.txt", uploadID, "1"), []byte("foobar!\n"), now)
+	c.Assert(err, nil)
+
+	err = presignStreamingUnsignedTrailerRequest(req, s.accessKey, s.secretKey, 60, now)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	verifyError(c, response, "InvalidRequest", "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.", http.StatusBadRequest)
+}
+
+func (s *TestSuiteCommon) TestUnsignedTrailerRejectsMultipleAuthSources(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	now := UTCNow()
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-cve-mixed-auth.txt"), []byte("foobar!\n"), now)
+	c.Assert(err, nil)
+
+	err = presignStreamingUnsignedTrailerRequest(req, s.accessKey, s.secretKey, 60, now)
+	c.Assert(err, nil)
+	err = signRequestV4(req, s.accessKey, s.secretKey)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	verifyError(c, response, "InvalidRequest", "Invalid Request (request has multiple authentication types, please use one)", http.StatusBadRequest)
+}
+
+func (s *TestSuiteCommon) TestAnonymousUnsignedTrailer(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+	objectName := "test-anonymous-unsigned-trailer.txt"
+	objectData := []byte("foobar!\n")
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	s.mustPutBucketPolicy(c, bucketName, getAnonWriteOnlyObjectPolicy(bucketName, objectName))
+
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName), objectData, UTCNow())
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	request, err = newTestSignedRequest(http.MethodGet, getGetObjectURL(s.endPoint, bucketName, objectName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	got, err := io.ReadAll(response.Body)
+	c.Assert(err, nil)
+	c.Assert(bytes.Equal(got, objectData), true)
+}
+
+func newStreamingUnsignedTrailerRequest(method, targetURL string, data []byte, reqTime time.Time) (*http.Request, error) {
+	req, err := http.NewRequest(method, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.Trailer = http.Header{}
+	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
+	req = signer.StreamingUnsignedV4(req, "", int64(len(data)), reqTime)
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", len(data)))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	req.Header.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
+	return req, nil
+}
+
+func presignStreamingUnsignedTrailerRequest(req *http.Request, accessKeyID, secretAccessKey string, expires int64, reqTime time.Time) error {
+	if accessKeyID == "" || secretAccessKey == "" {
+		return fmt.Errorf("presign cannot be generated without access and secret keys")
+	}
+
+	signedHeaders := []string{
+		"content-encoding",
+		"host",
+		"x-amz-content-sha256",
+		"x-amz-decoded-content-length",
+		"x-amz-trailer",
+	}
+	region := globalSite.Region()
+	scope := getScope(reqTime, region)
+	credential := fmt.Sprintf("%s/%s", accessKeyID, scope)
+
+	query := req.URL.Query()
+	query.Set(xhttp.AmzAlgorithm, signV4Algorithm)
+	query.Set(xhttp.AmzDate, reqTime.Format(iso8601Format))
+	query.Set(xhttp.AmzExpires, fmt.Sprintf("%d", expires))
+	query.Set(xhttp.AmzSignedHeaders, strings.Join(signedHeaders, ";"))
+	query.Set(xhttp.AmzCredential, credential)
+	query.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
+
+	req.Form = query
+	extractedSignedHeaders, errCode := extractSignedHeaders(signedHeaders, req)
+	if errCode != ErrNone {
+		return fmt.Errorf("extractSignedHeaders failed: %v", errCode)
+	}
+
+	queryStr := strings.ReplaceAll(query.Encode(), "+", "%20")
+	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, unsignedPayloadTrailer, queryStr, req.URL.Path, req.Method)
+	stringToSign := getStringToSign(canonicalRequest, reqTime, scope)
+	signingKey := getSigningKey(secretAccessKey, reqTime, region, serviceS3)
+	signature := getSignature(signingKey, stringToSign)
+
+	query.Set(xhttp.AmzSignature, signature)
+	req.URL.RawQuery = query.Encode()
+	req.Form = req.URL.Query()
+
+	return nil
+}
+
+func (s *TestSuiteCommon) mustPutBucketPolicy(c *check, bucketName string, bucketPolicy *policy.BucketPolicy) {
+	c.Helper()
+
+	policyBytes, err := json.Marshal(bucketPolicy)
+	c.Assert(err, nil)
+
+	request, err := newTestSignedRequest(http.MethodPut, getPutPolicyURL(s.endPoint, bucketName),
+		int64(len(policyBytes)), bytes.NewReader(policyBytes), s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusNoContent)
+}
+
+func (s *TestSuiteCommon) mustStartMultipartUpload(c *check, bucketName, objectName string) string {
+	c.Helper()
+
+	request, err := newTestSignedRequest(http.MethodPost, getNewMultipartURL(s.endPoint, bucketName, objectName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	decoder := xml.NewDecoder(response.Body)
+	newResponse := &InitiateMultipartUploadResponse{}
+	err = decoder.Decode(newResponse)
+	c.Assert(err, nil)
+	c.Assert(len(newResponse.UploadID) > 0, true)
+
+	return newResponse.UploadID
 }
 
 func (s *TestSuiteCommon) TestBucketSQSNotificationAMQP(c *check) {

@@ -26,12 +26,24 @@ import (
 	"strings"
 )
 
-// newUnsignedV4ChunkedReader returns a new s3UnsignedChunkedReader that translates the data read from r
-// out of HTTP "chunked" format before returning it.
+// newUnsignedV4ChunkedReader returns a new s3UnsignedChunkedReader that translates
+// the data read from r out of HTTP "chunked" format before returning it.
+//
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER requests cross the auth boundary here because
+// the handler starts consuming the body immediately after this reader is created.
+// Header-authenticated requests must therefore be validated before any body bytes
+// are read, preserving the security boundary added in #21103, while presigned
+// query-string auth is intentionally rejected for this streaming mode.
+//
 // The s3ChunkedReader returns io.EOF when the final 0-length chunk is read.
-func newUnsignedV4ChunkedReader(req *http.Request, trailer bool, signature bool) (io.ReadCloser, APIErrorCode) {
-	if signature {
-		if errCode := doesSignatureMatch(unsignedPayloadTrailer, req, globalSite.Region(), serviceS3); errCode != ErrNone {
+func newUnsignedV4ChunkedReader(req *http.Request, trailer bool) (io.ReadCloser, APIErrorCode) {
+	// Reject any request that claims presigned auth parameters are in use, even if
+	// the query is incomplete, to avoid silently downgrading it into the anonymous path.
+	if isRequestPresignedSignatureV4(req) {
+		return nil, ErrSignatureVersionNotSupported
+	}
+	if isRequestSignatureV4(req) {
+		if errCode := reqSignatureV4Verify(req, globalSite.Region(), serviceS3); errCode != ErrNone {
 			return nil, errCode
 		}
 	}
