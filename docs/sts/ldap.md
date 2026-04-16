@@ -46,6 +46,7 @@ MINIO_IDENTITY_LDAP_GROUP_SEARCH_BASE_DN    (list)      ";" separated list of gr
 MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY         (on|off)    trust server TLS without verification (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_INSECURE         (on|off)    allow plain text connection to AD/LDAP server (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection to AD/LDAP server (default: 'off')
+MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      "," separated list of trusted proxy IPs or CIDRs whose forwarded client IP headers may be used for LDAP STS rate limiting
 MINIO_IDENTITY_LDAP_COMMENT                 (sentence)  optionally add a comment to this setting
 ```
 
@@ -60,6 +61,20 @@ MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY         (on|off)    trust server TLS without
 MINIO_IDENTITY_LDAP_SERVER_INSECURE         (on|off)    allow plain text connection to AD/LDAP server, defaults to "off"
 MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection to AD/LDAP server, defaults to "off"
 ```
+
+### LDAP STS rate limiting behind trusted proxies
+
+LDAP STS login throttling is keyed by the socket peer address by default. This is the safe default because MinIO does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
+
+If MinIO is deployed behind a trusted reverse proxy, load balancer, or API gateway and you want LDAP STS throttling to bucket by the forwarded client IP instead of the proxy peer address, configure:
+
+```
+MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      "," separated list of trusted proxy IPs or CIDRs
+```
+
+Only requests whose peer address matches this allowlist may supply forwarded client IP headers for LDAP STS rate limiting. Requests from all other peers continue to use the peer address directly.
+
+For trusted-proxy deployments, prefer setting a clean single-value `X-Real-IP` header. If you rely on `X-Forwarded-For`, make sure the proxy strips or overwrites any inbound forwarding headers instead of appending to a client-supplied value. In nginx, prefer `$remote_addr` for the trusted client IP header; `proxy_add_x_forwarded_for` appends and is not suitable unless you first clear inbound forwarding headers.
 
 The server address variable is _required_. TLS is assumed to be on by default. The port in the server address is optional and defaults to 636 if not provided.
 

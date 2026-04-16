@@ -37,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	idldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -441,15 +442,23 @@ func (l *stsLDAPLoginKeyLimiterSet) refillLocked(now time.Time, entry *stsLDAPLo
 	}
 	if l.refillEvery <= 0 {
 		entry.lastRefill = now
-		entry.tokens = float64(l.burst)
+		entry.tokens = l.maxTokensLocked(entry)
 		return
 	}
 
 	entry.tokens += float64(now.Sub(lastRefill)) / float64(l.refillEvery)
-	if maxTokens := float64(l.burst); entry.tokens > maxTokens {
+	if maxTokens := l.maxTokensLocked(entry); entry.tokens > maxTokens {
 		entry.tokens = maxTokens
 	}
 	entry.lastRefill = now
+}
+
+func (l *stsLDAPLoginKeyLimiterSet) maxTokensLocked(entry *stsLDAPLoginKeyLimiter) float64 {
+	maxTokens := l.burst - entry.inFlight
+	if maxTokens < 0 {
+		return 0
+	}
+	return float64(maxTokens)
 }
 
 func (r *stsLDAPLoginKeyReservation) CommitAt(now time.Time) {
@@ -479,7 +488,7 @@ func (r *stsLDAPLoginKeyReservation) finalize(now time.Time, refund bool) {
 	}
 	if refund {
 		r.entry.tokens++
-		if maxTokens := float64(r.set.burst); r.entry.tokens > maxTokens {
+		if maxTokens := r.set.maxTokensLocked(r.entry); r.entry.tokens > maxTokens {
 			r.entry.tokens = maxTokens
 		}
 	}
@@ -488,11 +497,42 @@ func (r *stsLDAPLoginKeyReservation) finalize(now time.Time, refund bool) {
 }
 
 func getSTSLDAPLoginSourceIP(r *http.Request) string {
-	sourceIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	peerIP := getSTSLDAPLoginCanonicalIP(r.RemoteAddr)
+	sourceIP := peerIP
+	if sourceIP == "" {
+		sourceIP = getSTSLDAPLoginPeerAddr(r.RemoteAddr)
+	}
+	if peerIP != "" && globalIAMSys != nil && globalIAMSys.LDAPConfig.IsSTSTrustedProxy(peerIP) {
+		if forwardedIP := getSTSLDAPTrustedProxySourceIP(r); forwardedIP != "" {
+			return forwardedIP
+		}
+	}
+	return sourceIP
+}
+
+func getSTSLDAPTrustedProxySourceIP(r *http.Request) string {
+	if realIP := getSTSLDAPLoginCanonicalIP(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	return getSTSLDAPLoginCanonicalIP(handlers.GetSourceIPFromHeaders(r))
+}
+
+func getSTSLDAPLoginPeerAddr(remoteAddr string) string {
+	sourceIP, _, err := net.SplitHostPort(remoteAddr)
 	if err == nil {
 		return sourceIP
 	}
-	return r.RemoteAddr
+	return remoteAddr
+}
+
+func getSTSLDAPLoginCanonicalIP(addr string) string {
+	addr = strings.TrimSpace(getSTSLDAPLoginPeerAddr(addr))
+	addr = strings.TrimPrefix(addr, "[")
+	addr = strings.TrimSuffix(addr, "]")
+	if ip := net.ParseIP(addr); ip != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 // reserveSTSLDAPLogin acquires immediate tokens from the per-source and

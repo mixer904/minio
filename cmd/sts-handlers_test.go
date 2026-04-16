@@ -1008,7 +1008,34 @@ func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, 
 	fn()
 }
 
-func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSHTTPResult {
+func withLDAPSTSTrustedProxiesForTest(t *testing.T, trustedProxies string, fn func()) {
+	t.Helper()
+
+	previousIAMSys := globalIAMSys
+	if globalIAMSys == nil {
+		globalIAMSys = &IAMSys{}
+	}
+	previous := globalIAMSys.LDAPConfig.Clone()
+	if err := globalIAMSys.LDAPConfig.SetSTSTrustedProxies(trustedProxies); err != nil {
+		t.Fatalf("unable to set LDAP STS trusted proxies for test: %v", err)
+	}
+	defer func() {
+		globalIAMSys.LDAPConfig = previous
+		globalIAMSys = previousIAMSys
+	}()
+
+	fn()
+}
+
+func singleHeader(key, value string) http.Header {
+	header := make(http.Header)
+	if key != "" {
+		header.Set(key, value)
+	}
+	return header
+}
+
+func (s *TestSuiteIAM) postLDAPSTSWithHeaders(c *check, username, password string, headers http.Header) ldapSTSHTTPResult {
 	c.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
@@ -1025,6 +1052,11 @@ func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSH
 		c.Fatalf("unexpected request creation error: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 
 	resp, err := s.TestSuiteCommon.client.Do(req)
 	if err != nil {
@@ -1042,6 +1074,11 @@ func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSH
 		RetryAfter: resp.Header.Get("Retry-After"),
 		Body:       string(body),
 	}
+}
+
+func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSHTTPResult {
+	c.Helper()
+	return s.postLDAPSTSWithHeaders(c, username, password, nil)
 }
 
 func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
@@ -1198,6 +1235,32 @@ func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
 	)
 }
 
+func (s *TestSuiteIAM) TestLDAPSTSTrustedProxyRateLimit(c *check) {
+	withLDAPSTSTrustedProxiesForTest(c.T, "127.0.0.0/8,::1/128", func() {
+		withGlobalSTSLDAPLoginRateLimiterForTest(
+			newSTSLDAPLoginRateLimiter(time.Hour, 1, stsLDAPLoginEntryTTL),
+			func() {
+				// These usernames intentionally do not exist. The test asserts that
+				// LDAP user-not-found stays classified as an auth error, so failed
+				// attempts still commit the reservation and hit the source bucket.
+				first := s.postLDAPSTSWithHeaders(c, "missing-user-a", "nottherightpassword", singleHeader("X-Real-IP", "203.0.113.10"))
+				second := s.postLDAPSTSWithHeaders(c, "missing-user-b", "nottherightpassword", singleHeader("X-Real-IP", "198.51.100.23"))
+				third := s.postLDAPSTSWithHeaders(c, "missing-user-c", "nottherightpassword", singleHeader("X-Real-IP", "203.0.113.10"))
+
+				if first.StatusCode != http.StatusBadRequest {
+					c.Fatalf("expected first trusted-proxy LDAP STS auth failure to return %d, got %d body: %s", http.StatusBadRequest, first.StatusCode, first.Body)
+				}
+				if second.StatusCode != http.StatusBadRequest {
+					c.Fatalf("expected a different forwarded client IP behind the same trusted proxy to avoid source throttling, got %d body: %s", second.StatusCode, second.Body)
+				}
+				if third.StatusCode != http.StatusTooManyRequests {
+					c.Fatalf("expected the same forwarded client IP behind the trusted proxy to be throttled with %d, got %d body: %s", http.StatusTooManyRequests, third.StatusCode, third.Body)
+				}
+			},
+		)
+	})
+}
+
 func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1225,6 +1288,12 @@ func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
 			name: "UpstreamFailure",
 			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
 				suite.TestLDAPSTSUpstreamFailure(c)
+			},
+		},
+		{
+			name: "TrustedProxyRateLimit",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSTrustedProxyRateLimit(c)
 			},
 		},
 	}
@@ -1397,6 +1466,35 @@ func TestSTSLDAPLoginRateLimiterReserveCancel(t *testing.T) {
 	reservation.Cancel()
 }
 
+func TestSTSLDAPLoginKeyLimiterCancelDoesNotOverCreditAfterRefill(t *testing.T) {
+	set := newSTSLDAPLoginKeyLimiterSet(10*time.Millisecond, 2, time.Minute)
+	start := time.Unix(0, 0)
+
+	first := set.Reserve(start, "192.0.2.10")
+	if first == nil {
+		t.Fatal("expected first reservation to succeed")
+	}
+	second := set.Reserve(start.Add(5*time.Millisecond), "192.0.2.10")
+	if second == nil {
+		t.Fatal("expected second reservation to succeed while one token remains available")
+	}
+
+	first.CancelAt(start.Add(10 * time.Millisecond))
+
+	third := set.Reserve(start.Add(10*time.Millisecond), "192.0.2.10")
+	if third == nil {
+		t.Fatal("expected canceled reservation to restore exactly one slot")
+	}
+	defer third.CancelAt(start.Add(10 * time.Millisecond))
+
+	if extra := set.Reserve(start.Add(10*time.Millisecond), "192.0.2.10"); extra != nil {
+		extra.CancelAt(start.Add(10 * time.Millisecond))
+		t.Fatal("expected only one slot to be restored after cancel; got over-credit from refill")
+	}
+
+	second.CancelAt(start.Add(10 * time.Millisecond))
+}
+
 func TestSTSLDAPLoginRateLimiterReserveRollbackOnCompositeFailure(t *testing.T) {
 	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
 
@@ -1531,7 +1629,7 @@ func TestGetSTSLDAPLoginSourceIPIgnoresSpoofedForwardingHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &http.Request{
-				Header:     http.Header{tt.headerKey: []string{tt.headerValue}},
+				Header:     singleHeader(tt.headerKey, tt.headerValue),
 				RemoteAddr: "192.0.2.10:9000",
 			}
 
@@ -1540,6 +1638,73 @@ func TestGetSTSLDAPLoginSourceIPIgnoresSpoofedForwardingHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetSTSLDAPLoginSourceIPUsesForwardedHeadersForTrustedProxy(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerKey   string
+		headerValue string
+		want        string
+	}{
+		{
+			name:        "x-forwarded-for",
+			headerKey:   "X-Forwarded-For",
+			headerValue: "203.0.113.10, 198.51.100.24",
+			want:        "203.0.113.10",
+		},
+		{
+			name:        "x-real-ip",
+			headerKey:   "X-Real-IP",
+			headerValue: "203.0.113.10",
+			want:        "203.0.113.10",
+		},
+		{
+			name:        "forwarded",
+			headerKey:   "Forwarded",
+			headerValue: `for=203.0.113.10;proto=https`,
+			want:        "203.0.113.10",
+		},
+	}
+
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.headerValue),
+					RemoteAddr: "192.0.2.10:9000",
+				}
+
+				if got := getSTSLDAPLoginSourceIP(req); got != tt.want {
+					t.Fatalf("expected trusted proxy header %s to resolve %q, got %q", tt.headerKey, tt.want, got)
+				}
+			})
+		}
+	})
+}
+
+func TestGetSTSLDAPLoginSourceIPTrustedProxyPrefersXRealIPOverXForwardedFor(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     make(http.Header),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		req.Header.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.10")
+		req.Header.Set("X-Real-IP", "203.0.113.10")
+
+		if got := getSTSLDAPLoginSourceIP(req); got != "203.0.113.10" {
+			t.Fatalf("expected trusted proxy path to prefer X-Real-IP over appended X-Forwarded-For, got %q", got)
+		}
+	})
+}
+
+func TestGetSTSLDAPLoginSourceIPTrustedProxyFallsBackToPeerWithoutForwardingHeaders(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{RemoteAddr: "192.0.2.10:9000"}
+		if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
+			t.Fatalf("expected trusted proxy path without forwarding headers to fall back to peer address, got %q", got)
+		}
+	})
 }
 
 func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
@@ -1574,12 +1739,12 @@ func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
 			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
 			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
 				req1 := &http.Request{
-					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
 					RemoteAddr: "192.0.2.10:9000",
 					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
 				}
 				req2 := &http.Request{
-					Header:     http.Header{tt.headerKey: []string{tt.secondValue}},
+					Header:     singleHeader(tt.headerKey, tt.secondValue),
 					RemoteAddr: "192.0.2.10:9001",
 					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
 				}
@@ -1609,12 +1774,12 @@ func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
 			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
 			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
 				req1 := &http.Request{
-					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
 					RemoteAddr: "192.0.2.10:9000",
 					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
 				}
 				req2 := &http.Request{
-					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
 					RemoteAddr: "192.0.2.11:9000",
 					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
 				}
@@ -1643,6 +1808,46 @@ func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestReserveSTSLDAPLoginUsesForwardedBucketsForTrustedProxy(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+	withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
+		withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+			req1 := &http.Request{
+				Header:     singleHeader("X-Forwarded-For", "203.0.113.10"),
+				RemoteAddr: "192.0.2.10:9000",
+				Form:       url.Values{stsLDAPUsername: []string{"alice"}},
+			}
+			req2 := &http.Request{
+				Header:     singleHeader("X-Forwarded-For", "198.51.100.23"),
+				RemoteAddr: "192.0.2.10:9001",
+				Form:       url.Values{stsLDAPUsername: []string{"bob"}},
+			}
+
+			reservation1 := reserveSTSLDAPLogin(req1)
+			if reservation1 == nil {
+				t.Fatal("expected first reservation through trusted proxy to succeed")
+			}
+			defer reservation1.Cancel()
+
+			reservation2 := reserveSTSLDAPLogin(req2)
+			if reservation2 == nil {
+				t.Fatal("expected forwarded client IPs behind the same trusted proxy to use distinct source buckets")
+			}
+			defer reservation2.Cancel()
+
+			if got := len(limiter.source.entries); got != 2 {
+				t.Fatalf("expected distinct forwarded client IPs to use two source buckets, got %d", got)
+			}
+			if _, ok := limiter.source.entries["203.0.113.10"]; !ok {
+				t.Fatalf("expected source bucket for forwarded client IP %q, got keys %v", "203.0.113.10", limiter.source.entries)
+			}
+			if _, ok := limiter.source.entries["198.51.100.23"]; !ok {
+				t.Fatalf("expected source bucket for forwarded client IP %q, got keys %v", "198.51.100.23", limiter.source.entries)
+			}
+		})
+	})
 }
 
 func TestLDAPBindErrorToSTS(t *testing.T) {

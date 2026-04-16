@@ -22,7 +22,9 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
+	"net/netip"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -43,6 +45,7 @@ type Config struct {
 	LDAP ldap.Config
 
 	stsExpiryDuration time.Duration // contains converted value
+	stsTrustedProxies []netip.Prefix
 }
 
 // Enabled returns if LDAP is enabled.
@@ -58,6 +61,7 @@ func (l *Config) Clone() Config {
 	cfg := Config{
 		LDAP:              l.LDAP.Clone(),
 		stsExpiryDuration: l.stsExpiryDuration,
+		stsTrustedProxies: append([]netip.Prefix(nil), l.stsTrustedProxies...),
 	}
 	return cfg
 }
@@ -76,6 +80,7 @@ const (
 	TLSSkipVerify      = "tls_skip_verify"
 	ServerInsecure     = "server_insecure"
 	ServerStartTLS     = "server_starttls"
+	STSTrustedProxies  = "sts_trusted_proxies"
 
 	EnvServerAddr         = "MINIO_IDENTITY_LDAP_SERVER_ADDR"
 	EnvSRVRecordName      = "MINIO_IDENTITY_LDAP_SRV_RECORD_NAME"
@@ -90,6 +95,7 @@ const (
 	EnvGroupSearchBaseDN  = "MINIO_IDENTITY_LDAP_GROUP_SEARCH_BASE_DN"
 	EnvLookupBindDN       = "MINIO_IDENTITY_LDAP_LOOKUP_BIND_DN"
 	EnvLookupBindPassword = "MINIO_IDENTITY_LDAP_LOOKUP_BIND_PASSWORD"
+	EnvSTSTrustedProxies  = "MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES"
 )
 
 var removedKeys = []string{
@@ -155,8 +161,76 @@ var (
 			Key:   LookupBindPassword,
 			Value: "",
 		},
+		config.KV{
+			Key:   STSTrustedProxies,
+			Value: "",
+		},
 	}
 )
+
+func parseSTSTrustedProxies(value string) ([]netip.Prefix, error) {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		switch r {
+		case ',', ';', ' ', '\n', '\r', '\t':
+			return true
+		default:
+			return false
+		}
+	})
+	if len(fields) == 0 {
+		return nil, nil
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(fields))
+	for _, field := range fields {
+		if prefix, err := netip.ParsePrefix(field); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+
+		addr, err := netip.ParseAddr(field)
+		if err != nil {
+			return nil, config.Errorf("invalid LDAP STS trusted proxy %q", field)
+		}
+		bits := 32
+		if addr.Is6() {
+			bits = 128
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, bits))
+	}
+
+	return prefixes, nil
+}
+
+// SetSTSTrustedProxies parses and stores the LDAP STS trusted proxy allowlist.
+func (l *Config) SetSTSTrustedProxies(value string) error {
+	prefixes, err := parseSTSTrustedProxies(value)
+	if err != nil {
+		return err
+	}
+	l.stsTrustedProxies = prefixes
+	return nil
+}
+
+// IsSTSTrustedProxy reports whether the peer IP is allowed to supply forwarded headers
+// for LDAP STS source bucketing.
+func (l *Config) IsSTSTrustedProxy(peerIP string) bool {
+	if l == nil || len(l.stsTrustedProxies) == 0 {
+		return false
+	}
+
+	addr, err := netip.ParseAddr(peerIP)
+	if err != nil {
+		return false
+	}
+
+	for _, prefix := range l.stsTrustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
 
 // Enabled returns if LDAP config is enabled.
 func Enabled(kvs config.KVS) bool {
@@ -255,6 +329,9 @@ func Lookup(s config.Config, rootCAs *x509.CertPool) (l Config, err error) {
 	// Group search params configuration
 	l.LDAP.GroupSearchFilter = getCfgVal(GroupSearchFilter)
 	l.LDAP.GroupSearchBaseDistName = getCfgVal(GroupSearchBaseDN)
+	if err = l.SetSTSTrustedProxies(getCfgVal(STSTrustedProxies)); err != nil {
+		return l, err
+	}
 
 	// If enable flag was not explicitly set, we treat it as implicitly set at
 	// this point as necessary configuration is available.

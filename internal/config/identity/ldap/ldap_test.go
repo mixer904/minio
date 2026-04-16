@@ -43,3 +43,34 @@ func TestIsUserDNNotFoundError(t *testing.T) {
 		t.Fatal("expected infrastructure lookup error to not be detected as user-not-found")
 	}
 }
+
+func TestSetSTSTrustedProxies(t *testing.T) {
+	var cfg Config
+	if err := cfg.SetSTSTrustedProxies("192.0.2.10,198.51.100.0/24;2001:db8::/126"); err != nil {
+		t.Fatalf("expected trusted proxies to parse, got %v", err)
+	}
+
+	tests := []struct {
+		peerIP string
+		want   bool
+	}{
+		{peerIP: "192.0.2.10", want: true},
+		{peerIP: "198.51.100.23", want: true},
+		{peerIP: "198.51.101.23", want: false},
+		{peerIP: "2001:db8::2", want: true},
+		{peerIP: "2001:db8::8", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := cfg.IsSTSTrustedProxy(tt.peerIP); got != tt.want {
+			t.Fatalf("peer %q: expected %v, got %v", tt.peerIP, tt.want, got)
+		}
+	}
+}
+
+func TestSetSTSTrustedProxiesRejectsInvalidEntries(t *testing.T) {
+	var cfg Config
+	if err := cfg.SetSTSTrustedProxies("192.0.2.0/24,not-an-ip"); err == nil {
+		t.Fatal("expected invalid trusted proxy list to fail")
+	}
+}
