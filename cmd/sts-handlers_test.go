@@ -31,6 +31,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -990,6 +992,12 @@ type ldapSTSErrorResult struct {
 	Body       string
 }
 
+type ldapSTSHTTPResult struct {
+	StatusCode int
+	RetryAfter string
+	Body       string
+}
+
 func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, fn func()) {
 	previous := globalSTSLDAPLoginRateLimiter
 	globalSTSLDAPLoginRateLimiter = limiter
@@ -1000,7 +1008,7 @@ func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, 
 	fn()
 }
 
-func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
+func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSHTTPResult {
 	c.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
@@ -1028,21 +1036,33 @@ func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) 
 	if err != nil {
 		c.Fatalf("unexpected LDAP STS response read error: %v", err)
 	}
-	if resp.StatusCode == http.StatusOK {
-		c.Fatalf("expected LDAP STS request to fail, got success: %s", body)
+
+	return ldapSTSHTTPResult{
+		StatusCode: resp.StatusCode,
+		RetryAfter: resp.Header.Get("Retry-After"),
+		Body:       string(body),
+	}
+}
+
+func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
+	c.Helper()
+
+	result := s.postLDAPSTS(c, username, password)
+	if result.StatusCode == http.StatusOK {
+		c.Fatalf("expected LDAP STS request to fail, got success: %s", result.Body)
 	}
 
 	var stsErr STSErrorResponse
-	if err = xml.Unmarshal(body, &stsErr); err != nil {
-		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, body)
+	if err := xml.Unmarshal([]byte(result.Body), &stsErr); err != nil {
+		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, result.Body)
 	}
 
 	return ldapSTSErrorResult{
-		StatusCode: resp.StatusCode,
-		RetryAfter: resp.Header.Get("Retry-After"),
+		StatusCode: result.StatusCode,
+		RetryAfter: result.RetryAfter,
 		Code:       stsErr.Error.Code,
 		Message:    stsErr.Error.Message,
-		Body:       string(body),
+		Body:       result.Body,
 	}
 }
 
@@ -1102,6 +1122,42 @@ func (s *TestSuiteIAM) TestLDAPSTSRateLimit(c *check) {
 	)
 }
 
+func (s *TestSuiteIAM) TestLDAPSTSSuccessDoesNotConsumeRateLimit(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	userReq := madmin.PolicyAssociationReq{
+		Policies: []string{"consoleAdmin"},
+		User:     "uid=dillon,ou=people,ou=swengg,dc=min,dc=io",
+	}
+	if _, err := s.adm.AttachPolicyLDAP(ctx, userReq); err != nil {
+		c.Fatalf("unable to attach LDAP policy for success rate-limit test: %v", err)
+	}
+
+	withGlobalSTSLDAPLoginRateLimiterForTest(
+		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
+		func() {
+			for attempt := 1; attempt <= 3; attempt++ {
+				success := s.postLDAPSTS(c, "dillon", "dillon")
+				if success.StatusCode != http.StatusOK {
+					c.Fatalf("expected successful LDAP STS login on attempt %d, got status %d body: %s", attempt, success.StatusCode, success.Body)
+				}
+			}
+
+			firstFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			secondFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			throttled := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+
+			if firstFailure.StatusCode != http.StatusBadRequest || secondFailure.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected failed auth attempts after successful logins to return %d, got %d and %d", http.StatusBadRequest, firstFailure.StatusCode, secondFailure.StatusCode)
+			}
+			if throttled.StatusCode != http.StatusTooManyRequests {
+				c.Fatalf("expected third failed auth attempt after successful logins to be throttled with %d, got %d", http.StatusTooManyRequests, throttled.StatusCode)
+			}
+		},
+	)
+}
+
 func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
 	original := globalIAMSys.LDAPConfig.Clone()
 	globalIAMSys.LDAPConfig.LDAP.ServerAddr = "127.0.0.1:1"
@@ -1110,21 +1166,33 @@ func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
 	}()
 
 	withGlobalSTSLDAPLoginRateLimiterForTest(
-		newSTSLDAPLoginRateLimiter(time.Minute, stsLDAPLoginBurst, stsLDAPLoginEntryTTL),
+		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
 		func() {
-			upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
+			for range 3 {
+				upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
 
-			if upstreamFailure.StatusCode != http.StatusInternalServerError {
-				c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
+				if upstreamFailure.StatusCode != http.StatusInternalServerError {
+					c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
+				}
+				if upstreamFailure.Code != "InternalError" {
+					c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
+				}
+				if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
+					c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
+				}
+				if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
+					c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
+				}
 			}
-			if upstreamFailure.Code != "InternalError" {
-				c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
+
+			globalIAMSys.LDAPConfig = original
+
+			authFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			if authFailure.StatusCode == http.StatusTooManyRequests {
+				c.Fatalf("expected upstream failures not to consume rate limit budget, got throttled response: %+v", authFailure)
 			}
-			if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
-				c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
-			}
-			if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
-				c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
+			if authFailure.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected auth failure after upstream recovery to return %d, got %d", http.StatusBadRequest, authFailure.StatusCode)
 			}
 		},
 	)
@@ -1145,6 +1213,12 @@ func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
 			name: "RateLimit",
 			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
 				suite.TestLDAPSTSRateLimit(c)
+			},
+		},
+		{
+			name: "SuccessDoesNotConsumeRateLimit",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSSuccessDoesNotConsumeRateLimit(c)
 			},
 		},
 		{
@@ -1294,6 +1368,118 @@ func TestSTSLDAPLoginRateLimiter(t *testing.T) {
 	}
 	if !limiter.Allow("192.0.2.12", "other-user") {
 		t.Fatal("expected a fresh username and source tuple to be allowed")
+	}
+}
+
+func TestSTSLDAPLoginRateLimiterReserveCancel(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+
+	reservation := limiter.Reserve("192.0.2.10", "dillon")
+	if reservation == nil {
+		t.Fatal("expected first reservation to succeed")
+	}
+	if limiter.Reserve("192.0.2.10", "kevin") != nil {
+		t.Fatal("expected second reservation on the same source IP to be throttled before cancel")
+	}
+
+	reservation.Cancel()
+
+	reservation = limiter.Reserve("192.0.2.10", "kevin")
+	if reservation == nil {
+		t.Fatal("expected canceled reservation to restore source-IP capacity")
+	}
+	reservation.Cancel()
+
+	reservation = limiter.Reserve("192.0.2.11", "dillon")
+	if reservation == nil {
+		t.Fatal("expected canceled reservation to restore username capacity")
+	}
+	reservation.Cancel()
+}
+
+func TestSTSLDAPLoginRateLimiterReserveRollbackOnCompositeFailure(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+
+	reservation := limiter.Reserve("192.0.2.10", "dillon")
+	if reservation == nil {
+		t.Fatal("expected initial reservation to succeed")
+	}
+	defer reservation.Cancel()
+
+	if limiter.Reserve("192.0.2.11", "dillon") != nil {
+		t.Fatal("expected second reservation for the same username to be throttled")
+	}
+
+	reservation2 := limiter.Reserve("192.0.2.11", "kevin")
+	if reservation2 == nil {
+		t.Fatal("expected throttled username reservation to roll back the provisional source-IP reservation")
+	}
+	reservation2.Cancel()
+}
+
+func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 4, time.Minute)
+
+	const workers = 8
+	start := make(chan struct{})
+	finish := make(chan struct{})
+	var wg sync.WaitGroup
+	var reserveWG sync.WaitGroup
+	reservations := make([]*stsLDAPLoginReservation, workers)
+	var canceledReservations atomic.Int32
+
+	reserveWG.Add(workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+
+			reservations[worker] = limiter.Reserve("192.0.2.10", "dillon")
+			reserveWG.Done()
+			if reservations[worker] == nil {
+				return
+			}
+
+			<-finish
+			if worker%2 == 0 {
+				canceledReservations.Add(1)
+				reservations[worker].Cancel()
+				return
+			}
+
+			reservations[worker].Commit()
+		}(i)
+	}
+
+	close(start)
+	reserveWG.Wait()
+
+	successfulReservations := 0
+	for _, reservation := range reservations {
+		if reservation != nil {
+			successfulReservations++
+		}
+	}
+	if got := successfulReservations; got != 4 {
+		t.Fatalf("expected exactly 4 successful concurrent reservations, got %d", got)
+	}
+
+	close(finish)
+	wg.Wait()
+
+	remainingBudget := 0
+	for {
+		reservation := limiter.Reserve("192.0.2.10", "dillon")
+		if reservation == nil {
+			break
+		}
+		remainingBudget++
+		reservation.Commit()
+	}
+
+	if want, got := int(canceledReservations.Load()), remainingBudget; got != want {
+		t.Fatalf("expected %d tokens to remain after concurrent commit/cancel mix, got %d", want, got)
 	}
 }
 
