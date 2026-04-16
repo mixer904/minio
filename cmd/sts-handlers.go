@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -36,7 +37,6 @@ import (
 	"github.com/minio/minio/internal/auth"
 	idldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
-	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -487,11 +487,19 @@ func (r *stsLDAPLoginKeyReservation) finalize(now time.Time, refund bool) {
 	r.finalized = true
 }
 
+func getSTSLDAPLoginSourceIP(r *http.Request) string {
+	sourceIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return sourceIP
+	}
+	return r.RemoteAddr
+}
+
 // reserveSTSLDAPLogin acquires immediate tokens from the per-source and
 // per-username limiters before contacting LDAP. Call Commit on auth failures
 // and Cancel when the attempt should not count as an authentication failure.
 func reserveSTSLDAPLogin(r *http.Request) *stsLDAPLoginReservation {
-	return globalSTSLDAPLoginRateLimiter.Reserve(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
+	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r), r.Form.Get(stsLDAPUsername))
 }
 
 func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
