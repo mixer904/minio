@@ -18,11 +18,15 @@
 package cmd
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math/rand"
 	"net/http"
@@ -132,6 +136,9 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestUnsignedQueryStringCVE(c)
 	suite.TestUnsignedQueryStringCVEMultipart(c)
 	suite.TestUnsignedTrailerRejectsMultipleAuthSources(c)
+	suite.TestUnsignedTrailerSnowballAnonymousDenied(c)
+	suite.TestUnsignedTrailerSnowballRequiresSignature(c)
+	suite.TestUnsignedTrailerSnowballExtract(c)
 	suite.TestAnonymousUnsignedTrailer(c)
 	suite.TearDownSuite(c)
 }
@@ -490,6 +497,121 @@ func (s *TestSuiteCommon) TestUnsignedTrailerRejectsMultipleAuthSources(c *check
 	verifyError(c, response, "InvalidRequest", "Invalid Request (request has multiple authentication types, please use one)", http.StatusBadRequest)
 }
 
+func (s *TestSuiteCommon) TestUnsignedTrailerSnowballRequiresSignature(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+	objectName := "snowball-upload.tar"
+	extractedObject := "payload.txt"
+	extractedData := []byte("snowball object\n")
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	tarData, err := newTestTarArchive(extractedObject, extractedData)
+	c.Assert(err, nil)
+
+	// Deliberately send raw tar bytes: before the fix this path never
+	// initialized the unsigned-trailer reader, so Snowball accepted the
+	// body without chunked decoding or signature verification.
+	req, err := http.NewRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName), bytes.NewReader(tarData))
+	c.Assert(err, nil)
+
+	req.ContentLength = int64(len(tarData))
+	req.Header.Set(xhttp.AmzSnowballExtract, "true")
+	req.Header.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
+
+	err = signRequestV4(req, s.accessKey, s.secretKey)
+	c.Assert(err, nil)
+
+	req.Header.Set("Authorization",
+		regexp.MustCompile(`Signature=[0-9a-f]+`).ReplaceAllString(req.Header.Get("Authorization"), "Signature="+strings.Repeat("0", 64)))
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	verifyError(c, response, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided. Check your key and signing method.", http.StatusForbidden)
+}
+
+func (s *TestSuiteCommon) TestUnsignedTrailerSnowballAnonymousDenied(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+	objectName := "snowball-upload.tar"
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	tarData, err := newTestTarArchive("payload.txt", []byte("snowball object\n"))
+	c.Assert(err, nil)
+
+	req, err := http.NewRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName), bytes.NewReader(tarData))
+	c.Assert(err, nil)
+
+	req.ContentLength = int64(len(tarData))
+	req.Header.Set(xhttp.AmzSnowballExtract, "true")
+	req.Header.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	verifyError(c, response, "AccessDenied", "Access Denied.", http.StatusForbidden)
+}
+
+func (s *TestSuiteCommon) TestUnsignedTrailerSnowballExtract(c *check) {
+	c.Helper()
+
+	bucketName := getRandomBucketName()
+	objectName := "snowball-upload.tar"
+	extractedObject := "payload.txt"
+	extractedData := []byte("snowball object\n")
+
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	tarData, err := newTestTarArchive(extractedObject, extractedData)
+	c.Assert(err, nil)
+
+	req, err := newStreamingUnsignedTrailerRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, objectName), tarData, UTCNow())
+	c.Assert(err, nil)
+
+	req.Header.Set(xhttp.AmzSnowballExtract, "true")
+
+	err = signRequestV4(req, s.accessKey, s.secretKey)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	request, err = newTestSignedRequest(http.MethodGet, getGetObjectURL(s.endPoint, bucketName, extractedObject),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	response, err = s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	got, err := io.ReadAll(response.Body)
+	c.Assert(err, nil)
+	c.Assert(bytes.Equal(got, extractedData), true)
+}
+
 func (s *TestSuiteCommon) TestAnonymousUnsignedTrailer(c *check) {
 	c.Helper()
 
@@ -527,6 +649,30 @@ func (s *TestSuiteCommon) TestAnonymousUnsignedTrailer(c *check) {
 	c.Assert(bytes.Equal(got, objectData), true)
 }
 
+func newTestTarArchive(objectName string, objectData []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	err := tw.WriteHeader(&tar.Header{
+		Name: objectName,
+		Mode: 0o600,
+		Size: int64(len(objectData)),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = tw.Write(objectData); err != nil {
+		return nil, err
+	}
+
+	if err = tw.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
 func newStreamingUnsignedTrailerRequest(method, targetURL string, data []byte, reqTime time.Time) (*http.Request, error) {
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
@@ -535,13 +681,19 @@ func newStreamingUnsignedTrailerRequest(method, targetURL string, data []byte, r
 
 	req.Body = io.NopCloser(bytes.NewReader(data))
 	req.Trailer = http.Header{}
-	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
+	req.Trailer.Set("x-amz-checksum-crc32", crc32Base64(data))
 	req = signer.StreamingUnsignedV4(req, "", int64(len(data)), reqTime)
 	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", len(data)))
 	req.Header.Set("Content-Encoding", "aws-chunked")
 	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
 	req.Header.Set(xhttp.AmzContentSha256, unsignedPayloadTrailer)
 	return req, nil
+}
+
+func crc32Base64(data []byte) string {
+	var crc [4]byte
+	binary.BigEndian.PutUint32(crc[:], crc32.ChecksumIEEE(data))
+	return base64.StdEncoding.EncodeToString(crc[:])
 }
 
 func presignStreamingUnsignedTrailerRequest(req *http.Request, accessKeyID, secretAccessKey string, expires int64, reqTime time.Time) error {
