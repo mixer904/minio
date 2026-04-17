@@ -8,7 +8,7 @@
 [![Docker Image](https://img.shields.io/badge/Docker-pgsty/minio-%232496ED?style=flat&logo=docker&logoColor=white)](https://hub.docker.com/r/pgsty/minio)
 
 > [!IMPORTANT]
-> **This is a community-maintained fork of [minio/minio](https://github.com/minio/minio), maintained by [Pigsty](https://pigsty.io).**
+> **This is a community-maintained fork of the upstream MinIO project, maintained by [Pigsty](https://pigsty.io).**
 > This project is **NOT** affiliated with, endorsed by, or sponsored by MinIO, Inc.
 > "MinIO" is a trademark of MinIO, Inc., used here solely to identify the upstream project.
 >
@@ -29,4 +29,3 @@ Console: [`georgmangold/console`](https://github.com/georgmangold/console/), a c
 Ansible Deployment: [https://pigsty.io/docs/minio](https://pigsty.io/docs/minio)
 
 APT/YUM repo for `minio` and `mcli` binary: [https://pigsty.io/docs/infra](https://pigsty.io/docs/repo/infra/list/#object-storage)
-

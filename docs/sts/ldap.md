@@ -46,7 +46,7 @@ MINIO_IDENTITY_LDAP_GROUP_SEARCH_BASE_DN    (list)      ";" separated list of gr
 MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY         (on|off)    trust server TLS without verification (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_INSECURE         (on|off)    allow plain text connection to AD/LDAP server (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection to AD/LDAP server (default: 'off')
-MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      "," separated list of trusted proxy IPs or CIDRs whose forwarded client IP headers may be used for LDAP STS rate limiting
+MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      comma/semicolon/whitespace-separated list of trusted proxy IPs or CIDRs whose forwarded client IP headers may be used for LDAP STS rate limiting
 MINIO_IDENTITY_LDAP_COMMENT                 (sentence)  optionally add a comment to this setting
 ```
 
@@ -61,20 +61,6 @@ MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY         (on|off)    trust server TLS without
 MINIO_IDENTITY_LDAP_SERVER_INSECURE         (on|off)    allow plain text connection to AD/LDAP server, defaults to "off"
 MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection to AD/LDAP server, defaults to "off"
 ```
-
-### LDAP STS rate limiting behind trusted proxies
-
-LDAP STS login throttling is keyed by the socket peer address by default. This is the safe default because MinIO does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
-
-If MinIO is deployed behind a trusted reverse proxy, load balancer, or API gateway and you want LDAP STS throttling to bucket by the forwarded client IP instead of the proxy peer address, configure:
-
-```
-MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      "," separated list of trusted proxy IPs or CIDRs
-```
-
-Only requests whose peer address matches this allowlist may supply forwarded client IP headers for LDAP STS rate limiting. Requests from all other peers continue to use the peer address directly.
-
-For trusted-proxy deployments, prefer setting a clean single-value `X-Real-IP` header. If you rely on `X-Forwarded-For`, make sure the proxy strips or overwrites any inbound forwarding headers instead of appending to a client-supplied value. In nginx, prefer `$remote_addr` for the trusted client IP header; `proxy_add_x_forwarded_for` appends and is not suitable unless you first clear inbound forwarding headers.
 
 The server address variable is _required_. TLS is assumed to be on by default. The port in the server address is optional and defaults to 636 if not provided.
 
@@ -95,6 +81,39 @@ When using this feature, do not specify a port in the `server_addr` as the port 
 With the default (empty) value for `srv_record_name`, MinIO **will not** perform any SRV record request.
 
 The value of `srv_record_name` does not affect any TLS settings - they must be configured with their own parameters.
+
+### LDAP STS rate limiting
+
+LDAP STS rate limiting is enforced before each LDAP bind. Requests are tracked independently by source IP and by normalized username. A login attempt is throttled when either bucket is exhausted.
+
+By default, the source IP used for this key is the socket peer address. This is the safe default because MinIO does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
+
+Each login attempt reserves capacity for the duration of the LDAP bind. Successful logins and LDAP infrastructure failures refund that reservation. Only real authentication failures permanently consume tokens. Concurrent bursts above the burst capacity can still receive `429` responses even if those in-flight requests later succeed.
+
+| Behavior | Value |
+| :-- | :-- |
+| Bucket keys | Source IP and normalized username, enforced independently |
+| Burst capacity | 10 attempts per bucket |
+| Refill rate | 1 token every 6 seconds, about 10 attempts per minute per bucket |
+| Reservation lifetime | Held for the duration of the LDAP bind |
+| Idle entry cleanup | Bucket state is removed after 15 minutes without activity |
+| Throttled response | HTTP `429`, STS code `ThrottlingException`, `Retry-After: 6` |
+| Scope | Per-node, in-memory, not cluster-wide |
+| Configurability | Not currently configurable |
+
+In a multi-node deployment behind a load balancer, each MinIO node tracks its own buckets. The effective aggregate budget therefore depends on how requests are distributed across nodes.
+
+#### Trusted proxies
+
+If MinIO is deployed behind a trusted reverse proxy, load balancer, or API gateway and you want LDAP STS throttling to bucket by the forwarded client IP instead of the proxy peer address, configure:
+
+```
+MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      comma/semicolon/whitespace-separated list of trusted proxy IPs or CIDRs
+```
+
+Only requests whose peer address matches this allowlist may supply forwarded client IP headers for LDAP STS rate limiting. Requests from all other peers continue to use the peer address directly.
+
+For trusted-proxy deployments, prefer setting a clean single-value `X-Real-IP` header. If you rely on `X-Forwarded-For`, make sure the proxy strips or overwrites any inbound forwarding headers instead of appending to a client-supplied value. In nginx, prefer `$remote_addr` for the trusted client IP header; `proxy_add_x_forwarded_for` appends and is not suitable unless you first clear inbound forwarding headers.
 
 ### Lookup-Bind
 
@@ -276,6 +295,14 @@ XML response for this API is similar to [AWS STS AssumeRoleWithWebIdentity](http
 
 XML error response for this API is similar to [AWS STS AssumeRoleWithWebIdentity](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html#API_AssumeRoleWithWebIdentity_Errors)
 
+Authentication failures caused by unknown users and invalid passwords intentionally return the same external STS error response to prevent username enumeration via response differentiation (`CVE-2026-33419`).
+
+| Condition | HTTP status | STS code | Notes |
+| :-- | :-- | :-- | :-- |
+| Unknown user or invalid password | `400` | `InvalidParameterValue` | Same response for both cases to prevent username enumeration |
+| LDAP backend, network, or other infrastructure failure | `500` | `InternalError` | Returned as an upstream/internal failure and logged server-side |
+| Rate limit exhausted | `429` | `ThrottlingException` | Includes a `Retry-After` header |
+
 ## Sample `POST` Request
 
 ```
@@ -318,7 +345,7 @@ export MINIO_IDENTITY_LDAP_GROUP_SEARCH_FILTER='(&(objectclass=groupOfNames)(mem
 minio server ~/test
 ```
 
-You can make sure it works appropriately using our [example program](https://raw.githubusercontent.com/minio/minio/master/docs/sts/ldap.go):
+You can make sure it works appropriately using our [example program](https://raw.githubusercontent.com/pgsty/minio/master/docs/sts/ldap.go):
 
 ```
 $ go run ldap.go -u foouser -p foopassword

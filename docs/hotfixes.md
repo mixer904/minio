@@ -64,7 +64,7 @@ Developer is advised to clone the MinIO source and checkout the MinIO release ta
 ```
 
 Create a branch and proceed to push the branch **upstream**
-> (upstream here points to git@github.com:minio/minio.git)
+> (upstream here points to git@github.com:pgsty/minio.git)
 
 ```
 λ git branch -m RELEASE.2021-04-22T15-44-28Z.hotfix

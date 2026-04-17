@@ -104,7 +104,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         STSTrustedProxies,
-			Description: `"," separated list of trusted proxy IPs or CIDRs whose forwarded client IP headers may be used for LDAP STS rate limiting` + defaultHelpPostfix(STSTrustedProxies),
+			Description: `comma/semicolon/whitespace-separated list of trusted proxy IPs or CIDRs whose forwarded client IP headers may be used for LDAP STS rate limiting` + defaultHelpPostfix(STSTrustedProxies),
 			Optional:    true,
 			Type:        "list",
 		},

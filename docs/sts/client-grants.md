@@ -6,6 +6,8 @@ Returns a set of temporary security credentials for applications/clients who hav
 
 Calling AssumeRoleWithClientGrants does not require the use of MinIO default credentials. Therefore, client application can be distributed that requests temporary security credentials without including MinIO default credentials. Instead, the identity of the caller is validated by using a JWT access token from the identity provider. The temporary security credentials returned by this API consists of an access key, a secret key, and a security token. Applications can use these temporary security credentials to sign calls to MinIO API operations.
 
+**Breaking change (`CVE-2026-33322`)**: releases after `RELEASE.2026-03-25T00-00-00Z` validate the JWT access token with the provider JWKS endpoint advertised by the configured OpenID discovery document. In practice, MinIO currently accepts the RSA PKCS#1 v1.5 and ECDSA families already implemented in the verifier (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, plus the existing `RS3*` and `ES3*` aliases). HMAC-signed tokens such as `HS256`, `HS384`, and `HS512` are rejected. Algorithms such as `PS256` and `EdDSA` are not currently supported. `MINIO_IDENTITY_OPENID_CLIENT_SECRET` is used for OpenID/OAuth client interactions only and is not used as a JWT verification key. If your provider previously issued HMAC-signed access tokens for this flow, reconfigure it to publish RSA or ECDSA signing keys through JWKS before upgrading.
+
 By default, the temporary security credentials created by AssumeRoleWithClientGrants last for one hour. However, use the optional DurationSeconds parameter to specify the duration of the credentials. This value varies from 900 seconds (15 minutes) up to the maximum session duration of 365 days.
 
 ## API Request Parameters
@@ -95,7 +97,7 @@ minio server /mnt/export
 ```
 
 Testing with an example
-> Obtaining client ID and secrets follow [Keycloak configuring documentation](https://github.com/minio/minio/blob/master/docs/sts/keycloak.md)
+> Obtaining client ID and secrets follow [Keycloak configuring documentation](https://github.com/pgsty/minio/blob/master/docs/sts/keycloak.md)
 
 ```
 $ go run client-grants.go -cid PoEgXP6uVO45IsENRngDXj5Au5Ya -csec eKsw6z8CtOJVBtrOWvhRWL4TUCga
