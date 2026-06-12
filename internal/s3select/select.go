@@ -38,10 +38,8 @@ import (
 	"github.com/minio/minio/internal/s3select/csv"
 	"github.com/minio/minio/internal/s3select/json"
 	"github.com/minio/minio/internal/s3select/parquet"
-	"github.com/minio/minio/internal/s3select/simdj"
 	"github.com/minio/minio/internal/s3select/sql"
 	"github.com/minio/pkg/v3/env"
-	"github.com/minio/simdjson-go"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -438,11 +436,8 @@ func (s3Select *S3Select) Open(rsc io.ReadSeekCloser) error {
 		}
 
 		if strings.EqualFold(s3Select.Input.JSONArgs.ContentType, "lines") {
-			if simdjson.SupportedCPU() {
-				s3Select.recordReader = simdj.NewReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
-			} else {
-				s3Select.recordReader = json.NewPReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
-			}
+			// PReader enforces the S3 Select per-record size limit while splitting lines.
+			s3Select.recordReader = json.NewPReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
 		} else {
 			// Document mode.
 			s3Select.recordReader = json.NewReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
@@ -658,11 +653,19 @@ OuterLoop:
 	}
 
 	if err != nil {
-		if serr, ok := err.(SelectError); ok && serr.ErrorCode() == "OverMaxRecordSize" {
+		selectErr := err
+		if len(outputQueue) > 0 {
+			if !sendRecord() {
+				return
+			}
+		}
+
+		var serr SelectError
+		if errors.As(selectErr, &serr) {
 			_ = writer.FinishWithError(serr.ErrorCode(), serr.ErrorMessage())
 			return
 		}
-		_ = writer.FinishWithError("InternalError", err.Error())
+		_ = writer.FinishWithError("InternalError", selectErr.Error())
 	}
 }
 

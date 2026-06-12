@@ -244,7 +244,7 @@ func (r *PReader) startReaders() {
 				r.bufferPool.Put(in.input)
 				in.input = nil
 				if err := d.Err(); err != nil {
-					in.err = err
+					in.err = errJSONParsingError(err)
 				}
 				in.dst <- all
 			}
