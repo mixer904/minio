@@ -37,7 +37,6 @@ import (
 	"github.com/minio/minio/internal/auth"
 	idldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
-	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -267,14 +266,22 @@ func getTokenSigningKey() (string, error) {
 	return secret, nil
 }
 
+// stsLDAPLoginRateLimiter throttles LDAP STS logins per source IP. It does not
+// bucket by username on purpose: a username-keyed bucket is shared across all
+// sources, so a single client sending bad-password attempts for a known account
+// could keep that account's bucket drained and lock the legitimate user out.
+//
+// Scope of protection: the per-source bucket caps the attempt rate from any one
+// source, and the uniform auth-failure response (not this limiter) is what hides
+// whether a username exists. It does not stop attackers who spread across many
+// sources (botnets, IPv6 address rotation) or the residual bind-timing side
+// channel; those are accepted limitations of an in-memory, per-source control.
 type stsLDAPLoginRateLimiter struct {
 	source *stsLDAPLoginKeyLimiterSet
-	user   *stsLDAPLoginKeyLimiterSet
 }
 
 type stsLDAPLoginReservation struct {
 	source *stsLDAPLoginKeyReservation
-	user   *stsLDAPLoginKeyReservation
 }
 
 type stsLDAPLoginKeyLimiterSet struct {
@@ -302,7 +309,6 @@ type stsLDAPLoginKeyReservation struct {
 func newSTSLDAPLoginRateLimiter(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginRateLimiter {
 	return &stsLDAPLoginRateLimiter{
 		source: newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
-		user:   newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
 	}
 }
 
@@ -315,12 +321,8 @@ func newSTSLDAPLoginKeyLimiterSet(refillEvery time.Duration, burst int, ttl time
 	}
 }
 
-func normalizeSTSLDAPUsername(username string) string {
-	return strings.ToLower(strings.TrimSpace(username))
-}
-
-func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
-	reservation := l.Reserve(sourceIP, username)
+func (l *stsLDAPLoginRateLimiter) Allow(sourceIP string) bool {
+	reservation := l.Reserve(sourceIP)
 	if reservation == nil {
 		return false
 	}
@@ -328,55 +330,34 @@ func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
 	return true
 }
 
-func (l *stsLDAPLoginRateLimiter) Reserve(sourceIP, username string) *stsLDAPLoginReservation {
-	now := UTCNow()
-	reservation := &stsLDAPLoginReservation{}
-
-	if sourceIP != "" {
-		reservation.source = l.source.Reserve(now, sourceIP)
-		if reservation.source == nil {
-			return nil
-		}
+func (l *stsLDAPLoginRateLimiter) Reserve(sourceIP string) *stsLDAPLoginReservation {
+	// An empty source IP means we could not identify the peer; do not throttle
+	// rather than collapse every such request into one shared bucket.
+	if sourceIP == "" {
+		return &stsLDAPLoginReservation{}
 	}
 
-	username = normalizeSTSLDAPUsername(username)
-	if username != "" {
-		reservation.user = l.user.Reserve(now, username)
-		if reservation.user == nil {
-			reservation.Cancel()
-			return nil
-		}
+	source := l.source.Reserve(UTCNow(), sourceIP)
+	if source == nil {
+		return nil
 	}
-
-	return reservation
+	return &stsLDAPLoginReservation{source: source}
 }
 
 func (r *stsLDAPLoginReservation) Commit() {
-	if r == nil {
+	if r == nil || r.source == nil {
 		return
 	}
-	if r.source != nil {
-		r.source.CommitAt(UTCNow())
-		r.source = nil
-	}
-	if r.user != nil {
-		r.user.CommitAt(UTCNow())
-		r.user = nil
-	}
+	r.source.CommitAt(UTCNow())
+	r.source = nil
 }
 
 func (r *stsLDAPLoginReservation) Cancel() {
-	if r == nil {
+	if r == nil || r.source == nil {
 		return
 	}
-	if r.source != nil {
-		r.source.CancelAt(UTCNow())
-		r.source = nil
-	}
-	if r.user != nil {
-		r.user.CancelAt(UTCNow())
-		r.user = nil
-	}
+	r.source.CancelAt(UTCNow())
+	r.source = nil
 }
 
 func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
@@ -510,11 +491,37 @@ func getSTSLDAPLoginSourceIP(r *http.Request) string {
 	return sourceIP
 }
 
+// getSTSLDAPTrustedProxySourceIP resolves the client IP for a request whose peer
+// is an allow-listed trusted proxy. A single clean X-Real-IP is preferred; for
+// X-Forwarded-For we walk the chain right-to-left and skip trusted-proxy hops,
+// returning the first untrusted address. The XFF result ignores any client-
+// supplied (left-most) value unless the entire chain to its right is trusted,
+// which an external client cannot forge.
+//
+// X-Real-IP, unlike XFF, is a single value with no chain, so it cannot be
+// validated against the allowlist: it is trusted verbatim. The deployment
+// contract is therefore that the trusted proxy MUST overwrite (not pass through)
+// any client-supplied X-Real-IP; otherwise an attacker can vary it per request
+// to evade per-source throttling. This is the standard reverse-proxy real-IP
+// contract; reordering to prefer XFF would not remove the dependency, only move
+// it (an X-Real-IP-only proxy would then be evaded via an injected XFF header).
+//
+// The RFC 7239 Forwarded header is intentionally not honored here; such
+// deployments fall back to the safe peer-address bucket.
 func getSTSLDAPTrustedProxySourceIP(r *http.Request) string {
 	if realIP := getSTSLDAPLoginCanonicalIP(r.Header.Get("X-Real-IP")); realIP != "" {
 		return realIP
 	}
-	return getSTSLDAPLoginCanonicalIP(handlers.GetSourceIPFromHeaders(r))
+
+	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(forwarded) - 1; i >= 0; i-- {
+		ip := getSTSLDAPLoginCanonicalIP(forwarded[i])
+		if ip == "" || globalIAMSys.LDAPConfig.IsSTSTrustedProxy(ip) {
+			continue
+		}
+		return ip
+	}
+	return ""
 }
 
 func getSTSLDAPLoginPeerAddr(remoteAddr string) string {
@@ -535,11 +542,11 @@ func getSTSLDAPLoginCanonicalIP(addr string) string {
 	return ""
 }
 
-// reserveSTSLDAPLogin acquires immediate tokens from the per-source and
-// per-username limiters before contacting LDAP. Call Commit on auth failures
-// and Cancel when the attempt should not count as an authentication failure.
+// reserveSTSLDAPLogin acquires an immediate token from the per-source limiter
+// before contacting LDAP. Call Commit on auth failures and Cancel when the
+// attempt should not count as an authentication failure.
 func reserveSTSLDAPLogin(r *http.Request) *stsLDAPLoginReservation {
-	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r), r.Form.Get(stsLDAPUsername))
+	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r))
 }
 
 func ldapBindErrorToSTS(err error) (STSErrorCode, error) {

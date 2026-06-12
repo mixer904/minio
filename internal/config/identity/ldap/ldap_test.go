@@ -74,3 +74,12 @@ func TestSetSTSTrustedProxiesRejectsInvalidEntries(t *testing.T) {
 		t.Fatal("expected invalid trusted proxy list to fail")
 	}
 }
+
+func TestSetSTSTrustedProxiesRejectsCatchAll(t *testing.T) {
+	for _, value := range []string{"0.0.0.0/0", "::/0", "192.0.2.0/24,0.0.0.0/0"} {
+		var cfg Config
+		if err := cfg.SetSTSTrustedProxies(value); err == nil {
+			t.Fatalf("expected catch-all trusted proxy %q to be rejected", value)
+		}
+	}
+}

@@ -184,7 +184,13 @@ func parseSTSTrustedProxies(value string) ([]netip.Prefix, error) {
 	prefixes := make([]netip.Prefix, 0, len(fields))
 	for _, field := range fields {
 		if prefix, err := netip.ParsePrefix(field); err == nil {
-			prefixes = append(prefixes, prefix.Masked())
+			masked := prefix.Masked()
+			// Reject catch-all ranges (0.0.0.0/0, ::/0): they would trust
+			// forwarded headers from every peer and defeat the allowlist.
+			if masked.Bits() == 0 {
+				return nil, config.Errorf("LDAP STS trusted proxy %q is too broad", field)
+			}
+			prefixes = append(prefixes, masked)
 			continue
 		}
 

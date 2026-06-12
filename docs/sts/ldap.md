@@ -84,7 +84,7 @@ The value of `srv_record_name` does not affect any TLS settings - they must be c
 
 ### LDAP STS rate limiting
 
-LDAP STS rate limiting is enforced before each LDAP bind. Requests are tracked independently by source IP and by normalized username. A login attempt is throttled when either bucket is exhausted.
+LDAP STS rate limiting is enforced before each LDAP bind. Requests are tracked by source IP. A login attempt is throttled when that bucket is exhausted. Rate limiting is deliberately not keyed by username: a username-keyed bucket is shared across all sources, so an attacker could drain a known account's bucket with bad-password attempts and lock the legitimate user out. The per-source bucket caps the attempt rate from any single source, while the uniform auth-failure response is what conceals whether a username exists. This combination does not stop attackers who spread requests across many source IPs (botnets, IPv6 address rotation) or the residual bind-timing side channel; those are accepted limitations of an in-memory, per-source control.
 
 By default, the source IP used for this key is the socket peer address. This is the safe default because MinIO does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
 
@@ -92,7 +92,7 @@ Each login attempt reserves capacity for the duration of the LDAP bind. Successf
 
 | Behavior | Value |
 | :-- | :-- |
-| Bucket keys | Source IP and normalized username, enforced independently |
+| Bucket key | Source IP |
 | Burst capacity | 10 attempts per bucket |
 | Refill rate | 1 token every 6 seconds, about 10 attempts per minute per bucket |
 | Reservation lifetime | Held for the duration of the LDAP bind |
@@ -111,9 +111,13 @@ If MinIO is deployed behind a trusted reverse proxy, load balancer, or API gatew
 MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      comma/semicolon/whitespace-separated list of trusted proxy IPs or CIDRs
 ```
 
-Only requests whose peer address matches this allowlist may supply forwarded client IP headers for LDAP STS rate limiting. Requests from all other peers continue to use the peer address directly.
+Only requests whose peer address matches this allowlist may supply forwarded client IP headers for LDAP STS rate limiting. Requests from all other peers continue to use the peer address directly. Catch-all ranges (`0.0.0.0/0`, `::/0`) are rejected, since they would trust forwarded headers from every peer.
 
-For trusted-proxy deployments, prefer setting a clean single-value `X-Real-IP` header. If you rely on `X-Forwarded-For`, make sure the proxy strips or overwrites any inbound forwarding headers instead of appending to a client-supplied value. In nginx, prefer `$remote_addr` for the trusted client IP header; `proxy_add_x_forwarded_for` appends and is not suitable unless you first clear inbound forwarding headers.
+`X-Forwarded-For` is parsed right-to-left, skipping addresses that match the trusted-proxy allowlist, and the first untrusted address is used. A client-supplied (left-most) value is therefore ignored unless the entire chain to its right is trusted — so even nginx's default appending `proxy_add_x_forwarded_for` is safe. List every proxy hop's address in the allowlist so intermediate hops are skipped.
+
+`X-Real-IP` is preferred over `X-Forwarded-For` when present, but — unlike `X-Forwarded-For` — it is a single value that **cannot** be chain-validated against the allowlist, so it is trusted verbatim. **The trusted proxy must overwrite (not pass through) any client-supplied `X-Real-IP`.** If the proxy forwards a client-supplied value, an attacker can send a different `X-Real-IP` on each request to land in a fresh bucket and bypass per-source throttling. When in doubt, configure the proxy to set `X-Real-IP` from the connecting peer (e.g. nginx `proxy_set_header X-Real-IP $remote_addr`), or omit `X-Real-IP` and rely on the chain-validated `X-Forwarded-For`.
+
+The RFC 7239 `Forwarded` header is not used for this bucket; deployments that only send `Forwarded` fall back to the peer-address bucket.
 
 ### Lookup-Bind
 
