@@ -19,7 +19,7 @@ This document summarizes fork-specific security fixes and closely related upgrad
 | :-- | :-- | :-- |
 | `CVE-2026-34986` | `68e0ba997` | Upgrades `go-jose` to `v4.1.4`. |
 | `CVE-2026-39883` | `1869bd30b`, `e4fa06394` | Updates OpenTelemetry dependencies. |
-| Upstream Go security fixes | `db4c0fd5e` | Bumps the Go toolchain to `1.26.2`. |
+| Upstream Go security fixes | `db4c0fd5e`, Go 1.26.4 update | Bumps the Go toolchain through `1.26.4`. |
 
 ## Operationally significant security-related fixes
 
