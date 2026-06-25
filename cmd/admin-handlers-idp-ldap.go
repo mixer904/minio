@@ -267,7 +267,7 @@ func (a adminAPIHandlers) AddServiceAccountLDAP(w http.ResponseWriter, r *http.R
 		lookupResult, targetGroups, err = globalIAMSys.LDAPConfig.LookupUserDN(targetUser)
 		if err != nil {
 			// if not found, check if DN
-			if strings.Contains(err.Error(), "User DN not found for:") {
+			if strings.Contains(strings.ToLower(err.Error()), "user dn not found for:") {
 				if isDN {
 					// warn user that DNs are not allowed
 					writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminLDAPExpectedLoginName, err), r.URL)

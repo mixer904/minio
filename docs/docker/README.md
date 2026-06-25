@@ -2,6 +2,8 @@
 
 See our web documentation on [Deploying MinIO in Standalone Mode](Deploy Standalone MinIO in a Container) for a more structured tutorial on deploying MinIO in a container.
 
+For images built from this `pgsty/minio` fork, the container also bundles `mcli` and a compatibility `mc` symlink from `pgsty/mc`.
+
 ## Prerequisites
 
 Docker installed on your machine. Download the relevant installer from [here](https://www.docker.com/community-edition#/download).

@@ -118,16 +118,48 @@ func (r *PReader) nextSplit(skip int, dst []byte) ([]byte, error) {
 			return dst, io.EOF
 		}
 	}
-	// Read until next line.
-	in, err := r.buf.ReadBytes('\n')
-	dst = append(dst, in...)
-	return dst, err
+
+	tailLen := len(dst)
+	if i := bytes.LastIndexByte(dst, '\n'); i >= 0 {
+		tailLen = len(dst) - i - 1
+	}
+	tailStart := len(dst) - tailLen
+	if tailLen > maxCharsPerRecord {
+		return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+	}
+
+	for {
+		in, err := r.buf.ReadSlice('\n')
+		switch err {
+		case nil:
+			if tailLen+len(in)-1 > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			return dst, nil
+		case bufio.ErrBufferFull:
+			if tailLen+len(in) > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			tailLen += len(in)
+		default:
+			if tailLen+len(in) > maxCharsPerRecord {
+				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
+			}
+			dst = append(dst, in...)
+			return dst, err
+		}
+	}
 }
 
 // jsonSplitSize is the size of each block.
 // Blocks will read this much and find the first following newline.
 // 128KB appears to be a very reasonable default.
 const jsonSplitSize = 128 << 10
+
+// S3 Select allows up to 1 MiB per input record.
+const maxCharsPerRecord = 1 << 20
 
 // startReaders will read the header if needed and spin up a parser
 // and a number of workers based on GOMAXPROCS.
@@ -177,6 +209,10 @@ func (r *PReader) startReaders() {
 		go func() {
 			for in := range r.input {
 				if len(in.input) == 0 {
+					if in.input != nil {
+						r.bufferPool.Put(in.input[:0])
+						in.input = nil
+					}
 					in.dst <- nil
 					continue
 				}
@@ -207,7 +243,9 @@ func (r *PReader) startReaders() {
 				//nolint:staticcheck // SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
 				r.bufferPool.Put(in.input)
 				in.input = nil
-				in.err = d.Err()
+				if err := d.Err(); err != nil {
+					in.err = errJSONParsingError(err)
+				}
 				in.dst <- all
 			}
 		}()

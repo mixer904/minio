@@ -20,12 +20,19 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -977,6 +984,345 @@ func TestIAMWithLDAPServerSuite(t *testing.T) {
 	}
 }
 
+type ldapSTSErrorResult struct {
+	StatusCode int
+	RetryAfter string
+	Code       string
+	Message    string
+	Body       string
+}
+
+type ldapSTSHTTPResult struct {
+	StatusCode int
+	RetryAfter string
+	Body       string
+}
+
+func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, fn func()) {
+	previous := globalSTSLDAPLoginRateLimiter
+	globalSTSLDAPLoginRateLimiter = limiter
+	defer func() {
+		globalSTSLDAPLoginRateLimiter = previous
+	}()
+
+	fn()
+}
+
+func withLDAPSTSTrustedProxiesForTest(t *testing.T, trustedProxies string, fn func()) {
+	t.Helper()
+
+	previousIAMSys := globalIAMSys
+	if globalIAMSys == nil {
+		globalIAMSys = &IAMSys{}
+	}
+	previous := globalIAMSys.LDAPConfig.Clone()
+	if err := globalIAMSys.LDAPConfig.SetSTSTrustedProxies(trustedProxies); err != nil {
+		t.Fatalf("unable to set LDAP STS trusted proxies for test: %v", err)
+	}
+	defer func() {
+		globalIAMSys.LDAPConfig = previous
+		globalIAMSys = previousIAMSys
+	}()
+
+	fn()
+}
+
+func singleHeader(key, value string) http.Header {
+	header := make(http.Header)
+	if key != "" {
+		header.Set(key, value)
+	}
+	return header
+}
+
+func (s *TestSuiteIAM) postLDAPSTSWithHeaders(c *check, username, password string, headers http.Header) ldapSTSHTTPResult {
+	c.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	form := url.Values{}
+	form.Set("Action", ldapIdentity)
+	form.Set("Version", stsAPIVersion)
+	form.Set(stsLDAPUsername, username)
+	form.Set(stsLDAPPassword, password)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endPoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		c.Fatalf("unexpected request creation error: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	resp, err := s.TestSuiteCommon.client.Do(req)
+	if err != nil {
+		c.Fatalf("unexpected LDAP STS request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.Fatalf("unexpected LDAP STS response read error: %v", err)
+	}
+
+	return ldapSTSHTTPResult{
+		StatusCode: resp.StatusCode,
+		RetryAfter: resp.Header.Get("Retry-After"),
+		Body:       string(body),
+	}
+}
+
+func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSHTTPResult {
+	c.Helper()
+	return s.postLDAPSTSWithHeaders(c, username, password, nil)
+}
+
+func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
+	c.Helper()
+
+	result := s.postLDAPSTS(c, username, password)
+	if result.StatusCode == http.StatusOK {
+		c.Fatalf("expected LDAP STS request to fail, got success: %s", result.Body)
+	}
+
+	var stsErr STSErrorResponse
+	if err := xml.Unmarshal([]byte(result.Body), &stsErr); err != nil {
+		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, result.Body)
+	}
+
+	return ldapSTSErrorResult{
+		StatusCode: result.StatusCode,
+		RetryAfter: result.RetryAfter,
+		Code:       stsErr.Error.Code,
+		Message:    stsErr.Error.Message,
+		Body:       result.Body,
+	}
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSAuthFailureUniformResponse(c *check) {
+	withGlobalSTSLDAPLoginRateLimiterForTest(
+		newSTSLDAPLoginRateLimiter(time.Minute, stsLDAPLoginBurst, stsLDAPLoginEntryTTL),
+		func() {
+			missingUser := s.postLDAPSTSForError(c, "missing-user", "nottherightpassword")
+			wrongPassword := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+
+			if missingUser.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected missing-user request status %d, got %d", http.StatusBadRequest, missingUser.StatusCode)
+			}
+			if wrongPassword.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected wrong-password request status %d, got %d", http.StatusBadRequest, wrongPassword.StatusCode)
+			}
+			if missingUser.Code != "InvalidParameterValue" || wrongPassword.Code != "InvalidParameterValue" {
+				c.Fatalf("expected InvalidParameterValue for both auth failures, got missing=%q wrong=%q", missingUser.Code, wrongPassword.Code)
+			}
+			if missingUser.Message != errLDAPAuthenticationFailed.Error() || wrongPassword.Message != errLDAPAuthenticationFailed.Error() {
+				c.Fatalf("expected uniform LDAP auth failure message, got missing=%q wrong=%q", missingUser.Message, wrongPassword.Message)
+			}
+			if strings.Contains(strings.ToLower(missingUser.Body), "unable to find user dn") {
+				c.Fatalf("missing-user response leaked lookup details: %s", missingUser.Body)
+			}
+			if strings.Contains(strings.ToLower(wrongPassword.Body), "ldap auth failed for dn") {
+				c.Fatalf("wrong-password response leaked bind details: %s", wrongPassword.Body)
+			}
+		},
+	)
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSRateLimit(c *check) {
+	withGlobalSTSLDAPLoginRateLimiterForTest(
+		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
+		func() {
+			first := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			second := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			throttled := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+
+			if first.StatusCode != http.StatusBadRequest || second.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected first two failed auth attempts to return %d, got %d and %d", http.StatusBadRequest, first.StatusCode, second.StatusCode)
+			}
+			if throttled.StatusCode != http.StatusTooManyRequests {
+				c.Fatalf("expected throttled request status %d, got %d", http.StatusTooManyRequests, throttled.StatusCode)
+			}
+			if throttled.Code != "ThrottlingException" {
+				c.Fatalf("expected throttled code %q, got %q", "ThrottlingException", throttled.Code)
+			}
+			if throttled.Message != "Request throttled, please retry later." {
+				c.Fatalf("expected throttled message %q, got %q", "Request throttled, please retry later.", throttled.Message)
+			}
+			if throttled.RetryAfter != fmt.Sprintf("%d", stsLDAPLoginRetryAfterSec) {
+				c.Fatalf("expected Retry-After %d, got %q", stsLDAPLoginRetryAfterSec, throttled.RetryAfter)
+			}
+		},
+	)
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSSuccessDoesNotConsumeRateLimit(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	userReq := madmin.PolicyAssociationReq{
+		Policies: []string{"consoleAdmin"},
+		User:     "uid=dillon,ou=people,ou=swengg,dc=min,dc=io",
+	}
+	if _, err := s.adm.AttachPolicyLDAP(ctx, userReq); err != nil {
+		c.Fatalf("unable to attach LDAP policy for success rate-limit test: %v", err)
+	}
+
+	withGlobalSTSLDAPLoginRateLimiterForTest(
+		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
+		func() {
+			for attempt := 1; attempt <= 3; attempt++ {
+				success := s.postLDAPSTS(c, "dillon", "dillon")
+				if success.StatusCode != http.StatusOK {
+					c.Fatalf("expected successful LDAP STS login on attempt %d, got status %d body: %s", attempt, success.StatusCode, success.Body)
+				}
+			}
+
+			firstFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			secondFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			throttled := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+
+			if firstFailure.StatusCode != http.StatusBadRequest || secondFailure.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected failed auth attempts after successful logins to return %d, got %d and %d", http.StatusBadRequest, firstFailure.StatusCode, secondFailure.StatusCode)
+			}
+			if throttled.StatusCode != http.StatusTooManyRequests {
+				c.Fatalf("expected third failed auth attempt after successful logins to be throttled with %d, got %d", http.StatusTooManyRequests, throttled.StatusCode)
+			}
+		},
+	)
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
+	original := globalIAMSys.LDAPConfig.Clone()
+	globalIAMSys.LDAPConfig.LDAP.ServerAddr = "127.0.0.1:1"
+	defer func() {
+		globalIAMSys.LDAPConfig = original
+	}()
+
+	withGlobalSTSLDAPLoginRateLimiterForTest(
+		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
+		func() {
+			for range 3 {
+				upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
+
+				if upstreamFailure.StatusCode != http.StatusInternalServerError {
+					c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
+				}
+				if upstreamFailure.Code != "InternalError" {
+					c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
+				}
+				if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
+					c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
+				}
+				if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
+					c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
+				}
+			}
+
+			globalIAMSys.LDAPConfig = original
+
+			authFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
+			if authFailure.StatusCode == http.StatusTooManyRequests {
+				c.Fatalf("expected upstream failures not to consume rate limit budget, got throttled response: %+v", authFailure)
+			}
+			if authFailure.StatusCode != http.StatusBadRequest {
+				c.Fatalf("expected auth failure after upstream recovery to return %d, got %d", http.StatusBadRequest, authFailure.StatusCode)
+			}
+		},
+	)
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSTrustedProxyRateLimit(c *check) {
+	withLDAPSTSTrustedProxiesForTest(c.T, "127.0.0.0/8,::1/128", func() {
+		withGlobalSTSLDAPLoginRateLimiterForTest(
+			newSTSLDAPLoginRateLimiter(time.Hour, 1, stsLDAPLoginEntryTTL),
+			func() {
+				// These usernames intentionally do not exist. The test asserts that
+				// LDAP user-not-found stays classified as an auth error, so failed
+				// attempts still commit the reservation and hit the source bucket.
+				first := s.postLDAPSTSWithHeaders(c, "missing-user-a", "nottherightpassword", singleHeader("X-Real-IP", "203.0.113.10"))
+				second := s.postLDAPSTSWithHeaders(c, "missing-user-b", "nottherightpassword", singleHeader("X-Real-IP", "198.51.100.23"))
+				third := s.postLDAPSTSWithHeaders(c, "missing-user-c", "nottherightpassword", singleHeader("X-Real-IP", "203.0.113.10"))
+
+				if first.StatusCode != http.StatusBadRequest {
+					c.Fatalf("expected first trusted-proxy LDAP STS auth failure to return %d, got %d body: %s", http.StatusBadRequest, first.StatusCode, first.Body)
+				}
+				if second.StatusCode != http.StatusBadRequest {
+					c.Fatalf("expected a different forwarded client IP behind the same trusted proxy to avoid source throttling, got %d body: %s", second.StatusCode, second.Body)
+				}
+				if third.StatusCode != http.StatusTooManyRequests {
+					c.Fatalf("expected the same forwarded client IP behind the trusted proxy to be throttled with %d, got %d body: %s", http.StatusTooManyRequests, third.StatusCode, third.Body)
+				}
+			},
+		)
+	})
+}
+
+func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*TestSuiteIAM, *check, string)
+	}{
+		{
+			name: "AuthFailureUniformResponse",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSAuthFailureUniformResponse(c)
+			},
+		},
+		{
+			name: "RateLimit",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSRateLimit(c)
+			},
+		},
+		{
+			name: "SuccessDoesNotConsumeRateLimit",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSSuccessDoesNotConsumeRateLimit(c)
+			},
+		},
+		{
+			name: "UpstreamFailure",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSUpstreamFailure(c)
+			},
+		},
+		{
+			name: "TrustedProxyRateLimit",
+			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+				suite.TestLDAPSTSTrustedProxyRateLimit(c)
+			},
+		},
+	}
+
+	for i, testCase := range iamTestSuites {
+		t.Run(
+			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
+			func(t *testing.T) {
+				ldapServer := os.Getenv(EnvTestLDAPServer)
+				if ldapServer == "" {
+					t.Skipf("Skipping LDAP security test as no LDAP server is provided via %s", EnvTestLDAPServer)
+				}
+
+				suite := testCase
+				for _, tc := range tests {
+					tc := tc
+					t.Run(tc.name, func(t *testing.T) {
+						c := &check{t, testCase.serverType}
+						suite.SetUpSuite(c)
+						suite.SetUpLDAP(c, ldapServer)
+						tc.run(suite, c, ldapServer)
+						suite.TearDownSuite(c)
+					})
+				}
+			},
+		)
+	}
+}
+
 // This test is for a fix added to handle non-normalized base DN values in the
 // LDAP configuration. It runs the existing LDAP sub-tests with a non-normalized
 // LDAP configuration.
@@ -1049,6 +1395,578 @@ func TestIAMExportImportWithLDAP(t *testing.T) {
 				}
 			},
 		)
+	}
+}
+
+type matchingAuthError struct{}
+
+func (matchingAuthError) Error() string {
+	return "ldap auth failed"
+}
+
+func (matchingAuthError) Is(target error) bool {
+	return targetIsLDAPAuthFailure(target)
+}
+
+func targetIsLDAPAuthFailure(target error) bool {
+	return target != nil && target.Error() == "ldap authentication failed"
+}
+
+func TestSTSLDAPLoginRateLimiter(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
+
+	if !limiter.Allow("192.0.2.10") {
+		t.Fatal("expected first attempt to be allowed")
+	}
+	if !limiter.Allow("192.0.2.10") {
+		t.Fatal("expected second attempt within burst to be allowed")
+	}
+	if limiter.Allow("192.0.2.10") {
+		t.Fatal("expected source IP bucket to be throttled after burst")
+	}
+
+	// A different source IP has its own independent bucket, so one client
+	// cannot exhaust another's budget (no per-username lockout dimension).
+	if !limiter.Allow("192.0.2.11") {
+		t.Fatal("expected a different source IP to be allowed")
+	}
+
+	// An empty source IP cannot be identified and must never be throttled,
+	// otherwise all such requests would collapse into one shared bucket.
+	if !limiter.Allow("") || !limiter.Allow("") {
+		t.Fatal("expected unidentified source to stay unthrottled")
+	}
+}
+
+func TestSTSLDAPLoginRateLimiterReserveCancel(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+
+	reservation := limiter.Reserve("192.0.2.10")
+	if reservation == nil {
+		t.Fatal("expected first reservation to succeed")
+	}
+	if limiter.Reserve("192.0.2.10") != nil {
+		t.Fatal("expected second reservation on the same source IP to be throttled before cancel")
+	}
+
+	reservation.Cancel()
+
+	reservation = limiter.Reserve("192.0.2.10")
+	if reservation == nil {
+		t.Fatal("expected canceled reservation to restore source-IP capacity")
+	}
+	reservation.Cancel()
+
+	reservation = limiter.Reserve("192.0.2.11")
+	if reservation == nil {
+		t.Fatal("expected a different source IP to have independent capacity")
+	}
+	reservation.Cancel()
+}
+
+func TestSTSLDAPLoginKeyLimiterCancelDoesNotOverCreditAfterRefill(t *testing.T) {
+	set := newSTSLDAPLoginKeyLimiterSet(10*time.Millisecond, 2, time.Minute)
+	start := time.Unix(0, 0)
+
+	first := set.Reserve(start, "192.0.2.10")
+	if first == nil {
+		t.Fatal("expected first reservation to succeed")
+	}
+	second := set.Reserve(start.Add(5*time.Millisecond), "192.0.2.10")
+	if second == nil {
+		t.Fatal("expected second reservation to succeed while one token remains available")
+	}
+
+	first.CancelAt(start.Add(10 * time.Millisecond))
+
+	third := set.Reserve(start.Add(10*time.Millisecond), "192.0.2.10")
+	if third == nil {
+		t.Fatal("expected canceled reservation to restore exactly one slot")
+	}
+	defer third.CancelAt(start.Add(10 * time.Millisecond))
+
+	if extra := set.Reserve(start.Add(10*time.Millisecond), "192.0.2.10"); extra != nil {
+		extra.CancelAt(start.Add(10 * time.Millisecond))
+		t.Fatal("expected only one slot to be restored after cancel; got over-credit from refill")
+	}
+
+	second.CancelAt(start.Add(10 * time.Millisecond))
+}
+
+func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 4, time.Minute)
+
+	const workers = 8
+	start := make(chan struct{})
+	finish := make(chan struct{})
+	var wg sync.WaitGroup
+	var reserveWG sync.WaitGroup
+	reservations := make([]*stsLDAPLoginReservation, workers)
+	var canceledReservations atomic.Int32
+
+	reserveWG.Add(workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+
+			reservations[worker] = limiter.Reserve("192.0.2.10")
+			reserveWG.Done()
+			if reservations[worker] == nil {
+				return
+			}
+
+			<-finish
+			if worker%2 == 0 {
+				canceledReservations.Add(1)
+				reservations[worker].Cancel()
+				return
+			}
+
+			reservations[worker].Commit()
+		}(i)
+	}
+
+	close(start)
+	reserveWG.Wait()
+
+	successfulReservations := 0
+	for _, reservation := range reservations {
+		if reservation != nil {
+			successfulReservations++
+		}
+	}
+	if got := successfulReservations; got != 4 {
+		t.Fatalf("expected exactly 4 successful concurrent reservations, got %d", got)
+	}
+
+	close(finish)
+	wg.Wait()
+
+	remainingBudget := 0
+	for {
+		reservation := limiter.Reserve("192.0.2.10")
+		if reservation == nil {
+			break
+		}
+		remainingBudget++
+		reservation.Commit()
+	}
+
+	if want, got := int(canceledReservations.Load()), remainingBudget; got != want {
+		t.Fatalf("expected %d tokens to remain after concurrent commit/cancel mix, got %d", want, got)
+	}
+}
+
+func TestGetSTSLDAPLoginSourceIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{name: "empty", remoteAddr: "", want: ""},
+		{name: "ipv4", remoteAddr: "192.0.2.10:9000", want: "192.0.2.10"},
+		{name: "ipv6", remoteAddr: "[2001:db8::10]:9000", want: "2001:db8::10"},
+		{name: "bare-host", remoteAddr: "192.0.2.10", want: "192.0.2.10"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{RemoteAddr: tt.remoteAddr}
+			if got := getSTSLDAPLoginSourceIP(req); got != tt.want {
+				t.Fatalf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestGetSTSLDAPLoginSourceIPIgnoresSpoofedForwardingHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerKey   string
+		headerValue string
+	}{
+		{
+			name:        "x-forwarded-for",
+			headerKey:   "X-Forwarded-For",
+			headerValue: "203.0.113.10, 198.51.100.24",
+		},
+		{
+			name:        "x-real-ip",
+			headerKey:   "X-Real-IP",
+			headerValue: "203.0.113.10",
+		},
+		{
+			name:        "forwarded",
+			headerKey:   "Forwarded",
+			headerValue: `for=203.0.113.10;proto=https`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{
+				Header:     singleHeader(tt.headerKey, tt.headerValue),
+				RemoteAddr: "192.0.2.10:9000",
+			}
+
+			if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
+				t.Fatalf("expected helper to ignore spoofed %s and return peer address, got %q", tt.headerKey, got)
+			}
+		})
+	}
+}
+
+func TestGetSTSLDAPLoginSourceIPUsesForwardedHeadersForTrustedProxy(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerKey   string
+		headerValue string
+		want        string
+	}{
+		{
+			name:        "x-forwarded-for",
+			headerKey:   "X-Forwarded-For",
+			headerValue: "203.0.113.10",
+			want:        "203.0.113.10",
+		},
+		{
+			name:        "x-real-ip",
+			headerKey:   "X-Real-IP",
+			headerValue: "203.0.113.10",
+			want:        "203.0.113.10",
+		},
+	}
+
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.headerValue),
+					RemoteAddr: "192.0.2.10:9000",
+				}
+
+				if got := getSTSLDAPLoginSourceIP(req); got != tt.want {
+					t.Fatalf("expected trusted proxy header %s to resolve %q, got %q", tt.headerKey, tt.want, got)
+				}
+			})
+		}
+	})
+}
+
+// A client behind a trusted, appending proxy can prepend a spoofed left-most
+// X-Forwarded-For value. The right-to-left walk must skip only trusted hops and
+// return the real (right-most untrusted) client, ignoring the spoofed value.
+func TestGetSTSLDAPLoginSourceIPTrustedProxyStripsSpoofedForwardedFor(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     singleHeader("X-Forwarded-For", "1.2.3.4, 198.51.100.50"),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		if got := getSTSLDAPLoginSourceIP(req); got != "198.51.100.50" {
+			t.Fatalf("expected spoofed left-most XFF entry to be ignored and real client returned, got %q", got)
+		}
+	})
+}
+
+// When several hops in the chain are trusted proxies, the walk skips all of
+// them and resolves the left-most (real client) address.
+func TestGetSTSLDAPLoginSourceIPTrustedProxyWalksMultipleTrustedHops(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     singleHeader("X-Forwarded-For", "203.0.113.10, 192.0.2.20, 192.0.2.21"),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		if got := getSTSLDAPLoginSourceIP(req); got != "203.0.113.10" {
+			t.Fatalf("expected walk to skip trusted hops and return real client, got %q", got)
+		}
+	})
+}
+
+// The RFC 7239 Forwarded header is not honored for trusted-proxy bucketing; such
+// requests fall back to the safe peer-address bucket.
+func TestGetSTSLDAPLoginSourceIPTrustedProxyIgnoresForwardedHeader(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     singleHeader("Forwarded", `for=203.0.113.10;proto=https`),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
+			t.Fatalf("expected RFC 7239 Forwarded to be ignored and peer address used, got %q", got)
+		}
+	})
+}
+
+func TestGetSTSLDAPLoginSourceIPTrustedProxyPrefersXRealIPOverXForwardedFor(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     make(http.Header),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		req.Header.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.10")
+		req.Header.Set("X-Real-IP", "203.0.113.10")
+
+		if got := getSTSLDAPLoginSourceIP(req); got != "203.0.113.10" {
+			t.Fatalf("expected trusted proxy path to prefer X-Real-IP over appended X-Forwarded-For, got %q", got)
+		}
+	})
+}
+
+// X-Real-IP is trusted verbatim (it cannot be chain-validated like X-Forwarded-For),
+// so a client-supplied X-Real-IP that the proxy fails to overwrite wins even over a
+// correctly appended X-Forwarded-For chain. This locks the documented deployment
+// contract: the trusted proxy MUST overwrite X-Real-IP, otherwise it is a spoofing
+// vector. If this assertion ever changes, the change must be deliberate.
+func TestGetSTSLDAPLoginSourceIPTrustedProxyTrustsXRealIPVerbatim(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{
+			Header:     make(http.Header),
+			RemoteAddr: "192.0.2.10:9000",
+		}
+		// Attacker spoofs X-Real-IP with a value that appears nowhere in the XFF
+		// chain; the trusted proxy still appends the real client (198.51.100.50).
+		// The spoofed X-Real-IP wins, so the result can only have come from it.
+		req.Header.Set("X-Real-IP", "10.10.10.10")
+		req.Header.Set("X-Forwarded-For", "1.1.1.1, 198.51.100.50")
+
+		if got := getSTSLDAPLoginSourceIP(req); got != "10.10.10.10" {
+			t.Fatalf("expected verbatim X-Real-IP trust (spoofable contract), got %q", got)
+		}
+	})
+}
+
+func TestGetSTSLDAPLoginSourceIPTrustedProxyFallsBackToPeerWithoutForwardingHeaders(t *testing.T) {
+	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+		req := &http.Request{RemoteAddr: "192.0.2.10:9000"}
+		if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
+			t.Fatalf("expected trusted proxy path without forwarding headers to fall back to peer address, got %q", got)
+		}
+	})
+}
+
+func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerKey   string
+		firstValue  string
+		secondValue string
+	}{
+		{
+			name:        "x-forwarded-for",
+			headerKey:   "X-Forwarded-For",
+			firstValue:  "203.0.113.10",
+			secondValue: "198.51.100.23, 198.51.100.24",
+		},
+		{
+			name:        "x-real-ip",
+			headerKey:   "X-Real-IP",
+			firstValue:  "203.0.113.10",
+			secondValue: "198.51.100.23",
+		},
+		{
+			name:        "forwarded",
+			headerKey:   "Forwarded",
+			firstValue:  `for=203.0.113.10;proto=https`,
+			secondValue: `for=198.51.100.23;proto=https`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"-same-peer", func(t *testing.T) {
+			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
+			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
+				req1 := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
+					RemoteAddr: "192.0.2.10:9000",
+					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
+				}
+				req2 := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.secondValue),
+					RemoteAddr: "192.0.2.10:9001",
+					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
+				}
+
+				reservation1 := reserveSTSLDAPLogin(req1)
+				if reservation1 == nil {
+					t.Fatal("expected first reservation to succeed")
+				}
+				defer reservation1.Cancel()
+
+				reservation2 := reserveSTSLDAPLogin(req2)
+				if reservation2 == nil {
+					t.Fatal("expected second reservation to succeed with shared source bucket capacity")
+				}
+				defer reservation2.Cancel()
+
+				if got := len(limiter.source.entries); got != 1 {
+					t.Fatalf("expected requests from the same peer address to share one source bucket, got %d", got)
+				}
+				if _, ok := limiter.source.entries["192.0.2.10"]; !ok {
+					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.10", limiter.source.entries)
+				}
+			})
+		})
+
+		t.Run(tt.name+"-different-peers", func(t *testing.T) {
+			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
+				req1 := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
+					RemoteAddr: "192.0.2.10:9000",
+					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
+				}
+				req2 := &http.Request{
+					Header:     singleHeader(tt.headerKey, tt.firstValue),
+					RemoteAddr: "192.0.2.11:9000",
+					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
+				}
+
+				reservation1 := reserveSTSLDAPLogin(req1)
+				if reservation1 == nil {
+					t.Fatal("expected first reservation to succeed")
+				}
+				defer reservation1.Cancel()
+
+				reservation2 := reserveSTSLDAPLogin(req2)
+				if reservation2 == nil {
+					t.Fatal("expected second reservation from a different peer address to succeed")
+				}
+				defer reservation2.Cancel()
+
+				if got := len(limiter.source.entries); got != 2 {
+					t.Fatalf("expected requests from different peer addresses to use different source buckets, got %d", got)
+				}
+				if _, ok := limiter.source.entries["192.0.2.10"]; !ok {
+					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.10", limiter.source.entries)
+				}
+				if _, ok := limiter.source.entries["192.0.2.11"]; !ok {
+					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.11", limiter.source.entries)
+				}
+			})
+		})
+	}
+}
+
+func TestReserveSTSLDAPLoginUsesForwardedBucketsForTrustedProxy(t *testing.T) {
+	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+	withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
+		withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+			req1 := &http.Request{
+				Header:     singleHeader("X-Forwarded-For", "203.0.113.10"),
+				RemoteAddr: "192.0.2.10:9000",
+				Form:       url.Values{stsLDAPUsername: []string{"alice"}},
+			}
+			req2 := &http.Request{
+				Header:     singleHeader("X-Forwarded-For", "198.51.100.23"),
+				RemoteAddr: "192.0.2.10:9001",
+				Form:       url.Values{stsLDAPUsername: []string{"bob"}},
+			}
+
+			reservation1 := reserveSTSLDAPLogin(req1)
+			if reservation1 == nil {
+				t.Fatal("expected first reservation through trusted proxy to succeed")
+			}
+			defer reservation1.Cancel()
+
+			reservation2 := reserveSTSLDAPLogin(req2)
+			if reservation2 == nil {
+				t.Fatal("expected forwarded client IPs behind the same trusted proxy to use distinct source buckets")
+			}
+			defer reservation2.Cancel()
+
+			if got := len(limiter.source.entries); got != 2 {
+				t.Fatalf("expected distinct forwarded client IPs to use two source buckets, got %d", got)
+			}
+			if _, ok := limiter.source.entries["203.0.113.10"]; !ok {
+				t.Fatalf("expected source bucket for forwarded client IP %q, got keys %v", "203.0.113.10", limiter.source.entries)
+			}
+			if _, ok := limiter.source.entries["198.51.100.23"]; !ok {
+				t.Fatalf("expected source bucket for forwarded client IP %q, got keys %v", "198.51.100.23", limiter.source.entries)
+			}
+		})
+	})
+}
+
+func TestLDAPBindErrorToSTS(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		code    STSErrorCode
+		message string
+	}{
+		{
+			name:    "auth failure",
+			err:     matchingAuthError{},
+			code:    ErrSTSInvalidParameterValue,
+			message: errLDAPAuthenticationFailed.Error(),
+		},
+		{
+			name:    "upstream failure",
+			err:     errors.New("ldap server unavailable"),
+			code:    ErrSTSUpstreamError,
+			message: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, err := ldapBindErrorToSTS(tt.err)
+			if code != tt.code {
+				t.Fatalf("expected code %v, got %v", tt.code, code)
+			}
+			if tt.message == "" {
+				if err != nil {
+					t.Fatalf("expected nil response error, got %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.message {
+				t.Fatalf("expected %q, got %v", tt.message, err)
+			}
+		})
+	}
+}
+
+func TestSTSLDAPLoginRateLimiterCleanup(t *testing.T) {
+	set := newSTSLDAPLoginKeyLimiterSet(time.Hour, 1, time.Minute)
+	start := time.Unix(0, 0)
+
+	if !set.Allow(start, "old-key") {
+		t.Fatal("expected initial key to be allowed")
+	}
+	if len(set.entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(set.entries))
+	}
+
+	if !set.Allow(start.Add(2*time.Minute), "new-key") {
+		t.Fatal("expected new key to be allowed after ttl expiry")
+	}
+	if _, ok := set.entries["old-key"]; ok {
+		t.Fatal("expected expired key to be cleaned up")
+	}
+}
+
+func TestWriteSTSThrottledResponse(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://minio.test", strings.NewReader(""))
+	rr := httptest.NewRecorder()
+	req = req.WithContext(newContext(req, rr, "test-throttle"))
+
+	writeSTSThrottledResponse(rr)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected status %d, got %d", http.StatusTooManyRequests, rr.Code)
+	}
+	if got := rr.Header().Get("Retry-After"); got != "6" {
+		t.Fatalf("expected Retry-After header %q, got %q", "6", got)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "<Code>ThrottlingException</Code>") {
+		t.Fatalf("expected throttling code in response, got %s", body)
+	}
+	if !strings.Contains(body, "<Message>Request throttled, please retry later.</Message>") {
+		t.Fatalf("expected throttling message in response, got %s", body)
 	}
 }
 

@@ -17,6 +17,10 @@
 
 package json
 
+import "errors"
+
+var errLineTooLong = errors.New("line exceeds maximum allowed length")
+
 type s3Error struct {
 	code       string
 	message    string
@@ -57,6 +61,15 @@ func errJSONParsingError(err error) *s3Error {
 	return &s3Error{
 		code:       "JSONParsingError",
 		message:    "Encountered an error parsing the JSON file. Check the file and try again.",
+		statusCode: 400,
+		cause:      err,
+	}
+}
+
+func errOverMaxRecordSize(err error) *s3Error {
+	return &s3Error{
+		code:       "OverMaxRecordSize",
+		message:    "The length of a record in the input or result is greater than maxCharsPerRecord of 1 MB.",
 		statusCode: 400,
 		cause:      err,
 	}

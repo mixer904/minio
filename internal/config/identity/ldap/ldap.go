@@ -30,6 +30,42 @@ import (
 	xldap "github.com/minio/pkg/v3/ldap"
 )
 
+var errAuthentication = errors.New("ldap authentication failed")
+
+func isUserDNNotFoundError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "user dn not found for")
+}
+
+// authError marks authentication failures without changing the returned
+// message, so callers can distinguish auth failures from upstream outages.
+type authError struct {
+	err error
+}
+
+func (e authError) Error() string {
+	return e.err.Error()
+}
+
+func (e authError) Unwrap() error {
+	return e.err
+}
+
+func (e authError) Is(target error) bool {
+	return target == errAuthentication
+}
+
+func wrapAuthError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return authError{err: err}
+}
+
+// IsAuthError reports whether err is an LDAP authentication failure.
+func IsAuthError(err error) bool {
+	return errors.Is(err, errAuthentication)
+}
+
 // LookupUserDN searches for the full DN and groups of a given short/login
 // username.
 func (l *Config) LookupUserDN(username string) (*xldap.DNSearchResult, []string, error) {
@@ -86,7 +122,7 @@ func (l *Config) GetValidatedDNForUsername(username string) (*xldap.DNSearchResu
 		// the directory.
 		bindDN, err := l.LDAP.LookupUsername(conn, username)
 		if err != nil {
-			if strings.Contains(err.Error(), "User DN not found for") {
+			if isUserDNNotFoundError(err) {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("Unable to find user DN: %w", err)
@@ -204,7 +240,7 @@ func (l *Config) GetValidatedDNWithGroups(username string) (*xldap.DNSearchResul
 		// the directory.
 		lookupRes, err = l.LDAP.LookupUsername(conn, username)
 		if err != nil {
-			if strings.Contains(err.Error(), "User DN not found for") {
+			if isUserDNNotFoundError(err) {
 				return nil, nil, nil
 			}
 			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
@@ -245,6 +281,9 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 	lookupResult, err := l.LDAP.LookupUsername(conn, username)
 	if err != nil {
 		errRet := fmt.Errorf("Unable to find user DN: %w", err)
+		if isUserDNNotFoundError(err) {
+			return nil, nil, wrapAuthError(errRet)
+		}
 		return nil, nil, errRet
 	}
 
@@ -252,7 +291,7 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 	err = conn.Bind(lookupResult.ActualDN, password)
 	if err != nil {
 		errRet := fmt.Errorf("LDAP auth failed for DN %s: %w", lookupResult.ActualDN, err)
-		return nil, nil, errRet
+		return nil, nil, wrapAuthError(errRet)
 	}
 
 	// Bind to the lookup user account again to perform group search.

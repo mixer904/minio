@@ -70,6 +70,100 @@ func (w *testResponseWriter) WriteHeader(statusCode int) {
 func (w *testResponseWriter) Flush() {
 }
 
+func evaluateSelectForTest(t *testing.T, requestXML, input []byte) ([]byte, error) {
+	t.Helper()
+
+	s3Select, err := NewS3Select(bytes.NewReader(requestXML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s3Select.Open(newBytesRSC(input)); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &testResponseWriter{}
+	s3Select.Evaluate(w)
+	s3Select.Close()
+
+	resp := http.Response{
+		StatusCode:    http.StatusOK,
+		Body:          io.NopCloser(bytes.NewReader(w.response)),
+		ContentLength: int64(len(w.response)),
+	}
+	res, err := minio.NewSelectResults(&resp, "testbucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Close()
+
+	return io.ReadAll(res)
+}
+
+func TestJSONLinesRejectsOversizedRecord(t *testing.T) {
+	requestXML := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT id from S3Object s</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <JSON>
+            <Type>LINES</Type>
+        </JSON>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+</SelectObjectContentRequest>`)
+
+	input := []byte(`{"id":1}` + "\n" + `{"id":2,"pad":"` + strings.Repeat("a", maxRecordSize) + `"}`)
+	got, err := evaluateSelectForTest(t, requestXML, input)
+	if err == nil {
+		t.Fatal("expected OverMaxRecordSize error")
+	}
+	if !strings.Contains(err.Error(), "OverMaxRecordSize") {
+		t.Fatalf("expected OverMaxRecordSize error, got %v", err)
+	}
+	if gotS := strings.TrimSpace(string(got)); gotS != `{"id":1}` {
+		t.Fatalf("expected records before oversized record to be returned, got %q", gotS)
+	}
+}
+
+func TestEvaluatePreservesSelectErrorEvents(t *testing.T) {
+	requestXML := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT * from S3Object</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CompressionType>NONE</CompressionType>
+        <JSON>
+            <Type>LINES</Type>
+        </JSON>
+    </InputSerialization>
+    <OutputSerialization>
+        <JSON>
+        </JSON>
+    </OutputSerialization>
+    <RequestProgress>
+        <Enabled>FALSE</Enabled>
+    </RequestProgress>
+</SelectObjectContentRequest>`)
+
+	_, err := evaluateSelectForTest(t, requestXML, []byte("{bad}\n"))
+	if err == nil {
+		t.Fatal("expected JSONParsingError")
+	}
+	if !strings.Contains(err.Error(), "JSONParsingError") {
+		t.Fatalf("expected JSONParsingError, got %v", err)
+	}
+	if strings.Contains(err.Error(), "InternalError") {
+		t.Fatalf("select error was folded into InternalError: %v", err)
+	}
+}
+
 func TestJSONQueries(t *testing.T) {
 	input := `{"id": 0,"title": "Test Record","desc": "Some text","synonyms": ["foo", "bar", "whatever"]}
 	{"id": 1,"title": "Second Record","desc": "another text","synonyms": ["some", "synonym", "value"]}

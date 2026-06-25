@@ -42,6 +42,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	ioutilx "github.com/minio/minio/internal/ioutil"
@@ -59,6 +60,47 @@ const (
 	BadMD5
 	MissingUploadID
 )
+
+func replicationSSEPoisonHeaders() map[string]string {
+	return map[string]string{
+		"X-Minio-Replication-Server-Side-Encryption-Sealed-Key":     base64.StdEncoding.EncodeToString(make([]byte, 64)),
+		"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm": crypto.SealAlgorithm,
+		"X-Minio-Replication-Server-Side-Encryption-Iv":             base64.StdEncoding.EncodeToString(make([]byte, 32)),
+	}
+}
+
+func assertObjectMetadataKeysAbsent(t *testing.T, metadata map[string]string, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		if got, ok := metadata[key]; ok {
+			t.Fatalf("expected metadata %q to be absent, got %q", key, got)
+		}
+	}
+}
+
+func assertObjectMetadataValueNotEqual(t *testing.T, metadata map[string]string, key, unexpected string) {
+	t.Helper()
+	if got := metadata[key]; got == unexpected {
+		t.Fatalf("expected metadata %q to differ from %q", key, unexpected)
+	}
+}
+
+func assertObjectContents(t *testing.T, obj ObjectLayer, bucketName, objectName string, expected []byte) {
+	t.Helper()
+	reader, err := obj.GetObjectNInfo(context.Background(), bucketName, objectName, nil, nil, ObjectOptions{})
+	if err != nil {
+		t.Fatalf("failed to fetch object %s/%s: %v", bucketName, objectName, err)
+	}
+	defer reader.Close()
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("failed to read object %s/%s: %v", bucketName, objectName, err)
+	}
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("unexpected object contents: got %d bytes, expected %d bytes", len(got), len(expected))
+	}
+}
 
 // Wrapper for calling HeadObject API handler tests for both Erasure multiple disks and FS single drive setup.
 func TestAPIHeadObjectHandler(t *testing.T) {
@@ -1819,6 +1861,53 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 	}
 }
 
+func TestAPIPutObjectReplicationHeaderPoisoning(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecExtendedObjectLayerAPITest(t, testAPIPutObjectReplicationHeaderPoisoning, []string{"PutObject"})
+}
+
+func testAPIPutObjectReplicationHeaderPoisoning(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
+	credentials auth.Credentials, t *testing.T,
+) {
+	objectName := "replication-header-poison-put"
+	payload := []byte("replication-header-poison-put-payload")
+	headers := replicationSSEPoisonHeaders()
+
+	req, err := newTestSignedRequestV4(
+		http.MethodPut,
+		getPutObjectURL("", bucketName, objectName),
+		int64(len(payload)),
+		bytes.NewReader(payload),
+		credentials.AccessKey,
+		credentials.SecretKey,
+		headers,
+	)
+	if err != nil {
+		t.Fatalf("%s: failed to create signed put request: %v", instanceType, err)
+	}
+
+	rec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: expected put to succeed, got %d", instanceType, rec.Code)
+	}
+
+	objInfo, err := obj.GetObjectInfo(context.Background(), bucketName, objectName, ObjectOptions{})
+	if err != nil {
+		t.Fatalf("%s: failed to fetch object info: %v", instanceType, err)
+	}
+
+	assertObjectMetadataValueNotEqual(t, objInfo.UserDefined,
+		crypto.MetaSealedKeySSEC,
+		headers["X-Minio-Replication-Server-Side-Encryption-Sealed-Key"],
+	)
+	assertObjectMetadataValueNotEqual(t, objInfo.UserDefined,
+		crypto.MetaIV,
+		headers["X-Minio-Replication-Server-Side-Encryption-Iv"],
+	)
+	assertObjectContents(t, obj, bucketName, objectName, payload)
+}
+
 // Wrapper for calling Copy Object Part API handler tests for both Erasure multiple disks and single node setup.
 func TestAPICopyObjectPartHandler(t *testing.T) {
 	defer DetectTestLeak(t)()
@@ -2858,6 +2947,74 @@ func testAPINewMultipartHandlerParallel(obj ObjectLayer, instanceType, bucketNam
 			t.Fatalf("Invalid UploadID: <ERROR> %s", err)
 		}
 	}
+}
+
+func TestAPICopyObjectReplicationHeaderPoisoning(t *testing.T) {
+	defer DetectTestLeak(t)()
+	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectReplicationHeaderPoisoning, []string{"CopyObject", "PutObject"})
+}
+
+func testAPICopyObjectReplicationHeaderPoisoning(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
+	credentials auth.Credentials, t *testing.T,
+) {
+	srcObject := "replication-header-poison-copy-src"
+	dstObject := "replication-header-poison-copy-dst"
+	payload := []byte("replication-header-poison-copy-payload")
+
+	if _, err := obj.PutObject(
+		context.Background(),
+		bucketName,
+		srcObject,
+		mustGetPutObjReader(t, bytes.NewReader(payload), int64(len(payload)), "", ""),
+		ObjectOptions{},
+	); err != nil {
+		t.Fatalf("%s: failed to create source object: %v", instanceType, err)
+	}
+
+	headers := replicationSSEPoisonHeaders()
+	headers[xhttp.AmzCopySource] = url.QueryEscape(SlashSeparator + bucketName + SlashSeparator + srcObject)
+	headers[xhttp.AmzMetadataDirective] = replaceDirective
+	headers[xhttp.AmzBucketReplicationStatus] = "PENDING"
+	headers["Content-Type"] = "application/octet-stream"
+
+	req, err := newTestSignedRequestV4(
+		http.MethodPut,
+		getCopyObjectURL("", bucketName, dstObject),
+		0,
+		nil,
+		credentials.AccessKey,
+		credentials.SecretKey,
+		headers,
+	)
+	if err != nil {
+		t.Fatalf("%s: failed to create signed copy request: %v", instanceType, err)
+	}
+
+	rec := httptest.NewRecorder()
+	apiRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: expected copy to succeed, got %d", instanceType, rec.Code)
+	}
+
+	objInfo, err := obj.GetObjectInfo(context.Background(), bucketName, dstObject, ObjectOptions{})
+	if err != nil {
+		t.Fatalf("%s: failed to fetch copied object info: %v", instanceType, err)
+	}
+
+	assertObjectMetadataValueNotEqual(t, objInfo.UserDefined,
+		crypto.MetaSealedKeySSEC,
+		headers["X-Minio-Replication-Server-Side-Encryption-Sealed-Key"],
+	)
+	assertObjectMetadataValueNotEqual(t, objInfo.UserDefined,
+		crypto.MetaIV,
+		headers["X-Minio-Replication-Server-Side-Encryption-Iv"],
+	)
+	assertObjectMetadataKeysAbsent(t, objInfo.UserDefined,
+		xhttp.AmzBucketReplicationStatus,
+		ReservedMetadataPrefixLower+ReplicaStatus,
+		ReservedMetadataPrefixLower+ReplicaTimestamp,
+	)
+	assertObjectContents(t, obj, bucketName, dstObject, payload)
 }
 
 // The UploadID from the response body is parsed and its existence is asserted with an attempt to ListParts using it.
