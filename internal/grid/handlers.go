@@ -698,6 +698,11 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) PutRequest(r Req) {
 // These should be returned by the caller.
 func (h *StreamTypeHandler[Payload, Req, Resp]) PutResponse(r Resp) {
 	if r != h.nilResp {
+		if rc, ok := any(r).(Recycler); ok {
+			// Recycled stream responses must not leak fields
+			// from a previous use into the next response.
+			rc.Recycle()
+		}
 		//nolint:staticcheck // SA6002 IT IS A GENERIC VALUE! (and always a pointer)
 		h.respPool.Put(r)
 	}
