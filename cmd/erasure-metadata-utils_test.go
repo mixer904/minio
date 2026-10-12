@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -107,6 +108,35 @@ func TestReduceErrs(t *testing.T) {
 		if gotNewErr != errErasureWriteQuorum {
 			t.Errorf("Test %d : expected %s, got %s", i+1, errErasureWriteQuorum, gotErr)
 		}
+	}
+}
+
+// TestReduceWriteQuorumErrsCommitMetaMissing verifies that an in-quorum
+// errCommitMetaMissing reduces to the sentinel, which renameData() converts
+// to errErasureWriteQuorum, while below-quorum reduces directly to
+// errErasureWriteQuorum.
+func TestReduceWriteQuorumErrsCommitMetaMissing(t *testing.T) {
+	errs := make([]error, 16)
+	for i := range 9 {
+		errs[i] = errCommitMetaMissing
+	}
+	if err := reduceWriteQuorumErrs(t.Context(), errs, objectOpIgnoredErrs, 9); !errors.Is(err, errCommitMetaMissing) {
+		t.Errorf("expected %s, got %s", errCommitMetaMissing, err)
+	}
+	// The sentinel must be distinguishable from errFileNotFound so that
+	// commit failures are never mapped to ObjectNotFound (404).
+	if errors.Is(errCommitMetaMissing, errFileNotFound) {
+		t.Error("errCommitMetaMissing must not match errFileNotFound")
+	}
+
+	// Below quorum the reduction must yield a write-quorum failure (503);
+	// eight sentinels against eight committed drives is not a quorum.
+	belowQuorum := make([]error, 16)
+	for i := range 8 {
+		belowQuorum[i] = errCommitMetaMissing
+	}
+	if err := reduceWriteQuorumErrs(t.Context(), belowQuorum, objectOpIgnoredErrs, 9); !errors.Is(err, errErasureWriteQuorum) {
+		t.Errorf("expected %s, got %s", errErasureWriteQuorum, err)
 	}
 }
 
