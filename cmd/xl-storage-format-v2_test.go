@@ -38,6 +38,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/tinylib/msgp/msgp"
 )
 
 func TestReadXLMetaNoData(t *testing.T) {
@@ -1189,4 +1190,69 @@ func BenchmarkToFileInfoNoParts(b *testing.B) {
 
 func BenchmarkToFileInfoWithParts(b *testing.B) {
 	benchmarkManyPartsOptionally(b, true)
+}
+
+// TestXLMetaV2HeaderLegacyUnmarshalResetsEc checks that decoding legacy
+// version headers, which carry no erasure metadata fields, cannot leak
+// stale EcN/EcM values from a previously decoded object into the same
+// structure.
+func TestXLMetaV2HeaderLegacyUnmarshalResetsEc(t *testing.T) {
+	base := xlMetaV2VersionHeader{
+		VersionID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		ModTime:   time.Now().Unix(),
+		Signature: [4]byte{1, 2, 3, 4},
+		Type:      ObjectType,
+		Flags:     xlFlagInlineData,
+	}
+
+	// Legacy V2 header wire format: 5 fields, no EcN/EcM.
+	var legacy []byte
+	legacy = msgp.AppendArrayHeader(legacy, 5)
+	legacy = msgp.AppendBytes(legacy, base.VersionID[:])
+	legacy = msgp.AppendInt64(legacy, base.ModTime)
+	legacy = msgp.AppendBytes(legacy, base.Signature[:])
+	legacy = msgp.AppendUint8(legacy, uint8(base.Type))
+	legacy = msgp.AppendUint8(legacy, uint8(base.Flags))
+
+	header := base
+	header.EcN, header.EcM = 4, 8
+	x2 := xlMetaV2VersionHeaderV2{xlMetaV2VersionHeader: &header}
+	if _, err := x2.UnmarshalMsg(legacy); err != nil {
+		t.Fatalf("legacy V2 header unmarshal failed: %v", err)
+	}
+	if header.EcN != 0 || header.EcM != 0 {
+		t.Fatalf("stale erasure metadata leaked across objects: EcN %d, EcM %d", header.EcN, header.EcM)
+	}
+
+	// V1 headers (4 fields, never released) must zero the fields too.
+	var v1 []byte
+	v1 = msgp.AppendArrayHeader(v1, 4)
+	v1 = msgp.AppendBytes(v1, base.VersionID[:])
+	v1 = msgp.AppendInt64(v1, base.ModTime)
+	v1 = msgp.AppendUint8(v1, uint8(base.Type))
+	v1 = msgp.AppendUint8(v1, uint8(base.Flags))
+
+	header = base
+	header.EcN, header.EcM = 4, 8
+	if _, err := header.unmarshalV1(v1); err != nil {
+		t.Fatalf("legacy V1 header unmarshal failed: %v", err)
+	}
+	if header.EcN != 0 || header.EcM != 0 {
+		t.Fatalf("stale erasure metadata leaked on V1 decode: EcN %d, EcM %d", header.EcN, header.EcM)
+	}
+
+	// Current headers must keep their erasure metadata.
+	current := base
+	current.EcN, current.EcM = 4, 8
+	wire, err := current.MarshalMsg(nil)
+	if err != nil {
+		t.Fatalf("header marshal failed: %v", err)
+	}
+	decoded := base
+	if _, err := decoded.UnmarshalMsg(wire); err != nil {
+		t.Fatalf("header unmarshal failed: %v", err)
+	}
+	if decoded.EcN != 4 || decoded.EcM != 8 {
+		t.Fatalf("erasure metadata lost on current decode: EcN %d, EcM %d", decoded.EcN, decoded.EcM)
+	}
 }
