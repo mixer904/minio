@@ -1234,11 +1234,15 @@ func TestXLMetaV2HeaderLegacyUnmarshalResetsEc(t *testing.T) {
 
 	header = base
 	header.EcN, header.EcM = 4, 8
+	header.Signature = [4]byte{9, 9, 9, 9}
 	if _, err := header.unmarshalV1(v1); err != nil {
 		t.Fatalf("legacy V1 header unmarshal failed: %v", err)
 	}
 	if header.EcN != 0 || header.EcM != 0 {
 		t.Fatalf("stale erasure metadata leaked on V1 decode: EcN %d, EcM %d", header.EcN, header.EcM)
+	}
+	if header.Signature != ([4]byte{}) {
+		t.Fatalf("stale signature leaked on V1 decode: %v", header.Signature)
 	}
 
 	// Current headers must keep their erasure metadata.
