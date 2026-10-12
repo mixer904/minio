@@ -140,6 +140,49 @@ func TestReduceWriteQuorumErrsCommitMetaMissing(t *testing.T) {
 	}
 }
 
+// renameDataFailingDisk is a StorageAPI stub returning a fixed error
+// from RenameData, enough to drive renameData() in unit tests.
+type renameDataFailingDisk struct {
+	StorageAPI
+	err error
+}
+
+func (d *renameDataFailingDisk) RenameData(context.Context, string, string, FileInfo, string, string, RenameOptions) (RenameDataResp, error) {
+	return RenameDataResp{}, d.err
+}
+
+func (d *renameDataFailingDisk) DeleteVersion(context.Context, string, string, FileInfo, bool, DeleteOptions) error {
+	return nil
+}
+
+// TestRenameDataCommitMetaMissing verifies that renameData() converts an
+// in-quorum errCommitMetaMissing into errErasureWriteQuorum (HTTP 503),
+// while an in-quorum errFileNotFound keeps its meaning so that
+// PutObject() still reports IncompleteBody for client disconnects.
+func TestRenameDataCommitMetaMissing(t *testing.T) {
+	metadata := make([]FileInfo, 16)
+	for i := range metadata {
+		metadata[i] = FileInfo{Deleted: true} // valid without erasure info
+	}
+
+	disks := make([]StorageAPI, 16)
+	for i := range disks {
+		disks[i] = &renameDataFailingDisk{err: errCommitMetaMissing}
+	}
+	_, _, _, err := renameData(t.Context(), disks, minioMetaTmpBucket, "tmp", metadata, "bucket", "object", 9)
+	if !errors.Is(err, errErasureWriteQuorum) {
+		t.Fatalf("expected %s for in-quorum commit failure, got %v", errErasureWriteQuorum, err)
+	}
+
+	for i := range disks {
+		disks[i] = &renameDataFailingDisk{err: errFileNotFound}
+	}
+	_, _, _, err = renameData(t.Context(), disks, minioMetaTmpBucket, "tmp", metadata, "bucket", "object", 9)
+	if !errors.Is(err, errFileNotFound) {
+		t.Fatalf("expected %s for in-quorum staging failure, got %v", errFileNotFound, err)
+	}
+}
+
 // TestHashOrder - test order of ints in array
 func TestHashOrder(t *testing.T) {
 	testCases := []struct {
