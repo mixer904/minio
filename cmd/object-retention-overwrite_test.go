@@ -25,9 +25,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -299,4 +302,245 @@ func TestPoolsObjectLockOverwrite(t *testing.T) {
 			})
 		}
 	}
+}
+
+type planReviewGatedBody struct {
+	io.ReadCloser
+	first   sync.Once
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (g *planReviewGatedBody) Read(p []byte) (int, error) {
+	g.first.Do(func() { close(g.ready); <-g.release })
+	return g.ReadCloser.Read(p)
+}
+
+func TestPlanReviewSlowDirectoryPut(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		makeBucketOptions: MakeBucketOptions{VersioningEnabled: true, LockEnabled: true},
+		objAPITest: func(obj ObjectLayer, instance, bucket string, router http.Handler, root auth.Credentials, t *testing.T) {
+			writer := newObjectAttributesAuthzUser(t, instance, bucket, `"s3:PutObject"`)
+			t.Run(instance, func(t *testing.T) {
+				key := "slow-body-directory/"
+				before, err := obj.PutObject(t.Context(), bucket, key, mustGetPutObjReader(t, bytes.NewBufferString("original"), 8, "", ""), ObjectOptions{Versioned: true, VersionID: nullVersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte("replacement-body")
+				req, err := newTestSignedRequestV4(http.MethodPut, makeTestTargetURL("", bucket, key, nil), int64(len(payload)), bytes.NewReader(payload), writer.AccessKey, writer.SecretKey, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gate := &planReviewGatedBody{ReadCloser: req.Body, ready: make(chan struct{}), release: make(chan struct{})}
+				req.Body = gate
+				var once sync.Once
+				release := func() { once.Do(func() { close(gate.release) }) }
+				defer release()
+				rec := httptest.NewRecorder()
+				done := make(chan struct{})
+				go func() { router.ServeHTTP(rec, req); close(done) }()
+				select {
+				case <-gate.ready:
+				case <-done:
+					t.Fatalf("PUT finished before body: %d %s", rec.Code, rec.Body.String())
+				case <-time.After(5 * time.Second):
+					t.Fatal("PUT did not reach body read")
+				}
+				locked := make(chan int, 1)
+				go func() {
+					locked <- putRetention(t, router, root, bucket, key, nullVersionID, "COMPLIANCE", UTCNow().Add(365*24*time.Hour), false)
+				}()
+				select {
+				case status := <-locked:
+					if status != http.StatusOK {
+						t.Fatalf("set lock while body paused: %d", status)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("retention update blocked behind paused body")
+				}
+				release()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("PUT did not finish")
+				}
+				after, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: nullVersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusBadRequest || after.ETag != before.ETag || objectlock.GetObjectRetentionMeta(after.UserDefined).Mode != objectlock.RetCompliance {
+					t.Fatal("paused ordinary PUT overwrote the COMPLIANCE null version after the lock was acknowledged")
+				}
+			})
+		},
+	})
+}
+
+type planReviewReadFault struct {
+	ObjectLayer
+	key       string
+	fired     bool
+	putCalled bool
+}
+
+func (p *planReviewReadFault) GetObjectInfo(ctx context.Context, bucket, key string, opts ObjectOptions) (ObjectInfo, error) {
+	if key == p.key && opts.VersionID == nullVersionID && !p.fired {
+		p.fired = true
+		return ObjectInfo{}, InsufficientReadQuorum{}
+	}
+	return p.ObjectLayer.GetObjectInfo(ctx, bucket, key, opts)
+}
+
+func (p *planReviewReadFault) PutObject(ctx context.Context, bucket, key string, data *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
+	if key == p.key {
+		p.putCalled = true
+	}
+	return p.ObjectLayer.PutObject(ctx, bucket, key, data, opts)
+}
+
+func TestPlanReviewPreflightReadFailure(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		makeBucketOptions: MakeBucketOptions{VersioningEnabled: true, LockEnabled: true},
+		objAPITest: func(obj ObjectLayer, instance, bucket string, router http.Handler, _ auth.Credentials, t *testing.T) {
+			writer := newObjectAttributesAuthzUser(t, instance, bucket, `"s3:PutObject"`)
+			t.Run(instance, func(t *testing.T) {
+				key := "locked-directory-read-fault/"
+				_, err := obj.PutObject(t.Context(), bucket, key, mustGetPutObjReader(t, bytes.NewBufferString("original"), 8, "", ""), ObjectOptions{
+					Versioned: true, VersionID: nullVersionID, ReplicationRequest: true,
+					UserDefined: map[string]string{
+						strings.ToLower(xhttp.AmzObjectLockMode):            "COMPLIANCE",
+						strings.ToLower(xhttp.AmzObjectLockRetainUntilDate): amztime.ISO8601Format(UTCNow().Add(365 * 24 * time.Hour)),
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				initial, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: nullVersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fault := &planReviewReadFault{ObjectLayer: obj, key: key}
+				setObjectLayer(fault)
+				defer setObjectLayer(obj)
+				rec := retentionAuthzRequest(t, router, writer, http.MethodPut, makeTestTargetURL("", bucket, key, nil), []byte("replacement"), nil)
+				if !fault.fired {
+					t.Fatal("preflight fault was not injected")
+				}
+				if fault.putCalled {
+					t.Fatal("preflight read error allowed PutObject to proceed to storage layer")
+				}
+				after, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: nullVersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code < 400 {
+					t.Errorf("metadata read quorum error was treated as absence: status=%d", rec.Code)
+				}
+				retentionOverwriteUnchanged(t, initial, after)
+			})
+		},
+	})
+}
+
+func TestPlanReviewLegacyMPUCompliance(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		makeBucketOptions: MakeBucketOptions{VersioningEnabled: true, LockEnabled: true},
+		objAPITest: func(obj ObjectLayer, instance, bucket string, router http.Handler, root auth.Credentials, t *testing.T) {
+			writer := newObjectAttributesAuthzUser(t, instance, bucket, `"s3:PutObject"`)
+			t.Run(instance, func(t *testing.T) {
+				key := "legacy-mpu-compliance"
+				initial, err := obj.PutObject(t.Context(), bucket, key, mustGetPutObjReader(t, bytes.NewBufferString("original"), 8, "", ""), ObjectOptions{Versioned: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				up, err := obj.NewMultipartUpload(t.Context(), bucket, key, ObjectOptions{Versioned: true, VersionID: initial.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte("replacement-part")
+				part, err := obj.PutObjectPart(t.Context(), bucket, key, up.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(payload), int64(len(payload)), "", ""), ObjectOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status := putRetention(t, router, root, bucket, key, initial.VersionID, "COMPLIANCE", UTCNow().Add(365*24*time.Hour), false); status != http.StatusOK {
+					t.Fatalf("set compliance: %d", status)
+				}
+				before, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: initial.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := fmt.Appendf(nil, `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part></CompleteMultipartUpload>`, part.ETag)
+				rec := retentionAuthzRequest(t, router, writer, http.MethodPost, makeTestTargetURL("", bucket, key, url.Values{"uploadId": {up.UploadID}}), body, nil)
+				after, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: initial.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusForbidden {
+					t.Errorf("legacy upload replaced locked UUID: status=%d", rec.Code)
+				}
+				retentionOverwriteUnchanged(t, before, after)
+			})
+		},
+	})
+}
+
+// A recovered upload retains an authentic server-generated version ID while a
+// surviving replica reintroduces its already-completed version and lock.
+// Only the fixture uses replication privileges; completion uses PutObject only.
+func TestRecoveredMultipartUploadAfterReplica(t *testing.T) {
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
+		t:                 t,
+		makeBucketOptions: MakeBucketOptions{VersioningEnabled: true, LockEnabled: true},
+		objAPITest: func(obj ObjectLayer, instance, bucket string, router http.Handler, root auth.Credentials, t *testing.T) {
+			writer := newObjectAttributesAuthzUser(t, instance, bucket, `"s3:PutObject"`)
+			t.Run(instance, func(t *testing.T) {
+				z := obj.(*erasureServerPools)
+				key := "recovered-generated-upload"
+				up, err := obj.NewMultipartUpload(t.Context(), bucket, key, ObjectOptions{Versioned: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				er := z.serverPools[0].getHashedSet(key)
+				fi, _, err := er.checkUploadIDExists(t.Context(), bucket, key, up.UploadID, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = obj.PutObject(t.Context(), bucket, key,
+					mustGetPutObjReader(t, bytes.NewBufferString("protected-original"), 18, "", ""),
+					ObjectOptions{Versioned: true, VersionID: fi.VersionID, ReplicationRequest: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status := putRetention(t, router, root, bucket, key, fi.VersionID, "COMPLIANCE", UTCNow().Add(365*24*time.Hour), false); status != http.StatusOK {
+					t.Fatalf("setting compliance lock: %d", status)
+				}
+				before, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: fi.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				partRec := retentionAuthzRequest(t, router, writer, http.MethodPut,
+					makeTestTargetURL("", bucket, key, url.Values{"uploadId": {up.UploadID}, "partNumber": {"1"}}),
+					[]byte("attacker-replacement"), nil)
+				if partRec.Code != http.StatusOK {
+					t.Fatalf("upload part: %d %s", partRec.Code, partRec.Body.String())
+				}
+				etag := multipartConditionResponseETag(partRec)
+				body := []byte(multipartConditionCompleteBody([]CompletePart{{PartNumber: 1, ETag: etag}}))
+				rec := retentionAuthzRequest(t, router, writer, http.MethodPost,
+					makeTestTargetURL("", bucket, key, url.Values{"uploadId": {up.UploadID}}), body, nil)
+				after, err := obj.GetObjectInfo(t.Context(), bucket, key, ObjectOptions{VersionID: fi.VersionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusForbidden {
+					t.Errorf("recovered upload bypassed existing UUID guard: status=%d", rec.Code)
+				}
+				retentionOverwriteUnchanged(t, before, after)
+			})
+		},
+	})
 }

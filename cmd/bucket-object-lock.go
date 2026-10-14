@@ -332,7 +332,12 @@ func checkPutObjectLockAllowed(ctx context.Context, rq *http.Request, bucket, ob
 	}
 
 	if opts.VersionID != "" && !replicaTrusted {
-		if objInfo, err := getObjectInfoFn(ctx, bucket, object, opts); err == nil {
+		objInfo, err := getObjectInfoFn(ctx, bucket, object, opts)
+		if err != nil {
+			if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) && !errors.As(err, &MethodNotAllowed{}) {
+				return mode, retainDate, legalHold, toAPIErrorCode(ctx, err)
+			}
+		} else {
 			r := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
 			t, err := objectlock.UTCNowNTP()
 			if err != nil {
