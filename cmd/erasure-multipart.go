@@ -174,6 +174,23 @@ func (er erasureObjects) deleteAll(ctx context.Context, bucket, prefix string) {
 	wg.Wait()
 }
 
+// extractModTimeFromUploadIDDir extracts creation time from the upload ID directory on disk.
+// On-disk directory names are of the form <UUID>x<UnixNano>.
+// For compatibility with legacy or encoded representations, if the directory is Base64 encoded,
+// it decodes the name before parsing.
+func extractModTimeFromUploadIDDir(uploadIDDir string) time.Time {
+	target := uploadIDDir
+	if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil && strings.Contains(string(b64), "x") {
+		target = string(b64)
+	}
+	if split := strings.Split(target, "x"); len(split) == 2 {
+		if t, err := strconv.ParseInt(split[1], 10, 64); err == nil {
+			return time.Unix(0, t)
+		}
+	}
+	return time.Time{}
+}
+
 // Remove the old multipart uploads on the given disk.
 func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk StorageAPI) {
 	drivePath := disk.Endpoint().Path
@@ -181,16 +198,7 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 	readDirFn(pathJoin(drivePath, minioMetaMultipartBucket), func(shaDir string, typ os.FileMode) error {
 		readDirFn(pathJoin(drivePath, minioMetaMultipartBucket, shaDir), func(uploadIDDir string, typ os.FileMode) error {
 			uploadIDPath := pathJoin(shaDir, uploadIDDir)
-			var modTime time.Time
-			// Upload IDs are of the form base64_url(<UUID>x<UnixNano>), we can extract the time from the UUID.
-			if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil {
-				if split := strings.Split(string(b64), "x"); len(split) == 2 {
-					t, err := strconv.ParseInt(split[1], 10, 64)
-					if err == nil {
-						modTime = time.Unix(0, t)
-					}
-				}
-			}
+			modTime := extractModTimeFromUploadIDDir(uploadIDDir)
 			// Fallback for older uploads without time in the ID.
 			if modTime.IsZero() {
 				wait := deleteMultipartCleanupSleeper.Timer(ctx)
