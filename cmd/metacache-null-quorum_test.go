@@ -596,7 +596,7 @@ func TestListFallbackDoesNotTrustNotFound(t *testing.T) {
 func TestListCrossParityMinorityStaysVisible(t *testing.T) {
 	z, bucket, router := nullQuorumBackend(t)
 	set := z.serverPools[0].sets[0]
-	disks := set.getDisks()
+	disks, switchDisks := installListingDiskSwitch(set)
 	const object = "object"
 	mtime := time.Now().UTC().Add(-time.Hour)
 
@@ -619,7 +619,7 @@ func TestListCrossParityMinorityStaysVisible(t *testing.T) {
 	for i := 12; i < len(online); i++ {
 		online[i] = &offlineNullQuorumDisk{StorageAPI: disks[i]}
 	}
-	set.getDisks = func() []StorageAPI { return online }
+	switchDisks(online)
 	if code := nullQuorumRequest(t, router, http.MethodHead, getHeadObjectURL("", bucket, object)).Code; code == http.StatusNotFound {
 		t.Errorf("HEAD with a node away: 404 for an existing object")
 	}
@@ -627,7 +627,7 @@ func TestListCrossParityMinorityStaysVisible(t *testing.T) {
 		t.Errorf("ListObjectsV2 with a node away: got %d %v; want 200 [%s]", code, keys, object)
 	}
 
-	set.getDisks = func() []StorageAPI { return disks }
+	switchDisks(disks)
 	if get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object)); get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), g1Body) {
 		t.Fatalf("GET after the node returns: %d", get.Code)
 	}

@@ -191,19 +191,19 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			return entries, err
 		}
 		entries.truncate(0)
-		go func() {
-			rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+		rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+		go func(o listPathOptions) {
 			if rpc != nil {
 				ctx, cancel := context.WithTimeout(GlobalContext, 5*time.Second)
 				defer cancel()
-				c, err := rpc.GetMetacacheListing(ctx, *o)
+				c, err := rpc.GetMetacacheListing(ctx, o)
 				if err == nil {
 					c.error = "no longer used"
 					c.status = scanStateError
 					rpc.UpdateMetacacheListing(ctx, *c)
 				}
 			}
-		}()
+		}(*o)
 		o.ID = ""
 	}
 

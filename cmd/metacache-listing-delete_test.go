@@ -33,6 +33,7 @@ func TestListFallbackPreservesPoolDeleteMarker(t *testing.T) {
 			z, bucket, router := listingPoolsBackend(t)
 			ctx := t.Context()
 			live, deleted := z.serverPools[1-markerPool].sets[0], z.serverPools[markerPool].sets[0]
+			disks, switchDisks := installListingDiskSwitch(deleted)
 			const object = "gone"
 			body := bytes.Repeat([]byte{'a'}, 8192)
 			oldTime := time.Now().UTC().Add(-time.Hour)
@@ -42,7 +43,6 @@ func TestListFallbackPreservesPoolDeleteMarker(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			disks := deleted.getDisks()
 			old := make([][]byte, 3)
 			for i := range old {
 				old[i] = mustReadNullQuorumMeta(t, disks[i], bucket, object)
@@ -69,7 +69,7 @@ func TestListFallbackPreservesPoolDeleteMarker(t *testing.T) {
 			for i := 8; i < len(walkers); i++ {
 				walkers[i] = &failedMetadataWalkDisk{StorageAPI: disks[i]}
 			}
-			deleted.getDisks = func() []StorageAPI { return walkers }
+			switchDisks(walkers)
 			fi, _, _, err := deleted.getObjectFileInfo(ctx, bucket, object, ObjectOptions{}, false)
 			if err != nil || !fi.Deleted {
 				t.Fatalf("read fallback marker: %+v %v", fi, err)

@@ -116,6 +116,8 @@ func TestListingMergeDoesNotSkipFailedPool(t *testing.T) {
 	defer cancel()
 	z, bucket, router := listingPoolsBackend(t)
 	broken, healthy := z.serverPools[0].sets[0], z.serverPools[1].sets[0]
+	brokenDisks, switchBrokenDisks := installListingDiskSwitch(broken)
+	healthyDisks, switchHealthyDisks := installListingDiskSwitch(healthy)
 	body := bytes.Repeat([]byte{'a'}, 8192)
 	mtime := time.Now().UTC().Add(-time.Hour)
 	put := func(set *erasureObjects, name string, tm time.Time) {
@@ -135,7 +137,6 @@ func TestListingMergeDoesNotSkipFailedPool(t *testing.T) {
 		t.Fatalf("first page HTTP=%d body=%s", first.Code, first.Body.String())
 	}
 	firstToken := page.NextContinuationToken
-	brokenDisks := broken.getDisks()
 	old := make([][]byte, 3)
 	for i := range old {
 		old[i] = mustReadNullQuorumMeta(t, brokenDisks[i], bucket, "e")
@@ -154,14 +155,14 @@ func TestListingMergeDoesNotSkipFailedPool(t *testing.T) {
 			brokenWalkers[i] = &failedMetadataWalkDisk{StorageAPI: brokenWalkers[i]}
 		}
 	}
-	broken.getDisks = func() []StorageAPI { return brokenWalkers }
+	switchBrokenDisks(brokenWalkers)
 	resume := make(chan struct{})
 	defer close(resume)
-	healthyWalkers := slices.Clone(healthy.getDisks())
+	healthyWalkers := slices.Clone(healthyDisks)
 	for i, disk := range healthyWalkers {
 		healthyWalkers[i] = &listingPausedTailDisk{StorageAPI: disk, bucket: bucket, tail: "zz", resume: resume, blocked: &blocked, active: &active}
 	}
-	healthy.getDisks = func() []StorageAPI { return healthyWalkers }
+	switchHealthyDisks(healthyWalkers)
 
 	target := getListObjectsV2URL("", bucket, "", "2", "", "", "") + "&continuation-token=" + url.QueryEscape(firstToken)
 	req, err := newTestSignedRequestV4(http.MethodGet, target, 0, nil, globalActiveCred.AccessKey, globalActiveCred.SecretKey, nil)
