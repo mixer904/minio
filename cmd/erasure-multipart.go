@@ -174,6 +174,24 @@ func (er erasureObjects) deleteAll(ctx context.Context, bucket, prefix string) {
 	wg.Wait()
 }
 
+// extractModTimeFromUploadIDDir extracts creation time from the upload ID directory on disk.
+// On-disk directory names are of the form <UUID>x<UnixNano>.
+// Parse the native format first: plaintext UUIDs can also be valid Base64.
+// Preserve the previous encoded-format parser for compatibility.
+func extractModTimeFromUploadIDDir(uploadIDDir string) time.Time {
+	if modTime, ok := multipartUploadTime(uploadIDDir); ok {
+		return modTime
+	}
+	if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil {
+		if split := strings.Split(string(b64), "x"); len(split) == 2 {
+			if t, err := strconv.ParseInt(split[1], 10, 64); err == nil {
+				return time.Unix(0, t)
+			}
+		}
+	}
+	return time.Time{}
+}
+
 // Remove the old multipart uploads on the given disk.
 func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk StorageAPI) {
 	drivePath := disk.Endpoint().Path
@@ -181,16 +199,7 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 	readDirFn(pathJoin(drivePath, minioMetaMultipartBucket), func(shaDir string, typ os.FileMode) error {
 		readDirFn(pathJoin(drivePath, minioMetaMultipartBucket, shaDir), func(uploadIDDir string, typ os.FileMode) error {
 			uploadIDPath := pathJoin(shaDir, uploadIDDir)
-			var modTime time.Time
-			// Upload IDs are of the form base64_url(<UUID>x<UnixNano>), we can extract the time from the UUID.
-			if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil {
-				if split := strings.Split(string(b64), "x"); len(split) == 2 {
-					t, err := strconv.ParseInt(split[1], 10, 64)
-					if err == nil {
-						modTime = time.Unix(0, t)
-					}
-				}
-			}
+			modTime := extractModTimeFromUploadIDDir(uploadIDDir)
 			// Fallback for older uploads without time in the ID.
 			if modTime.IsZero() {
 				wait := deleteMultipartCleanupSleeper.Timer(ctx)
@@ -1694,6 +1703,32 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
+	}
+
+	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if fi.VersionID == "" || fi.VersionID == nullVersionID {
+			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
+				return oi, toObjectErr(err, bucket, object)
+			}
+		} else {
+			_, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
+				VersionID:        fi.VersionID,
+				Versioned:        opts.Versioned,
+				VersionSuspended: opts.VersionSuspended,
+				NoLock:           true,
+			})
+			switch {
+			case gerr == nil, errors.As(gerr, &MethodNotAllowed{}):
+				return oi, toObjectErr(errAuthentication, bucket, object)
+			case isErrVersionNotFound(gerr) || isErrObjectNotFound(gerr):
+			default:
+				return oi, toObjectErr(gerr, bucket, object)
+			}
+		}
 	}
 
 	er.cleanupMultipartPath(ctx, paths...) // cleanup all part.N.meta, and skipped part.N's before final rename().

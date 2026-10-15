@@ -162,7 +162,7 @@ func toObjectErr(oerr error, params ...string) error {
 			apiErr.Type = v.Type
 		}
 		return apiErr
-	case errErasureWriteQuorum.Error():
+	case errErasureWriteQuorum.Error(), errCommitMetaMissing.Error():
 		apiErr := InsufficientWriteQuorum{}
 		if len(params) >= 1 {
 			apiErr.Bucket = params[0]

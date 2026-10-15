@@ -150,6 +150,17 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		}
 	}
 
+	if !dstOpts.ReplicationRequest && !dstOpts.ReplicaLockReconcile && !dstOpts.DataMovement &&
+		(versionID == "" || versionID == nullVersionID) {
+		getObjectInfo := er.getObjectInfo
+		if dstOpts.replicaObjectInfo != nil {
+			getObjectInfo = dstOpts.replicaObjectInfo
+		}
+		if err := checkObjectLockedForOverwrite(ctx, dstBucket, dstObject, getObjectInfo); err != nil {
+			return oi, toObjectErr(err, dstBucket, dstObject)
+		}
+	}
+
 	modTime = UTCNow() // We only preserve modTime if dstOpts.MTime is true.
 	// in all other cases mtime is latest.
 
@@ -1072,6 +1083,12 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 	errs := g.Wait()
 
 	err := reduceWriteQuorumErrs(ctx, errs, objectOpIgnoredErrs, writeQuorum)
+	if errors.Is(err, errCommitMetaMissing) {
+		// Commit metadata went missing on a quorum of drives; the write
+		// did not commit. Return a 503 class error so clients retry
+		// instead of treating the object as absent (404).
+		err = errErasureWriteQuorum
+	}
 	if err != nil {
 		dg := errgroup.WithNErrs(len(disks))
 		for index, nerr := range errs {
@@ -1592,6 +1609,17 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		}
 		ctx = lkctx.Context()
 		defer lk.Unlock(lkctx)
+	}
+
+	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement &&
+		(fi.VersionID == "" || fi.VersionID == nullVersionID) {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
 	}
 
 	// Rename the successfully written temporary object to final location.
