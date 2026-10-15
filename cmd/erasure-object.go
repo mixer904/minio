@@ -1083,6 +1083,12 @@ func renameData(ctx context.Context, disks []StorageAPI, srcBucket, srcEntry str
 	errs := g.Wait()
 
 	err := reduceWriteQuorumErrs(ctx, errs, objectOpIgnoredErrs, writeQuorum)
+	if errors.Is(err, errCommitMetaMissing) {
+		// Commit metadata went missing on a quorum of drives; the write
+		// did not commit. Return a 503 class error so clients retry
+		// instead of treating the object as absent (404).
+		err = errErasureWriteQuorum
+	}
 	if err != nil {
 		dg := errgroup.WithNErrs(len(disks))
 		for index, nerr := range errs {
