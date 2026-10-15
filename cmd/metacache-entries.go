@@ -670,6 +670,12 @@ func (m *metaCacheEntriesSorted) forwardPast(s string) {
 // If the context is canceled the function will return the error,
 // otherwise the function will return nil.
 func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int) error {
+	return mergeEntryChannelsWithErrors(ctx, in, out, readQuorum, nil)
+}
+
+// terminalErr is inspected after each input closes and before the merger
+// advances beyond it. Callers must publish the error before closing the input.
+func mergeEntryChannelsWithErrors(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int, terminalErr func(int) error) error {
 	defer xioutil.SafeClose(out)
 	top := make([]*metaCacheEntry, len(in))
 	nDone := 0
@@ -683,6 +689,9 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 				return ctx.Err()
 			case v, ok := <-in[0]:
 				if !ok {
+					if terminalErr != nil {
+						return terminalErr(0)
+					}
 					return nil
 				}
 				select {
@@ -700,6 +709,11 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 			return ctx.Err()
 		case entry, ok := <-in[idx]:
 			if !ok {
+				if terminalErr != nil {
+					if err := terminalErr(idx); err != nil {
+						return err
+					}
+				}
 				top[idx] = nil
 				nDone++
 			} else {

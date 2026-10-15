@@ -264,6 +264,16 @@ func (z *erasureServerPools) listPathShortcutEOF(ctx context.Context, bucket str
 	return io.EOF
 }
 
+// listingNSLock chooses the namespace used by regular object writes.
+// Multiple pools serialize at the pools layer; single-pool PUT and GET use
+// the destination set. This keeps the existing single-pool lock routing.
+func (z *erasureServerPools) listingNSLock(er *erasureObjects) func(string, ...string) RWLocker {
+	if z.SinglePool() {
+		return er.NewNSLock
+	}
+	return z.NewNSLock
+}
+
 // listMerged will list across all sets and return a merged results stream.
 // The result channel is closed when no more results are expected.
 func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) error {
@@ -283,13 +293,16 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 			inputs = append(inputs, innerResults)
 			go func(i int, set *erasureObjects) {
 				defer wg.Done()
-				err := set.listPath(listCtx, o, innerResults)
+				err := set.listPath(listCtx, o, innerResults, z.listingNSLock(set))
 				mu.Lock()
-				defer mu.Unlock()
 				if err == nil {
 					allAtEOF = false
 				}
 				errs[i] = err
+				mu.Unlock()
+				// The merger must observe the terminal error before treating
+				// this stream as exhausted and advancing to another pool.
+				xioutil.SafeClose(innerResults)
 			}(len(errs), set)
 			errs = append(errs, nil)
 		}
@@ -298,7 +311,16 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 
 	// Gather results to a single channel.
 	// Quorum is one since we are merging across sets.
-	err := mergeEntryChannels(ctx, inputs, results, 1)
+	err := mergeEntryChannelsWithErrors(ctx, inputs, results, 1, func(i int) error {
+		mu.Lock()
+		err := errs[i]
+		mu.Unlock()
+		// Keep the existing aggregate handling of absent paths and buckets.
+		if errors.Is(err, io.EOF) || isAllNotFound([]error{err}) {
+			return nil
+		}
+		return err
+	})
 
 	cancelList()
 	wg.Wait()
@@ -415,13 +437,18 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 		cancel()
 	}()
 
-	// Do listing...
+	// Publish the typed terminal result before either consumer observes EOF.
+	// mergeEntryChannels closes inCh before listMerged has inspected set errors.
+	listingDone := make(chan struct{})
+	var listingErr error
 	go func(o listPathOptions) {
-		err := z.listMerged(listCtx, o, inCh)
-		if err != nil {
-			meta.setErr(err.Error())
+		listingErr = z.listMerged(listCtx, o, inCh)
+		if listingErr != nil && !errors.Is(listingErr, io.EOF) {
+			meta.setErr(listingErr.Error())
+			cancel()
 		}
-		o.debugln("listAndSave: listing", o.ID, "finished with ", err)
+		close(listingDone)
+		o.debugln("listAndSave: listing", o.ID, "finished with ", listingErr)
 	}(*o)
 
 	// Keep track of when we return since we no longer have to send entries to output.
@@ -451,6 +478,9 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 			entry.reusable = returned
 			saveCh <- entry
 		}
+		// Do not publish an end-of-stream cache block or a final response
+		// before the scan has recorded its terminal error.
+		<-listingDone
 		if !returned {
 			xioutil.SafeClose(outCh)
 		}
@@ -458,9 +488,19 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 	}()
 
 	entries, err = filteredResults()
-	if err == nil {
-		// Check if listing recorded an error.
-		err = meta.getErr()
+	if err == nil || errors.Is(err, io.EOF) {
+		// Full pages may return before the scan ends. A final page has
+		// crossed the completion barrier above and must preserve scan errors.
+		select {
+		case <-listingDone:
+			if listingErr != nil && !errors.Is(listingErr, io.EOF) {
+				return entries, listingErr
+			}
+		default:
+		}
+		if cacheErr := meta.getErr(); cacheErr != nil {
+			return entries, cacheErr
+		}
 	}
 	return entries, err
 }
