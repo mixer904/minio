@@ -18,14 +18,18 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestExtractModTimeFromUploadIDDir(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Millisecond)
+	now := time.Unix(1792056747, 123456789).UTC()
 	nano := now.UnixNano()
 	uuid := "d16ad42a-6fe5-4a3b-8092-69983142238f"
 
@@ -42,6 +46,13 @@ func TestExtractModTimeFromUploadIDDir(t *testing.T) {
 			wantZero:    false,
 		},
 		{
+			// This valid UUID decodes to bytes containing 'x'. Checking
+			// for that byte before parsing plaintext loses the timestamp.
+			name:        "Plaintext Also Decodes To Base64 Containing x",
+			dirName:     fmt.Sprintf("4eacd477-e733-4851-b821-6fd42785ff87x%d", nano),
+			expectedMod: now,
+		},
+		{
 			name:        "Legacy Format Without Timestamp (<UUID>)",
 			dirName:     uuid,
 			expectedMod: time.Time{},
@@ -54,10 +65,25 @@ func TestExtractModTimeFromUploadIDDir(t *testing.T) {
 			wantZero:    false,
 		},
 		{
+			name:        "Encoded Format With Deployment Prefix",
+			dirName:     base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%s.%sx%d", uuid, uuid, nano))),
+			expectedMod: now,
+		},
+		{
 			name:        "Malformed Suffix (<UUID>xinvalid)",
 			dirName:     fmt.Sprintf("%sxnotanumber", uuid),
 			expectedMod: time.Time{},
 			wantZero:    true,
+		},
+		{
+			name:     "Timestamp Overflow",
+			dirName:  uuid + "x9223372036854775808",
+			wantZero: true,
+		},
+		{
+			name:     "Malformed Plaintext UUID",
+			dirName:  fmt.Sprintf("not-a-uuidx%d", nano),
+			wantZero: true,
 		},
 		{
 			name:        "Empty Directory Name",
@@ -78,6 +104,73 @@ func TestExtractModTimeFromUploadIDDir(t *testing.T) {
 			}
 			if !got.Equal(tc.expectedMod) {
 				t.Fatalf("extractModTimeFromUploadIDDir(%q) = %v; want %v", tc.dirName, got, tc.expectedMod)
+			}
+		})
+	}
+}
+
+type multipartCleanupDisk struct {
+	StorageAPI
+	root    string
+	modTime time.Time
+	readErr error
+	reads   int
+}
+
+func (d *multipartCleanupDisk) Endpoint() Endpoint {
+	return Endpoint{URL: &url.URL{Path: d.root}}
+}
+
+func (d *multipartCleanupDisk) ReadVersion(context.Context, string, string, string, string, ReadOptions) (FileInfo, error) {
+	d.reads++
+	return FileInfo{ModTime: d.modTime}, d.readErr
+}
+
+func (d *multipartCleanupDisk) StatVol(context.Context, string) (VolInfo, error) {
+	return VolInfo{Created: time.Now()}, nil
+}
+
+func TestCleanupStaleUploadsOnDisk(t *testing.T) {
+	const uuid = "d16ad42a-6fe5-4a3b-8092-69983142238f"
+	expiry := globalAPIConfig.getStaleUploadsExpiry()
+	for _, tc := range []struct {
+		name, prefix string
+		age          time.Duration
+		legacy       bool
+		readErr      error
+		wantReads    int
+		wantDeleted  bool
+	}{
+		{name: "recent", prefix: uuid, age: expiry / 2, readErr: errFileNotFound},
+		{name: "plaintext_base64_collision", prefix: "4eacd477-e733-4851-b821-6fd42785ff87", age: expiry / 2, readErr: errFileNotFound},
+		{name: "expired", prefix: uuid, age: 2 * expiry, readErr: errFileNotFound, wantDeleted: true},
+		{name: "legacy_recent", prefix: uuid, age: expiry / 2, legacy: true, wantReads: 1},
+		{name: "legacy_expired", prefix: uuid, age: 2 * expiry, legacy: true, wantReads: 1, wantDeleted: true},
+		{name: "legacy_metadata_missing", prefix: uuid, age: 2 * expiry, legacy: true, readErr: errFileNotFound, wantReads: 1},
+		{name: "malformed_metadata_missing", prefix: "not-a-uuid", age: 2 * expiry, readErr: errFileNotFound, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			modTime := time.Now().Add(-tc.age)
+			id := tc.prefix
+			if !tc.legacy {
+				id = fmt.Sprintf("%sx%d", tc.prefix, modTime.UnixNano())
+			}
+			disk := &multipartCleanupDisk{root: t.TempDir(), modTime: modTime, readErr: tc.readErr}
+			uploadDir := filepath.Join(disk.root, minioMetaMultipartBucket, "sha", id)
+			if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+			if disk.reads != tc.wantReads {
+				t.Errorf("ReadVersion calls = %d, want %d", disk.reads, tc.wantReads)
+			}
+			_, err := os.Stat(uploadDir)
+			if tc.wantDeleted {
+				if !os.IsNotExist(err) {
+					t.Errorf("expired upload must be removed: %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("upload must be preserved: %v", err)
 			}
 		})
 	}

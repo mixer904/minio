@@ -176,16 +176,17 @@ func (er erasureObjects) deleteAll(ctx context.Context, bucket, prefix string) {
 
 // extractModTimeFromUploadIDDir extracts creation time from the upload ID directory on disk.
 // On-disk directory names are of the form <UUID>x<UnixNano>.
-// For compatibility with legacy or encoded representations, if the directory is Base64 encoded,
-// it decodes the name before parsing.
+// Parse the native format first: plaintext UUIDs can also be valid Base64.
+// Preserve the previous encoded-format parser for compatibility.
 func extractModTimeFromUploadIDDir(uploadIDDir string) time.Time {
-	target := uploadIDDir
-	if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil && strings.Contains(string(b64), "x") {
-		target = string(b64)
+	if modTime, ok := multipartUploadTime(uploadIDDir); ok {
+		return modTime
 	}
-	if split := strings.Split(target, "x"); len(split) == 2 {
-		if t, err := strconv.ParseInt(split[1], 10, 64); err == nil {
-			return time.Unix(0, t)
+	if b64, err := base64.RawURLEncoding.DecodeString(uploadIDDir); err == nil {
+		if split := strings.Split(string(b64), "x"); len(split) == 2 {
+			if t, err := strconv.ParseInt(split[1], 10, 64); err == nil {
+				return time.Unix(0, t)
+			}
 		}
 	}
 	return time.Time{}
