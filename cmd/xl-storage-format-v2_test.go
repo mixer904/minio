@@ -1214,14 +1214,34 @@ func TestXLMetaV2HeaderLegacyUnmarshalResetsEc(t *testing.T) {
 	legacy = msgp.AppendUint8(legacy, uint8(base.Type))
 	legacy = msgp.AppendUint8(legacy, uint8(base.Flags))
 
-	header := base
-	header.EcN, header.EcM = 4, 8
-	x2 := xlMetaV2VersionHeaderV2{xlMetaV2VersionHeader: &header}
-	if _, err := x2.UnmarshalMsg(legacy); err != nil {
-		t.Fatalf("legacy V2 header unmarshal failed: %v", err)
-	}
-	if header.EcN != 0 || header.EcM != 0 {
-		t.Fatalf("stale erasure metadata leaked across objects: EcN %d, EcM %d", header.EcN, header.EcM)
+	for _, decoder := range []string{"UnmarshalMsg", "DecodeMsg", "loadIndexed"} {
+		t.Run(decoder, func(t *testing.T) {
+			header := base
+			header.EcN, header.EcM = 4, 8
+			x2 := xlMetaV2VersionHeaderV2{xlMetaV2VersionHeader: &header}
+			var err error
+			switch decoder {
+			case "UnmarshalMsg":
+				_, err = x2.UnmarshalMsg(legacy)
+			case "DecodeMsg":
+				err = x2.DecodeMsg(msgp.NewReader(bytes.NewReader(legacy)))
+			case "loadIndexed":
+				indexed := msgp.AppendUint(nil, 2)
+				indexed = msgp.AppendUint(indexed, xlMetaVersion)
+				indexed = msgp.AppendInt(indexed, 1)
+				indexed = msgp.AppendBytes(indexed, legacy)
+				indexed = msgp.AppendBytes(indexed, nil)
+				xl := xlMetaV2{versions: []xlMetaV2ShallowVersion{{header: header}}}
+				err = xl.loadIndexed(indexed, nil)
+				header = xl.versions[0].header
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if header != base {
+				t.Fatalf("legacy header: got %+v, want %+v", header, base)
+			}
+		})
 	}
 
 	// V1 headers (4 fields, never released) must zero the fields too.
@@ -1232,7 +1252,7 @@ func TestXLMetaV2HeaderLegacyUnmarshalResetsEc(t *testing.T) {
 	v1 = msgp.AppendUint8(v1, uint8(base.Type))
 	v1 = msgp.AppendUint8(v1, uint8(base.Flags))
 
-	header = base
+	header := base
 	header.EcN, header.EcM = 4, 8
 	header.Signature = [4]byte{9, 9, 9, 9}
 	if _, err := header.unmarshalV1(v1); err != nil {

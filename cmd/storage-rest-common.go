@@ -83,13 +83,3 @@ type nsScannerResp struct {
 	Update *dataUsageEntry `msg:"u"`
 	Final  *dataUsageCache `msg:"f"`
 }
-
-// Recycle resets the response, so that recycled responses cannot
-// leak stale scanner data into a subsequent scan.
-func (r *nsScannerResp) Recycle() {
-	if r == nil {
-		return
-	}
-	r.Update = nil
-	r.Final = nil
-}
