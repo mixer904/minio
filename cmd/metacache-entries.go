@@ -781,6 +781,15 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 	}
 	last := ""
 	var toMerge []int
+	var directoryCollisions []int
+	discardDirectories := func() error {
+		for _, idx := range directoryCollisions {
+			if err := selectFrom(idx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	// Choose the best to return.
 	for {
@@ -790,6 +799,7 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 		best := top[0]
 		bestIdx := 0
 		toMerge = toMerge[:0]
+		directoryCollisions = directoryCollisions[:0]
 		for i, other := range top[1:] {
 			otherIdx := i + 1
 			if other == nil {
@@ -819,10 +829,9 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 						if serverDebugLog {
 							console.Debugln("mergeEntryChannels: discarding directory", other.name, "for object", best.name)
 						}
-						// Discard the directory.
-						if err := selectFrom(otherIdx); err != nil {
-							return err
-						}
+						// A pending object can resolve to absence. Keep the
+						// directory until the whole object group is confirmed.
+						directoryCollisions = append(directoryCollisions, otherIdx)
 						continue
 					}
 					// Replace directory with object.
@@ -838,6 +847,7 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 			}
 			if best.name > other.name {
 				toMerge = toMerge[:0]
+				directoryCollisions = directoryCollisions[:0]
 				best = other
 				bestIdx = otherIdx
 			}
@@ -866,6 +876,11 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 			if err != nil {
 				return err
 			}
+			if resolved != nil {
+				if err := discardDirectories(); err != nil {
+					return err
+				}
+			}
 			if resolved != nil && resolved.name > last {
 				select {
 				case <-ctxDone:
@@ -875,6 +890,9 @@ func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntr
 				}
 			}
 			continue
+		}
+		if err := discardDirectories(); err != nil {
+			return err
 		}
 
 		// Merge any unmerged
