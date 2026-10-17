@@ -450,7 +450,7 @@ const (
 	ErrAdminNoSecretKey
 
 	ErrIAMNotInitialized
-	ErrMultipartListingLegacy
+	ErrMultipartListingLegacy // Reserved: legacy uploads no longer block listing.
 	ErrMultipartListingIdentity
 	ErrSlowDown
 
@@ -2191,8 +2191,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	err = unwrapAll(err)
 
 	switch err {
-	case errMultipartListingLegacy:
-		apiErr = ErrMultipartListingLegacy
 	case errMultipartListingIdentity:
 		apiErr = ErrMultipartListingIdentity
 	case errCompleteMultipartChecksumMismatch, errCompleteMultipartChecksumTypeMismatch:
