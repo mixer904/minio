@@ -75,7 +75,7 @@ func TestListFallbackMultiPoolReadLock(t *testing.T) {
 	var readErr error
 	go func() {
 		defer close(done)
-		entry, readErr = set.resolveListEntry(ctx, bucket, entries, errs, &resolver, z.listingNSLock(set))
+		entry, readErr = z.resolveListingGroup(ctx, bucket, []*metaCacheEntry{set.resolveListEntry(entries, errs, &resolver)})
 	}()
 	waitForListingReadLock(t, z.serverPools[0].sets[0].nsMutex, bucket, object, done)
 	lock.Unlock(lkctx)

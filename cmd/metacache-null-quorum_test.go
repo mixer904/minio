@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -285,7 +286,7 @@ func TestListObjectsSingleNullQuorumHTTP(t *testing.T) {
 func TestListObjectsFallsBackToReadableMetadata(t *testing.T) {
 	z, bucket, router := nullQuorumBackend(t)
 	set := z.serverPools[0].sets[0]
-	disks := set.getDisks()
+	disks, switchDisks := installListingDiskSwitch(set)
 	const object = "object"
 	oldBody := bytes.Repeat([]byte{'a'}, 8192)
 	newBody := bytes.Repeat([]byte{'b'}, 8192)
@@ -317,7 +318,7 @@ func TestListObjectsFallsBackToReadableMetadata(t *testing.T) {
 			wrapped[i] = &failedMetadataWalkDisk{StorageAPI: disk}
 		}
 	}
-	set.getDisks = func() []StorageAPI { return wrapped }
+	switchDisks(wrapped)
 
 	rec := nullQuorumRequest(t, router, http.MethodGet, getListObjectsV2URL("", bucket, "", "1000", "", "", ""))
 	var list ListObjectsV2Response
@@ -333,6 +334,49 @@ func TestListObjectsFallsBackToReadableMetadata(t *testing.T) {
 	get := nullQuorumRequest(t, router, http.MethodGet, getGetObjectURL("", bucket, object))
 	if get.Code != http.StatusOK || !bytes.Equal(get.Body.Bytes(), newBody) {
 		t.Fatalf("GET lost the readable generation: %d %q", get.Code, get.Body.String())
+	}
+	// Walk uses a separate producer but must share the same latest-only pool
+	// recovery. Versioned walks retain their existing no-fallback behavior.
+	for _, latestOnly := range []bool{false, true} {
+		out := make(chan itemOrErr[ObjectInfo], 10)
+		if err := z.Walk(t.Context(), bucket, "", out, WalkOptions{LatestOnly: latestOnly, AskDisks: "strict"}); err != nil {
+			t.Fatal(err)
+		}
+		var objects []ObjectInfo
+		for result := range out {
+			if result.Err != nil {
+				t.Fatal(result.Err)
+			}
+			objects = append(objects, result.Item)
+		}
+		if latestOnly {
+			if len(objects) != 1 || objects[0].Name != object || !objects[0].ModTime.Equal(oldTime.Add(time.Minute)) {
+				t.Fatalf("Walk latest recovery: %+v", objects)
+			}
+		} else if len(objects) != 0 {
+			t.Fatalf("versioned Walk unexpectedly enabled recovery: %+v", objects)
+		}
+	}
+	failedDisks := slices.Clone(wrapped)
+	for i, disk := range failedDisks {
+		failedDisks[i] = &listingReadFailDisk{StorageAPI: disk, object: object, reads: &atomic.Int64{}}
+	}
+	switchDisks(failedDisks)
+	out := make(chan itemOrErr[ObjectInfo], 10)
+	if err := z.Walk(t.Context(), bucket, "", out, WalkOptions{LatestOnly: true, AskDisks: "strict"}); err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	for result := range out {
+		if result.Err == nil {
+			t.Fatalf("failed Walk yielded object: %+v", result.Item)
+		}
+		if isErrReadQuorum(result.Err) {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatal("failed Walk recovery did not report quorum error")
 	}
 }
 
@@ -548,7 +592,7 @@ func TestListSplitDirectoryObject(t *testing.T) {
 	}
 }
 
-func TestListFallbackDoesNotTrustNotFound(t *testing.T) {
+func TestListFallbackConfirmsCurrentAbsence(t *testing.T) {
 	z, bucket, _ := nullQuorumBackend(t)
 	set := z.serverPools[0].sets[0]
 	disks := set.getDisks()
@@ -582,9 +626,9 @@ func TestListFallbackDoesNotTrustNotFound(t *testing.T) {
 		errs[i] = errDiskNotFound
 	}
 	resolver := metadataResolutionParams{dirQuorum: 8, objQuorum: 8, bucket: bucket, requestedVersions: 1}
-	entry, err := set.resolveListEntry(t.Context(), bucket, entries, errs, &resolver, z.listingNSLock(set))
-	if entry != nil || !isErrReadQuorum(err) {
-		t.Fatalf("ambiguous not-found: got entry=%v err=%v; want read quorum error", entry, err)
+	entry, err := z.resolveListingGroup(t.Context(), bucket, []*metaCacheEntry{set.resolveListEntry(entries, errs, &resolver)})
+	if entry != nil || err != nil {
+		t.Fatalf("strict current absence: got entry=%v err=%v; want no entry or error", entry, err)
 	}
 }
 

@@ -422,63 +422,89 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		retryDelay    = 50 * time.Millisecond
 		retryDelay250 = 250 * time.Millisecond
 	)
+	var lastStateCheck time.Time
+	retryWait := func() error {
+		if contextCanceled(ctx) {
+			return ctx.Err()
+		}
+		// A failed producer cannot publish another block. Check on the first
+		// failure, then at most once per retry interval while it is still running.
+		if time.Since(lastStateCheck) >= retryDelay250 {
+			lastStateCheck = time.Now()
+			if err := o.checkMetacacheState(ctx, rpc); err != nil {
+				return fmt.Errorf("remote listing canceled: %w", err)
+			}
+		}
+		retries++
+		delay := retryDelay250
+		if retries == 1 {
+			delay = retryDelay
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+	// Probe one online disk per retry, rotating so a missing replica cannot
+	// pin the reader to one disk. A miss only delays the next probe: it never
+	// establishes absence or replaces the quorum read after a probe succeeds.
+	// This bounds missing-block I/O without sleeping once for every disk.
+	nextProbeDisk := 0
+	probePart := func(part int) bool {
+		disks := er.getDisks()
+		for range disks {
+			if contextCanceled(ctx) {
+				return false
+			}
+			i := nextProbeDisk % len(disks)
+			nextProbeDisk = i + 1
+			disk := disks[i]
+			if disk == nil || !disk.IsOnline() {
+				continue
+			}
+			_, err := disk.ReadVersion(ctx, "", minioMetaBucket, o.objectPath(part), "", ReadOptions{})
+			return err == nil
+		}
+		return false
+	}
 
+	retryOtherError := false
 	for {
 		if contextCanceled(ctx) {
 			return entries, ctx.Err()
 		}
 
-		// If many failures, check the cache state.
-		if retries > 10 {
-			err := o.checkMetacacheState(ctx, rpc)
-			if err != nil {
-				return entries, fmt.Errorf("remote listing canceled: %w", err)
-			}
-			retries = 1
-		}
-
 		// All operations are performed without locks, so we must be careful and allow for failures.
-		// Read metadata associated with the object from a disk.
-		if retries > 0 {
-			for _, disk := range er.getDisks() {
-				if disk == nil {
-					continue
-				}
-				if !disk.IsOnline() {
-					continue
-				}
-				_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
-					o.objectPath(0), "", ReadOptions{})
-				if err != nil {
-					time.Sleep(retryDelay250)
-					retries++
-					continue
-				}
-				break
+		if retries > 0 && !retryOtherError && !probePart(0) {
+			if err := retryWait(); err != nil {
+				return entries, err
 			}
-		}
-		retryWait := func() {
-			retries++
-			if retries == 1 {
-				time.Sleep(retryDelay)
-			} else {
-				time.Sleep(retryDelay250)
-			}
+			continue
 		}
 		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
+		retryOtherError = false
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
 			switch toObjectErr(err, minioMetaBucket, o.objectPath(0)).(type) {
 			case ObjectNotFound, InsufficientReadQuorum:
-				retryWait()
+				if err := retryWait(); err != nil {
+					return entries, err
+				}
 				continue
 			}
 			// Allow one fast retry for other errors.
 			if retries > 0 {
 				return entries, fmt.Errorf("reading first part metadata: %v", err)
 			}
-			retryWait()
+			retryOtherError = true
+			if err := retryWait(); err != nil {
+				return entries, err
+			}
 			continue
 		}
 
@@ -486,14 +512,9 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		switch {
 		case err == nil:
 		case errors.Is(err, io.ErrUnexpectedEOF):
-			if retries == 10 {
-				err := o.checkMetacacheState(ctx, rpc)
-				if err != nil {
-					return entries, fmt.Errorf("remote listing canceled: %w", err)
-				}
-				retries = -1
+			if err := retryWait(); err != nil {
+				return entries, err
 			}
-			retryWait()
 			continue
 		case errors.Is(err, io.EOF):
 			return entries, io.EOF
@@ -507,39 +528,19 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			}
 
 			if partN != loadedPart {
-				if retries > 10 {
-					err := o.checkMetacacheState(ctx, rpc)
-					if err != nil {
-						return entries, fmt.Errorf("waiting for next part %d: %w", partN, err)
+				if retries > 0 && !probePart(partN) {
+					if err := retryWait(); err != nil {
+						return entries, err
 					}
-					retries = 1
-				}
-
-				if retries > 0 {
-					// Load from one disk only
-					for _, disk := range er.getDisks() {
-						if disk == nil {
-							continue
-						}
-						if !disk.IsOnline() {
-							continue
-						}
-						_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
-							o.objectPath(partN), "", ReadOptions{})
-						if err != nil {
-							time.Sleep(retryDelay250)
-							retries++
-							continue
-						}
-						break
-					}
+					continue
 				}
 
 				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
-					time.Sleep(retryDelay250)
-					retries++
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				}
 				loadedPart = partN
@@ -575,13 +576,15 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			if err != nil && !errors.Is(err, io.EOF) {
 				switch toObjectErr(err, minioMetaBucket, o.objectPath(partN)).(type) {
 				case ObjectNotFound:
-					retries++
-					time.Sleep(retryDelay250)
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				case InsufficientReadQuorum:
-					retries++
 					loadedPart = -1
-					time.Sleep(retryDelay250)
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				default:
 					internalLogIf(ctx, err)
@@ -699,18 +702,16 @@ func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDi
 	return newDisks
 }
 
-// resolveListEntry resolves walk snapshots and, for latest-only listings,
-// falls back to the regular object read path when those snapshots disagree.
-//
-// Only unresolved entries pay for the additional namespace read lock and
-// metadata read. The caller supplies the lock domain used by object writes.
-func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, entries metaCacheEntries, errs []error, resolver *metadataResolutionParams, newNSLock func(string, ...string) RWLocker) (*metaCacheEntry, error) {
+// resolveListEntry keeps the existing walk resolution and fallback eligibility.
+// Eligible latest-only disagreements are resolved at the pool merger, where a
+// current absence can replace the entire same-name group, including stale walks.
+func (er *erasureObjects) resolveListEntry(entries metaCacheEntries, errs []error, resolver *metadataResolutionParams) *metaCacheEntry {
 	entry, ok := entries.resolve(resolver)
 	if ok {
-		return entry, nil
+		return entry
 	}
 	if resolver.requestedVersions != 1 {
-		return nil, nil
+		return nil
 	}
 	valid := 0
 	for i := range entries {
@@ -731,55 +732,15 @@ func (er *erasureObjects) resolveListEntry(ctx context.Context, bucket string, e
 		}
 	}
 	if entry == nil || valid < resolver.objQuorum {
-		return nil, nil
+		return nil
 	}
-	readQuorumErr := func() error {
-		return InsufficientReadQuorum{
-			Bucket: bucket,
-			Object: entry.name,
-			Err:    errErasureReadQuorum,
-			Type:   RQInconsistentMeta,
-		}
-	}
-	// Read under the object read lock, exactly as the GET path does. A
-	// lock-free read of an object being overwritten stably reports a live
-	// object as absent, so an unlocked fallback only trades one silent
-	// omission for another.
-	object := encodeDirObject(entry.name)
-	lock := newNSLock(bucket, object)
-	lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	lkctx, err := lock.GetRLock(lockCtx, globalOperationTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer lock.RUnlock(lkctx)
-
-	fi, _, _, err := er.getObjectFileInfo(lkctx.Context(), bucket, object, ObjectOptions{}, false)
-	if err != nil {
-		// getObjectFileInfo maps inconsistent metadata to not-found, so the
-		// walk evidence means not-found is still undecidable here.
-		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
-			return nil, readQuorumErr()
-		}
-		return nil, err
-	}
-	// Preserve delete markers until the cross-pool merge has discarded any
-	// older live copy. The normal listing filter removes the merged marker.
-	xl := &xlMetaV2{}
-	if err = xl.AddVersion(fi); err != nil {
-		return nil, readQuorumErr()
-	}
-	resolved := &metaCacheEntry{name: entry.name, cached: xl, reusable: true}
-	resolved.metadata, err = xl.AppendTo(metaDataPoolGet())
-	if err != nil {
-		return nil, err
-	}
-	return resolved, nil
+	// This entry exists only in the internal set-to-pool stream. Do not retain
+	// an arbitrary walk snapshot or encode the pending state as metadata.
+	return &metaCacheEntry{name: entry.name, listingSet: er}
 }
 
 // Will return io.EOF if continuing would not yield more results.
-func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry, newNSLock func(string, ...string) RWLocker) (err error) {
+func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
 	// The caller records the terminal error before closing results.
 	o.debugf(color.Green("listPath:")+" with options: %#v", o)
 
@@ -854,19 +815,15 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 			case results <- entry:
 			}
 		},
-		partial: func(entries metaCacheEntries, errs []error) error {
+		partial: func(entries metaCacheEntries, errs []error) {
 			// Results Disagree :-(
-			entry, err := er.resolveListEntry(ctx, o.Bucket, entries, errs, &resolver, newNSLock)
-			if err != nil {
-				return err
-			}
+			entry := er.resolveListEntry(entries, errs, &resolver)
 			if entry != nil {
 				select {
 				case <-ctxDone:
 				case results <- *entry:
 				}
 			}
-			return nil
 		},
 	})
 }
@@ -891,7 +848,9 @@ func (m *metaCacheRPC) setErr(err string) {
 		// An error is already set.
 		return
 	}
-	meta, _ = m.o.updateMetacacheListing(meta, m.rpc)
+	if updated, err := m.o.updateMetacacheListing(meta, m.rpc); err == nil {
+		meta = updated
+	}
 	*m.meta = meta
 }
 
@@ -1062,7 +1021,7 @@ type listPathRawOptions struct {
 	// partial will be called when there is disagreement between disks.
 	// if disk did not return any result, but also haven't errored
 	// the entry will be empty and errs will
-	partial func(entries metaCacheEntries, errs []error) error
+	partial func(entries metaCacheEntries, errs []error)
 
 	// finished will be called when all streams have finished and
 	// more than one disk returned an error.
@@ -1273,9 +1232,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			continue
 		}
 		if opts.partial != nil {
-			if err := opts.partial(topEntries, errs); err != nil {
-				return err
-			}
+			opts.partial(topEntries, errs)
 		}
 		// Skip the inputs we used.
 		for i, r := range readers {

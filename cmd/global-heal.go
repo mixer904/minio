@@ -529,7 +529,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				jt.Take()
 				go healEntry(bucket, entry)
 			},
-			partial: func(entries metaCacheEntries, _ []error) error {
+			partial: func(entries metaCacheEntries, _ []error) {
 				entry, ok := entries.resolve(&resolver)
 				if !ok {
 					// check if we can get one entry at least
@@ -538,7 +538,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				}
 				jt.Take()
 				go healEntry(bucket, *entry)
-				return nil
 			},
 			finished: func(errs []error) {
 				success := countErrs(errs, nil)

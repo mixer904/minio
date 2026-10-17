@@ -35,6 +35,8 @@ func TestListFallbackDistributedLockRoute(t *testing.T) {
 		{"multi-pool-shared-lockers", true, true},
 		{"multi-pool-disjoint-lockers", true, false},
 		{"single-pool-target-set-lockers", false, false},
+		{"single-pool-first-set-lockers", false, false},
+		{"single-pool-shared-ns-distinct-lockers", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := []dsync.NetLocker{newLocker(), newLocker()}
@@ -44,12 +46,15 @@ func TestListFallbackDistributedLockRoute(t *testing.T) {
 			}
 			set0 := &erasureObjects{nsMutex: newNSLock(true), getLockers: func() ([]dsync.NetLocker, string) { return a, "listing-test" }}
 			target := &erasureObjects{nsMutex: newNSLock(true), getLockers: func() ([]dsync.NetLocker, string) { return b, "listing-test" }}
+			if tc.name == "single-pool-shared-ns-distinct-lockers" {
+				target.nsMutex = set0.nsMutex
+			}
 			z := &erasureServerPools{serverPools: []*erasureSets{{sets: []*erasureObjects{set0, target}}}}
 			if tc.multiPool {
 				z.serverPools = []*erasureSets{{sets: []*erasureObjects{set0}}, {sets: []*erasureObjects{target}}}
 			}
 			writer := target.NewNSLock("bucket", "object")
-			if tc.multiPool {
+			if tc.multiPool || tc.name == "single-pool-first-set-lockers" {
 				writer = z.NewNSLock("bucket", "object")
 			}
 			wctx, err := writer.GetLock(t.Context(), globalOperationTimeout)
@@ -62,23 +67,65 @@ func TestListFallbackDistributedLockRoute(t *testing.T) {
 					writer.Unlock(wctx)
 				}
 			}()
-			reader := z.listingNSLock(target)("bucket", "object")
 			ctx, cancel := context.WithTimeout(t.Context(), 80*time.Millisecond)
 			defer cancel()
-			rctx, err := reader.GetRLock(ctx, globalOperationTimeout)
+			_, unlock, err := z.listingRLock(ctx, "bucket", "object", target)
 			if err == nil {
-				reader.RUnlock(rctx)
+				unlock()
 				t.Fatal("fallback read lock acquired while ordinary writer lock is held")
 			}
 			writer.Unlock(wctx)
 			locked = false
 			ctx, cancel = context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			rctx, err = reader.GetRLock(ctx, globalOperationTimeout)
+			_, unlock, err = z.listingRLock(ctx, "bucket", "object", target)
 			if err != nil {
 				t.Fatalf("fallback read lock failed after writer unlock: %v", err)
 			}
-			reader.RUnlock(rctx)
+			unlock()
 		})
 	}
+}
+
+// Cancellation while waiting for the second domain must release the first.
+func TestListingSecondLockCancellationReleasesFirst(t *testing.T) {
+	first := &erasureObjects{nsMutex: newNSLock(false)}
+	target := &erasureObjects{nsMutex: newNSLock(false)}
+	z := &erasureServerPools{serverPools: []*erasureSets{{sets: []*erasureObjects{first, target}}}}
+	writer := target.NewNSLock("bucket", "object")
+	wctx, err := writer.GetLock(t.Context(), globalOperationTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Unlock(wctx)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	var lockErr error
+	go func() {
+		defer close(done)
+		_, unlock, err := z.listingRLock(ctx, "bucket", "object", target)
+		lockErr = err
+		if err == nil {
+			unlock()
+		}
+	}()
+	waitForListingReadLock(t, target.nsMutex, "bucket", "object", done)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second lock did not cancel")
+	}
+	if lockErr == nil {
+		t.Fatal("canceled second lock succeeded")
+	}
+	poolWriter := z.NewNSLock("bucket", "object")
+	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	pctx, err := poolWriter.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		t.Fatalf("first lock leaked after second failed: %v", err)
+	}
+	poolWriter.Unlock(pctx)
 }

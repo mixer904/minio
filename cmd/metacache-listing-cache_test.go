@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -322,5 +323,81 @@ func TestListingCacheFullPageDoesNotWaitForTail(t *testing.T) {
 	}
 	if !slices.Equal(keys, []string{"c", "d", "e", "zz"}) {
 		t.Fatalf("cached remainder lost keys: %v", keys)
+	}
+}
+
+// Keep the error update pending at the actual peer RPC boundary. Other cache
+// operations, including readers and abandoned-cache cleanup, remain live.
+func listingCacheErrorPeer(t *testing.T, fail bool) (*peerRESTClient, <-chan struct{}, func()) {
+	t.Helper()
+	tg, err := grid.SetupTestGrid(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, resume := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	t.Cleanup(func() {
+		release()
+		tg.Cleanup()
+	})
+	var entered sync.Once
+	server := &peerRESTServer{}
+	if err := getMetacacheListingRPC.Register(tg.Managers[1], server.GetMetacacheListingHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateMetacacheListingRPC.Register(tg.Managers[1], func(m *metacache) (*metacache, *grid.RemoteErr) {
+		if m.error != "" && m.error != "no longer used" {
+			entered.Do(func() { close(ready) })
+			select {
+			case <-resume:
+			case <-t.Context().Done():
+				return nil, grid.NewRemoteErr(t.Context().Err())
+			}
+			if fail {
+				return nil, grid.NewRemoteErr(errors.New("cache error update failed"))
+			}
+		}
+		return server.UpdateMetacacheListingHandler(m)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return &peerRESTClient{gridConn: func() *grid.Connection { return tg.Managers[0].Connection(tg.Hosts[1]) }}, ready, release
+}
+
+func TestListingCacheRetainsErrorAfterPeerFailure(t *testing.T) {
+	client, ready, release := listingCacheErrorPeer(t, true)
+	o := listPathOptions{ID: mustGetUUID(), Bucket: "bucket"}
+	m := o.newMetacache()
+	mc := metaCacheRPC{meta: &m, rpc: client, o: o}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mc.setErr("terminal listing failure")
+	}()
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("setErr worker did not finish before grid cleanup")
+		}
+	})
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("error update did not reach peer")
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed peer update did not return")
+	}
+	if m.id != o.ID || m.bucket != o.Bucket || m.status != scanStateError || m.error != "terminal listing failure" || mc.getErr() == nil {
+		t.Fatalf("peer failure erased local failure: %+v", m)
+	}
+	mc.setErr("later failure")
+	if m.error != "terminal listing failure" {
+		t.Fatalf("later failure replaced the terminal error: %+v", m)
 	}
 }

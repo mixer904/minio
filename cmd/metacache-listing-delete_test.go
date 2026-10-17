@@ -126,7 +126,7 @@ func TestListFallbackRejectsSplitGenerations(t *testing.T) {
 		}
 	}
 	resolver := metadataResolutionParams{dirQuorum: 8, objQuorum: 8, bucket: bucket, requestedVersions: 1}
-	entry, err := set.resolveListEntry(t.Context(), bucket, entries, nil, &resolver, z.listingNSLock(set))
+	entry, err := z.resolveListingGroup(t.Context(), bucket, []*metaCacheEntry{set.resolveListEntry(entries, nil, &resolver)})
 	if entry != nil || !isErrReadQuorum(err) {
 		t.Fatalf("split live metadata became absence: entry=%v err=%v", entry, err)
 	}

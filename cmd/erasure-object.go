@@ -729,6 +729,57 @@ func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, r
 	return pickLatestQuorumFilesInfo(ctx, rawFileInfos, errs, bucket, object, readData, inclFreeVers)
 }
 
+// readListingFileInfo is the read-only, latest-version metadata path for listing
+// recovery. Ordinary GET keeps its fast-read, healing and dangling semantics.
+// Absence is proved before decoding can replace a native storage error: every
+// configured slot must have returned FileNotFound in this read.
+func (er erasureObjects) readListingFileInfo(ctx context.Context, bucket, object string) (FileInfo, bool, error) {
+	disks := er.getDisks()
+	if len(disks) == 0 || len(disks) != er.setDriveCount {
+		return FileInfo{}, false, listingReadQuorumError(bucket, object)
+	}
+	// An offline slot is not evidence of absence, even if a test or transport
+	// implementation could return a cached not-found response for it.
+	online := append([]StorageAPI(nil), disks...)
+	for i, disk := range online {
+		if disk != nil && !disk.IsOnline() {
+			online[i] = nil
+		}
+	}
+	raw, errs := readAllRawFileInfo(ctx, online, bucket, object, false)
+	if err := ctx.Err(); err != nil {
+		return FileInfo{}, false, err
+	}
+	absent := true
+	for _, err := range errs {
+		absent = absent && err == errFileNotFound
+	}
+	if absent {
+		return FileInfo{}, true, nil
+	}
+
+	// Keep the same latest-version and actual object parity quorum as GET,
+	// without its opportunistic dangling deletion or generic NotFound mapping.
+	meta, errs := pickLatestQuorumFilesInfo(ctx, raw, errs, bucket, object, false, false)
+	quorum, _, err := objectQuorumFromMeta(ctx, meta, errs, er.defaultParityCount)
+	if err == nil {
+		err = reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, quorum)
+	}
+	if err != nil {
+		return FileInfo{}, false, listingReadQuorumError(bucket, object)
+	}
+	_, modTime, etag := listOnlineDisks(disks, meta, errs, quorum)
+	fi, err := pickValidFileInfo(ctx, meta, modTime, etag, quorum)
+	if err != nil || (!fi.Deleted && len(fi.Erasure.Distribution) != len(disks)) {
+		return FileInfo{}, false, listingReadQuorumError(bucket, object)
+	}
+	return fi, false, nil
+}
+
+func listingReadQuorumError(bucket, object string) error {
+	return InsufficientReadQuorum{Bucket: bucket, Object: decodeDirObject(object), Err: errErasureReadQuorum, Type: RQInconsistentMeta}
+}
+
 func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object string, opts ObjectOptions, readData bool) (FileInfo, []FileInfo, []StorageAPI, error) {
 	rawArr := make([]RawFileInfo, er.setDriveCount)
 	metaArr := make([]FileInfo, er.setDriveCount)

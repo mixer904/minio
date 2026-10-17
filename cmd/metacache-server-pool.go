@@ -264,14 +264,174 @@ func (z *erasureServerPools) listPathShortcutEOF(ctx context.Context, bucket str
 	return io.EOF
 }
 
-// listingNSLock chooses the namespace used by regular object writes.
-// Multiple pools serialize at the pools layer; single-pool PUT and GET use
-// the destination set. This keeps the existing single-pool lock routing.
-func (z *erasureServerPools) listingNSLock(er *erasureObjects) func(string, ...string) RWLocker {
-	if z.SinglePool() {
-		return er.NewNSLock
+// listingRLock covers the lock domains used by normal same-key mutations.
+// Multi-pool writes use the pools lock. In a single pool, DELETE/COPY use the
+// first set while PUT and metadata updates use the destination set, so recovery
+// takes both in that order. No writer routing or wire protocol changes here.
+func (z *erasureServerPools) listingRLock(ctx context.Context, bucket, object string, source *erasureObjects) (LockContext, func(), error) {
+	firstSet := z.serverPools[0].sets[0]
+	first := z.NewNSLock(bucket, object)
+	firstCtx, err := first.GetRLock(ctx, globalListingOperationTimeout)
+	if err != nil {
+		return LockContext{}, nil, err
 	}
-	return z.NewNSLock
+	if !z.SinglePool() || source == firstSet || (!source.nsMutex.isDistErasure && source.nsMutex == firstSet.nsMutex) {
+		return firstCtx, func() { first.RUnlock(firstCtx) }, nil
+	}
+	// Shared nsMutex pointers do not prove shared distributed locker sets.
+	second := source.NewNSLock(bucket, object)
+	secondCtx, err := second.GetRLock(firstCtx.Context(), globalListingOperationTimeout)
+	if err != nil {
+		first.RUnlock(firstCtx)
+		return LockContext{}, nil, err
+	}
+	return secondCtx, func() {
+		second.RUnlock(secondCtx)
+		first.RUnlock(firstCtx)
+	}, nil
+}
+
+// resolveListingGroup recovers a complete same-name group, never a private
+// per-set contribution. A strictly absent source requires current reads from
+// every pool, since another pool's earlier walk may predate a migration copy.
+func (z *erasureServerPools) resolveListingGroup(ctx context.Context, bucket string, group []*metaCacheEntry) (*metaCacheEntry, error) {
+	var source *erasureObjects
+	for _, entry := range group {
+		if entry.listingSet != nil {
+			source = entry.listingSet
+			break
+		}
+	}
+	if source == nil {
+		return nil, errInvalidArgument
+	}
+	// Recovery consumes this group. Return reusable walk buffers only after
+	// their contents have been copied into the newly encoded result.
+	defer func() {
+		for _, entry := range group {
+			if entry.reusable {
+				metaDataPoolPut(entry.metadata)
+			}
+		}
+	}()
+	name := group[0].name
+	object := encodeDirObject(name)
+	if z.SinglePool() {
+		target := z.serverPools[0].getHashedSet(object)
+		for _, entry := range group {
+			if entry.listingSet != nil && entry.listingSet != target {
+				// Unexpected placement is not evidence of absence at the
+				// current write target. Do not extend recovery to arbitrary sets.
+				return nil, listingReadQuorumError(bucket, object)
+			}
+		}
+	}
+	type readResult struct {
+		fi     FileInfo
+		absent bool
+	}
+	reads := make(map[*erasureObjects]readResult)
+	currentOnly := false
+	var current *FileInfo
+	err := func() error {
+		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		lkctx, unlock, err := z.listingRLock(lockCtx, bucket, object, source)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		read := func(set *erasureObjects) (readResult, error) {
+			if result, ok := reads[set]; ok {
+				return result, nil
+			}
+			fi, absent, err := set.readListingFileInfo(lkctx.Context(), bucket, object)
+			result := readResult{fi: fi, absent: absent}
+			if err == nil {
+				reads[set] = result
+			}
+			return result, err
+		}
+		for _, entry := range group {
+			if entry.listingSet == nil {
+				continue
+			}
+			result, err := read(entry.listingSet)
+			if err != nil {
+				return err
+			}
+			currentOnly = currentOnly || result.absent
+		}
+		if !currentOnly {
+			return lkctx.Context().Err()
+		}
+		// Migration publishes the replacement through the pooled write lock
+		// before source cleanup. While this read lock is held, new publication
+		// cannot pass these reads; any concurrent cleanup already has a copy.
+		// Unknown pools still fail rather than being counted as absent.
+		for _, pool := range z.serverPools {
+			result, err := read(pool.getHashedSet(object))
+			if err != nil {
+				return err
+			}
+			if result.absent {
+				continue
+			}
+			// Match latest GET: newest ModTime, then lowest pool index.
+			if current == nil || result.fi.ModTime.After(current.ModTime) {
+				fi := result.fi
+				current = &fi
+			}
+		}
+		return lkctx.Context().Err()
+	}()
+	if err != nil {
+		return nil, err
+	}
+	// All FileInfo values above are owned decoded results. Encoding and merge
+	// allocation happen after RUnlock, as do all stream sends and cache RPCs.
+	encode := func(fi FileInfo) (*metaCacheEntry, error) {
+		xl := &xlMetaV2{}
+		if err := xl.AddVersion(fi); err != nil {
+			return nil, listingReadQuorumError(bucket, object)
+		}
+		entry := &metaCacheEntry{name: name, cached: xl, reusable: true}
+		var err error
+		entry.metadata, err = xl.AppendTo(metaDataPoolGet())
+		return entry, err
+	}
+	if currentOnly {
+		if current == nil {
+			return nil, nil
+		}
+		// Replace the whole group: no stale live copy or marker can override
+		// this current global decision.
+		return encode(*current)
+	}
+	versions := make([][]xlMetaV2ShallowVersion, 0, len(group))
+	for _, entry := range group {
+		if entry.listingSet != nil {
+			fi := reads[entry.listingSet].fi
+			xl := &xlMetaV2{}
+			if err := xl.AddVersion(fi); err != nil {
+				return nil, listingReadQuorumError(bucket, object)
+			}
+			versions = append(versions, xl.versions)
+			continue
+		}
+		xl, err := entry.xlmeta()
+		if err != nil {
+			return nil, listingReadQuorumError(bucket, object)
+		}
+		versions = append(versions, xl.versions)
+	}
+	// Preserve the existing cross-pool merge rule for recovered live metadata
+	// and delete markers when no source was strictly absent.
+	xl := &xlMetaV2{versions: mergeXLV2Versions(1, true, 0, versions...)}
+	// Do not retain shallow versions referencing reusable input buffers.
+	resolved := &metaCacheEntry{name: name, reusable: true}
+	resolved.metadata, err = xl.AppendTo(metaDataPoolGet())
+	return resolved, err
 }
 
 // listMerged will list across all sets and return a merged results stream.
@@ -293,7 +453,7 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 			inputs = append(inputs, innerResults)
 			go func(i int, set *erasureObjects) {
 				defer wg.Done()
-				err := set.listPath(listCtx, o, innerResults, z.listingNSLock(set))
+				err := set.listPath(listCtx, o, innerResults)
 				mu.Lock()
 				if err == nil {
 					allAtEOF = false
@@ -311,7 +471,7 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 
 	// Gather results to a single channel.
 	// Quorum is one since we are merging across sets.
-	err := mergeEntryChannelsWithErrors(ctx, inputs, results, 1, func(i int) error {
+	err := mergeEntryChannelsWithResolver(ctx, inputs, results, 1, func(i int) error {
 		mu.Lock()
 		err := errs[i]
 		mu.Unlock()
@@ -320,6 +480,8 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 			return nil
 		}
 		return err
+	}, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
+		return z.resolveListingGroup(ctx, o.Bucket, group)
 	})
 
 	cancelList()
@@ -440,14 +602,20 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 	// Publish the typed terminal result before either consumer observes EOF.
 	// mergeEntryChannels closes inCh before listMerged has inspected set errors.
 	listingDone := make(chan struct{})
+	var cacheErrorDone chan struct{}
 	var listingErr error
 	go func(o listPathOptions) {
 		listingErr = z.listMerged(listCtx, o, inCh)
-		if listingErr != nil && !errors.Is(listingErr, io.EOF) {
-			meta.setErr(listingErr.Error())
-			cancel()
+		failed := listingErr != nil && !errors.Is(listingErr, io.EOF)
+		if failed {
+			cacheErrorDone = make(chan struct{})
 		}
 		close(listingDone)
+		if failed {
+			meta.setErr(listingErr.Error())
+			cancel()
+			close(cacheErrorDone)
+		}
 		o.debugln("listAndSave: listing", o.ID, "finished with ", listingErr)
 	}(*o)
 
@@ -478,11 +646,15 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 			entry.reusable = returned
 			saveCh <- entry
 		}
-		// Do not publish an end-of-stream cache block or a final response
-		// before the scan has recorded its terminal error.
+		// The typed scan result is enough to finish the HTTP response.
 		<-listingDone
 		if !returned {
 			xioutil.SafeClose(outCh)
+		}
+		// Closing saveCh writes an end-of-stream cache block. On failure,
+		// wait until the error is recorded and the writer is canceled.
+		if cacheErrorDone != nil {
+			<-cacheErrorDone
 		}
 		xioutil.SafeClose(saveCh)
 	}()
