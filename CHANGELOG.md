@@ -2,12 +2,31 @@
 
 ## Unreleased
 
-Preparation target: `RELEASE.2026-09-16T00-00-00Z` (package version
-`20260916000000.0.0`). The entries below describe the candidate changes since
-the latest published Server.
-**The latest published Server remains 20260903.** These changes are not in its
-binaries, packages or images. See the [component matrix](https://silo.pgsty.com/compatibility/versions/)
-and [complete commit range](https://github.com/pgsty/silo/compare/RELEASE.2026-09-03T13-18-01Z...main).
+Preparation target: `RELEASE.2026-10-18T00-00-00Z` (package version
+`20261018000000.0.0`). **This is a tag and Draft preparation; it is not a public
+Server release.** The latest published Server remains 20260916. Server 20261015
+also remains a Draft. Existing binaries, packages and images do not change.
+See the [component matrix](https://silo.pgsty.com/compatibility/versions/) and
+[changes since the public release](https://github.com/pgsty/silo/compare/RELEASE.2026-09-16T00-00-00Z...main).
+
+### October 18 dependency update
+
+- Select silo-pkg v3.14.2, upstream minio-go v7.4.1, published mcli 20261018
+  and Console v2.4.2 source (`ef2dd2c41d21`). The SDK includes cancellation cleanup, UTC retention
+  timestamps and preserved STS duration; parallel GET/Compose remain opt-in.
+- Build with Go 1.27.2 and refresh Go x/* modules. Apply go-jose v4.1.6,
+  LDAP v3.4.15, compress v1.20.3, msgp v1.6.5, etcd v3.7.2, fwd v1.2.1 and
+  cpuid v2.4.1 bug/security fixes. OIDC JWK RSA keys must not exceed 4096 bits.
+- Update the bundled mcli archive hashes, installation helper and Helm client
+  image to the published 20261018 release. Server Helm image defaults retain the
+  public 20260916 version until a Server image is published.
+- Refresh pinned UBI 9 images and use GoReleaser v2.18.3, nFPM v2.48.0,
+  golangci-lint v2.15.0 and govulncheck v1.9.0. Keep the NetBSD go-systemd
+  v22.6.0 compatibility replacement.
+
+The sections below retain the cumulative maintenance history, including changes
+already shipped in 20260916; the source comparison above identifies this
+candidate's exact delta.
 
 ### Authorization and security
 
