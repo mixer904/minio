@@ -11,6 +11,8 @@ fail() {
 	exit 1
 }
 
+command -v rg >/dev/null 2>&1 || fail "ripgrep (rg) is required for rebrand verification"
+
 require_file() {
 	[ -f "$1" ] || fail "missing required file: $1"
 }
