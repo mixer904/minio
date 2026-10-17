@@ -11,9 +11,12 @@ See the [component matrix](https://silo.pgsty.com/compatibility/versions/) and
 
 ### October 18 dependency update
 
-- Select silo-pkg v3.14.2, upstream minio-go v7.4.1, published mcli 20261018
+- Select silo-pkg v3.14.3, upstream minio-go v7.4.1, published mcli 20261018
   and Console v2.4.2 source (`ef2dd2c41d21`). The SDK includes cancellation cleanup, UTC retention
   timestamps and preserved STS duration; parallel GET/Compose remain opt-in.
+- Adopt silo-pkg's faster admin-action classification during policy evaluation,
+  preserving authorization behavior and compatibility with existing clients.
+  Update the standalone `reorder-disks` debugging module to the same package version.
 - Build with Go 1.27.2 and refresh Go x/* modules. Apply go-jose v4.1.6,
   LDAP v3.4.15, compress v1.20.3, msgp v1.6.5, etcd v3.7.2, fwd v1.2.1 and
   cpuid v2.4.1 bug/security fixes. OIDC JWK RSA keys must not exceed 4096 bits.
