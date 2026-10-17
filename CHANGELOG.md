@@ -54,35 +54,29 @@ and [complete commit range](https://github.com/pgsty/silo/compare/RELEASE.2026-0
 
 ### Object storage and replication
 
-- Make `ListMultipartUploads` discover quorum-valid uploads from durable state
-  across pools, erasure sets and drives, then apply S3 prefix, delimiter,
-  marker, ordering and 1,000-entry pagination semantics globally (#198). New uploads
-  store their canonical bucket and key as reserved fields in the existing
-  quorum-written `xl.meta`; completion removes those upload-only fields. Native
-  markers remain usable after their upload is completed or canceled. Strict
-  listing returns a diagnostic 503 for legacy uploads or uncertain coverage;
-  the default remains the released exact-key/cache-based `legacy` behavior.
-  Opt into strict mode only through `MINIO_API_MULTIPART_LISTING=strict`, after
-  upgrading every writer, draining old uploads, checking the read-only admin
-  `multipart-preflight` report and validating scan capacity. The process-only
-  setting is not persisted into shared API configuration. Historical
-  `multipart_listing` keys are ignored and can be removed with a targeted
-  `mcli admin config reset ALIAS api multipart_listing` before rollback. Per-process
-  admission, directory-entry, worker and time budgets bound scan scheduling;
-  each page still scans durable state. See [issue #79](https://github.com/pgsty/silo/issues/79)
-  and its [design record](https://silo.pgsty.com/blog/design/list-multipart-uploads/).
-  Thanks to mr javad seydi (@mrjavadseydi) for the original implementation.
-- Retain released read-quorum and best-effort multipart cancellation in default
-  legacy mode. Strict mode requires majority deletion acknowledgements and
-  permits retries below read quorum. When most drives were already empty,
-  failed deletion of an observed remnant now returns 503 instead of being
-  masked by empty-drive successes. Wrong-key or wrong-bucket cancellation
-  preserves the valid upload's cache entry; successful cancellation notifies
-  peers with the request context after the distributed lock is released.
-  The HTTP response for an absent
-  upload remains 204; this is not proof of physical cleanup. **Known boundary:**
-  delayed creation writes can still restore an upload after cancellation;
-  this change does not add a durable creation fence.
+- Make durable `ListMultipartUploads` scanning the only listing path (#79):
+  apply prefix, delimiter, markers, ordering and the 1,000-entry page limit
+  globally across pools and sets, independently of node-local caches. Omit
+  readable historical uploads only when both bucket/key identity fields are
+  absent; malformed identities, uncertain coverage and resource limits remain
+  errors. Old uploads still support part upload, completion and cancellation
+  with a known bucket/key/upload ID. No backfill or new storage layout is added.
+  `MINIO_API_MULTIPART_LISTING` is retired and ignored with a startup warning;
+  historical shared `api multipart_listing` keys remain tolerated. The read-only
+  admin `multipart-preflight` reports `mode=persistent`; `ready` diagnoses the
+  absence of old records and no longer gates listing. Each page still scans
+  durable state within the existing 100,000-directory-entry, 30-second and
+  per-process concurrency budgets. See the
+  [design and limits](https://silo.pgsty.com/blog/design/list-multipart-uploads/#implementation).
+  Thanks to mr javad seydi (@mrjavadseydi) for the original metadata-and-scan
+  implementation (#198).
+- Keep the default read-quorum, best-effort multipart cancellation and
+  first-matching-pool behavior when retiring the listing switch. The optional
+  strict cancellation branch is removed. Wrong-target protection, upload-ID
+  path validation and peer notification with the request context remain.
+  HTTP 204 for an absent upload remains idempotent and does not prove physical
+  cleanup. **Known boundary:** delayed creation writes can still restore a
+  readable upload after cancellation; this change adds no creation fence.
 - Preserve object tags during multi-pool metadata reconciliation by reading the
   resolved tag field together with its revision (#189). Previously, reconciliation
   could replace existing tags with an empty value.
