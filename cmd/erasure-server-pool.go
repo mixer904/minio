@@ -2587,9 +2587,9 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 					minDisks:       listingQuorum,
 					reportNotFound: false,
 					agreed:         send,
-					partial: func(entries metaCacheEntries, _ []error) {
-						entry, ok := entries.resolve(&resolver)
-						if ok {
+					partial: func(entries metaCacheEntries, errs []error) {
+						entry := set.resolveListEntry(entries, errs, &resolver)
+						if entry != nil {
 							send(*entry)
 						}
 					},
@@ -2691,7 +2691,11 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 		// Merge all entries from all disks.
 		// We leave quorum at 1, since entries are already resolved to have the desired quorum.
 		// mergeEntryChannels will close 'merged' channel upon completion or cancellation.
-		errCh <- mergeEntryChannels(ctx, entries, merged, 1)
+		errCh <- mergeEntryChannelsWithResolver(ctx, entries, merged, 1, func(int) error {
+			return context.Cause(ctx)
+		}, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
+			return z.resolveListingGroup(ctx, bucket, group)
+		})
 	}()
 
 	return nil

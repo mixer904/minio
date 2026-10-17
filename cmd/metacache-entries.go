@@ -37,6 +37,10 @@ type metaCacheEntry struct {
 	// Entries without metadata will only be present in non-recursive scans.
 	metadata []byte
 
+	// listingSet marks an eligible unresolved walk entry. It is consumed by the
+	// pool merger before any cache serialization or downstream filtering.
+	listingSet *erasureObjects
+
 	// cached contains the metadata if decoded.
 	cached *xlMetaV2
 
@@ -46,17 +50,17 @@ type metaCacheEntry struct {
 
 // isDir returns if the entry is representing a prefix directory.
 func (e metaCacheEntry) isDir() bool {
-	return len(e.metadata) == 0 && strings.HasSuffix(e.name, slashSeparator)
+	return e.listingSet == nil && len(e.metadata) == 0 && strings.HasSuffix(e.name, slashSeparator)
 }
 
 // isObject returns if the entry is representing an object.
 func (e metaCacheEntry) isObject() bool {
-	return len(e.metadata) > 0
+	return e.listingSet != nil || len(e.metadata) > 0
 }
 
 // isObjectDir returns if the entry is representing an object/
 func (e metaCacheEntry) isObjectDir() bool {
-	return len(e.metadata) > 0 && strings.HasSuffix(e.name, slashSeparator)
+	return (e.listingSet != nil || len(e.metadata) > 0) && strings.HasSuffix(e.name, slashSeparator)
 }
 
 // hasPrefix returns whether an entry has a specific prefix
@@ -670,26 +674,82 @@ func (m *metaCacheEntriesSorted) forwardPast(s string) {
 // If the context is canceled the function will return the error,
 // otherwise the function will return nil.
 func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int) error {
+	return mergeEntryChannelsWithErrors(ctx, in, out, readQuorum, nil)
+}
+
+// terminalErr is inspected after each input closes and before the merger
+// advances beyond it. Callers must publish the error before closing the input.
+func mergeEntryChannelsWithErrors(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int, terminalErr func(int) error) error {
+	return mergeEntryChannelsWithResolver(ctx, in, out, readQuorum, terminalErr, nil)
+}
+
+// resolve is called only for groups containing a pending listing entry. All
+// selected inputs are advanced (and their terminal errors checked) before it is
+// called, so recovery never holds an object lock while waiting for input.
+func mergeEntryChannelsWithResolver(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int, terminalErr func(int) error, resolve func([]*metaCacheEntry) (*metaCacheEntry, error)) error {
 	defer xioutil.SafeClose(out)
 	top := make([]*metaCacheEntry, len(in))
 	nDone := 0
 	ctxDone := ctx.Done()
 
-	// Use simpler forwarder.
+	// Keep the single-input normal path allocation-free. Only a pending entry
+	// requires looking ahead to observe its stream's terminal error first.
 	if len(in) == 1 {
+		var buffered metaCacheEntry
+		haveBuffered, exhausted := false, false
 		for {
-			select {
-			case <-ctxDone:
-				return ctx.Err()
-			case v, ok := <-in[0]:
-				if !ok {
-					return nil
+			var v metaCacheEntry
+			if haveBuffered {
+				v, haveBuffered = buffered, false
+			} else {
+				select {
+				case <-ctxDone:
+					return ctx.Err()
+				case entry, ok := <-in[0]:
+					if !ok {
+						if terminalErr != nil {
+							return terminalErr(0)
+						}
+						return nil
+					}
+					v = entry
+				}
+			}
+			if v.listingSet != nil {
+				if resolve == nil {
+					return errInvalidArgument
 				}
 				select {
 				case <-ctxDone:
 					return ctx.Err()
-				case out <- v:
+				case entry, ok := <-in[0]:
+					buffered, haveBuffered, exhausted = entry, ok, !ok
+					if !ok && terminalErr != nil {
+						if err := terminalErr(0); err != nil {
+							return err
+						}
+					}
 				}
+				pending := v
+				resolved, err := resolve([]*metaCacheEntry{&pending})
+				if err != nil {
+					return err
+				}
+				if resolved == nil {
+					if exhausted {
+						return nil
+					}
+					continue
+				}
+				v = *resolved
+			}
+			select {
+			case <-ctxDone:
+				return ctx.Err()
+			case out <- v:
+			}
+			if exhausted {
+				return nil
 			}
 		}
 	}
@@ -700,6 +760,11 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 			return ctx.Err()
 		case entry, ok := <-in[idx]:
 			if !ok {
+				if terminalErr != nil {
+					if err := terminalErr(idx); err != nil {
+						return err
+					}
+				}
 				top[idx] = nil
 				nDone++
 			} else {
@@ -776,6 +841,40 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 				best = other
 				bestIdx = otherIdx
 			}
+		}
+
+		pending := best.listingSet != nil
+		for _, idx := range toMerge {
+			pending = pending || top[idx].listingSet != nil
+		}
+		if pending {
+			if resolve == nil {
+				return errInvalidArgument
+			}
+			group := make([]*metaCacheEntry, 1, len(toMerge)+1)
+			group[0] = best
+			for _, idx := range toMerge {
+				group = append(group, top[idx])
+				if err := selectFrom(idx); err != nil {
+					return err
+				}
+			}
+			if err := selectFrom(bestIdx); err != nil {
+				return err
+			}
+			resolved, err := resolve(group)
+			if err != nil {
+				return err
+			}
+			if resolved != nil && resolved.name > last {
+				select {
+				case <-ctxDone:
+					return ctx.Err()
+				case out <- *resolved:
+					last = resolved.name
+				}
+			}
+			continue
 		}
 
 		// Merge any unmerged
