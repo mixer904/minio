@@ -1237,7 +1237,7 @@ func (a adminAPIHandlers) ListAccessKeysBulk(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	if !globalIAMSys.IsAllowed(policy.Args{
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.ListServiceAccountsAdminAction,
@@ -1250,12 +1250,12 @@ func (a adminAPIHandlers) ListAccessKeysBulk(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if selfOnly && len(users) == 0 {
+	if selfOnly {
 		selfUser := cred.AccessKey
 		if cred.ParentUser != "" {
 			selfUser = cred.ParentUser
 		}
-		users = append(users, selfUser)
+		users = []string{selfUser}
 	}
 
 	var checkedUserList []string

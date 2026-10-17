@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -248,8 +249,20 @@ func TestIAMAdminPolicylessSelf(t *testing.T) {
 	ctx, sys := iamAdminFixture(t)
 	caller := iamAdminUser(ctx, t, sys, "review-policyless", "")
 	svc := iamAdminServiceAccount(ctx, t, sys, caller.AccessKey, "rv-policyless-child", "")
+	other := iamAdminUser(ctx, t, sys, "bulk-other", "readwrite")
+	_ = iamAdminServiceAccount(ctx, t, sys, other.AccessKey, "bulk-other-child", "")
 	api := adminAPIHandlers{}
 	assertIAMAdminStatus(t, "list", iamAdminCall(t, caller, "GET", "/minio/admin/v3/list-service-accounts", nil, nil, api.ListServiceAccounts), 200)
+	rec := iamAdminCall(t, caller, "GET", "/minio/admin/v3/list-access-keys-bulk?listType=all", nil, nil, api.ListAccessKeysBulk)
+	assertIAMAdminStatus(t, "list bulk self", rec, 200)
+	data, err := madmin.DecryptData(caller.SecretKey, rec.Body)
+	mustIAM(t, err)
+	var listed map[string]madmin.ListAccessKeysResp
+	mustIAM(t, json.Unmarshal(data, &listed))
+	entry, ok := listed[caller.AccessKey]
+	if len(listed) != 1 || !ok || len(entry.ServiceAccounts) != 1 || entry.ServiceAccounts[0].AccessKey != svc.AccessKey || len(entry.STSKeys) != 0 {
+		t.Fatalf("policyless bulk self returned unexpected identities: %+v", listed)
+	}
 	assertIAMAdminStatus(t, "info service", iamAdminCall(t, caller, "GET", "/minio/admin/v3/info-service-account?accessKey="+svc.AccessKey, nil, map[string]string{"accessKey": svc.AccessKey}, api.InfoServiceAccount), 200)
 	assertIAMAdminStatus(t, "info access key", iamAdminCall(t, caller, "GET", "/minio/admin/v3/info-access-key?accessKey="+svc.AccessKey, nil, map[string]string{"accessKey": svc.AccessKey}, api.InfoAccessKey), 200)
 	assertIAMAdminStatus(t, "delete", iamAdminCall(t, caller, "DELETE", "/minio/admin/v3/delete-service-account?accessKey="+svc.AccessKey, nil, map[string]string{"accessKey": svc.AccessKey}, api.DeleteServiceAccount), 204)
@@ -384,6 +397,7 @@ func TestIAMAdminSelfDenials(t *testing.T) {
 			}
 			api := adminAPIHandlers{}
 			assertIAMAdminStatus(t, "list", iamAdminCall(t, caller, "GET", "/minio/admin/v3/list-service-accounts", nil, nil, api.ListServiceAccounts), 403)
+			assertIAMAdminStatus(t, "list bulk self", iamAdminCall(t, caller, "GET", "/minio/admin/v3/list-access-keys-bulk?listType=all", nil, nil, api.ListAccessKeysBulk), 403)
 			assertIAMAdminStatus(t, "info service", iamAdminCall(t, caller, "GET", "/minio/admin/v3/info-service-account?accessKey="+target.AccessKey, nil, map[string]string{"accessKey": target.AccessKey}, api.InfoServiceAccount), 403)
 			assertIAMAdminStatus(t, "info access key", iamAdminCall(t, caller, "GET", "/minio/admin/v3/info-access-key?accessKey="+target.AccessKey, nil, map[string]string{"accessKey": target.AccessKey}, api.InfoAccessKey), 403)
 			assertIAMAdminStatus(t, "delete", iamAdminCall(t, caller, "DELETE", "/minio/admin/v3/delete-service-account?accessKey="+target.AccessKey, nil, map[string]string{"accessKey": target.AccessKey}, api.DeleteServiceAccount), 403)
@@ -477,7 +491,10 @@ func TestIAMAdminListSelfAliases(t *testing.T) {
 			ctx, sys := iamAdminFixture(t)
 			parent := iamAdminUser(ctx, t, sys, "alias-parent", "readwrite")
 			target := iamAdminServiceAccount(ctx, t, sys, parent.AccessKey, "alias-target", "")
-			caller := iamAdminServiceAccount(ctx, t, sys, parent.AccessKey, "alias-caller", "")
+			serviceCaller := iamAdminServiceAccount(ctx, t, sys, parent.AccessKey, "alias-caller", "")
+			caller := serviceCaller
+			other := iamAdminUser(ctx, t, sys, "alias-other", "readwrite")
+			_ = iamAdminServiceAccount(ctx, t, sys, other.AccessKey, "alias-other-child", "")
 			if kind == "sts" {
 				var err error
 				caller, err = auth.GetNewCredentialsWithMetadata(map[string]any{parentClaim: parent.AccessKey, "exp": UTCNow().Add(time.Hour).Unix()}, globalActiveCred.SecretKey)
@@ -500,6 +517,38 @@ func TestIAMAdminListSelfAliases(t *testing.T) {
 				}
 				if !found {
 					t.Fatalf("self alias %q did not list the parent's service accounts", alias)
+				}
+
+				query := url.Values{"listType": {madmin.AccessKeyListAll}}
+				if alias != "" {
+					query.Set("users", alias)
+				}
+				bulk := iamAdminCall(t, caller, "GET", "/minio/admin/v3/list-access-keys-bulk?"+query.Encode(), nil, nil, api.ListAccessKeysBulk)
+				assertIAMAdminStatus(t, "list bulk self alias", bulk, 200)
+				data, err = madmin.DecryptData(caller.SecretKey, bulk.Body)
+				mustIAM(t, err)
+				var listed map[string]madmin.ListAccessKeysResp
+				mustIAM(t, json.Unmarshal(data, &listed))
+				entry, ok := listed[parent.AccessKey]
+				if len(listed) != 1 || !ok || len(entry.ServiceAccounts) != 2 {
+					t.Fatalf("bulk self alias %q returned unexpected identities: %+v", alias, listed)
+				}
+				want := map[string]bool{target.AccessKey: true, serviceCaller.AccessKey: true}
+				for _, account := range entry.ServiceAccounts {
+					if !want[account.AccessKey] {
+						t.Fatalf("bulk self alias %q returned unexpected or duplicate service account %s", alias, account.AccessKey)
+					}
+					delete(want, account.AccessKey)
+				}
+				if kind == "sts" {
+					if len(entry.STSKeys) != 1 || entry.STSKeys[0].AccessKey != caller.AccessKey {
+						t.Fatalf("bulk self alias %q returned unexpected STS accounts: %+v", alias, entry.STSKeys)
+					}
+				} else if len(entry.STSKeys) != 0 {
+					t.Fatalf("service caller returned unexpected STS accounts: %+v", entry.STSKeys)
+				}
+				if bytes.Contains(data, []byte(serviceCaller.SecretKey)) || bytes.Contains(data, []byte(`"secretKey"`)) || bytes.Contains(data, []byte(`"sessionToken"`)) {
+					t.Fatal("bulk listing returned credential secrets")
 				}
 			}
 		})
