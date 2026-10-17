@@ -179,3 +179,65 @@ func TestListingRecoveryDirectoryCollisionOrdering(t *testing.T) {
 		}
 	}
 }
+
+// A regular walk result may be stale when a pending peer forces current
+// recovery. Keep sibling prefixes until the complete object group is resolved.
+func TestListingRecoveryMixedDirectoryCollision(t *testing.T) {
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for _, order := range orders {
+		for _, present := range []bool{false, true} {
+			t.Run(fmt.Sprintf("order=%v/present=%t", order, present), func(t *testing.T) {
+				entries := []metaCacheEntry{
+					{name: "dir/", metadata: []byte{1}},
+					{name: "dir/"},
+					{name: "dir/", listingSet: &erasureObjects{}},
+				}
+				in := make([]chan metaCacheEntry, len(order))
+				for i, index := range order {
+					in[i] = make(chan metaCacheEntry, 2)
+					in[i] <- entries[index]
+					in[i] <- metaCacheEntry{name: fmt.Sprintf("tail-%d", i), metadata: []byte{1}}
+					close(in[i])
+				}
+				out := make(chan metaCacheEntry, 6)
+				calls := 0
+				err := mergeEntryChannelsWithResolver(t.Context(), in, out, 1, nil, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
+					calls++
+					if len(group) != 2 {
+						t.Fatalf("incomplete object group: %+v", group)
+					}
+					pending := 0
+					for _, entry := range group {
+						if entry.name != "dir/" || entry.isDir() {
+							t.Fatalf("unexpected recovery entry: %+v", entry)
+						}
+						if entry.listingSet != nil {
+							pending++
+						}
+					}
+					if pending != 1 {
+						t.Fatalf("pending entries=%d, want 1", pending)
+					}
+					if !present {
+						return nil, nil
+					}
+					return &metaCacheEntry{name: "dir/", metadata: []byte{1}}, nil
+				})
+				if err != nil || calls != 1 {
+					t.Fatalf("err=%v recovery calls=%d", err, calls)
+				}
+				var names []string
+				for entry := range out {
+					names = append(names, entry.name)
+					if entry.listingSet != nil || entry.name == "dir/" && entry.isObject() != present {
+						t.Fatalf("unexpected merged entry: %+v", entry)
+					}
+				}
+				want := []string{"dir/", "tail-0", "tail-1", "tail-2"}
+				if !slices.Equal(names, want) {
+					t.Fatalf("names=%v, want %v", names, want)
+				}
+			})
+		}
+	}
+}

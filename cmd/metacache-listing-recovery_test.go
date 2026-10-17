@@ -221,33 +221,50 @@ func TestListingRecoveryNormalPathDoesNotReadOrLock(t *testing.T) {
 
 func TestListingPendingDirectoryCollision(t *testing.T) {
 	for _, objectFirst := range []bool{false, true} {
-		t.Run(fmt.Sprint(objectFirst), func(t *testing.T) {
-			in := []chan metaCacheEntry{make(chan metaCacheEntry, 1), make(chan metaCacheEntry, 1)}
-			objectIndex := 1
-			if objectFirst {
-				objectIndex = 0
-			}
-			in[objectIndex] <- metaCacheEntry{name: "dir/", listingSet: &erasureObjects{}}
-			in[1-objectIndex] <- metaCacheEntry{name: "dir/"}
-			for _, c := range in {
-				close(c)
-			}
-			out := make(chan metaCacheEntry, 2)
-			calls := 0
-			err := mergeEntryChannelsWithResolver(t.Context(), in, out, 1, nil, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
-				calls++
-				if len(group) != 1 || group[0].listingSet == nil {
-					t.Fatalf("wrong pending group: %+v", group)
+		for _, present := range []bool{true, false} {
+			t.Run(fmt.Sprintf("objectFirst=%v/present=%v", objectFirst, present), func(t *testing.T) {
+				in := []chan metaCacheEntry{make(chan metaCacheEntry, 2), make(chan metaCacheEntry, 2), make(chan metaCacheEntry, 2)}
+				objectIndex := 1
+				if objectFirst {
+					objectIndex = 0
 				}
-				return &metaCacheEntry{name: "dir/", metadata: []byte{1}}, nil
+				in[objectIndex] <- metaCacheEntry{name: "dir/", listingSet: &erasureObjects{}}
+				in[1-objectIndex] <- metaCacheEntry{name: "dir/"}
+				in[2] <- metaCacheEntry{name: "a", metadata: []byte{1}}
+				for _, c := range in {
+					close(c)
+				}
+				out := make(chan metaCacheEntry, 4)
+				calls := 0
+				err := mergeEntryChannelsWithResolver(t.Context(), in, out, 1, nil, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
+					calls++
+					if len(group) != 1 || group[0].listingSet == nil {
+						t.Fatalf("wrong pending group: %+v", group)
+					}
+					if !present {
+						return nil, nil
+					}
+					return &metaCacheEntry{name: "dir/", metadata: []byte{1}}, nil
+				})
+				if err != nil || calls != 1 || len(out) != 2 {
+					t.Fatalf("err=%v recoveries=%d outputs=%d", err, calls, len(out))
+				}
+				first := <-out
+				if first.name != "a" {
+					t.Fatalf("expected smaller key first, got %+v", first)
+				}
+				entry := <-out
+				if entry.name != "dir/" || entry.listingSet != nil {
+					t.Fatalf("unexpected recovered entry: %+v", entry)
+				}
+				if present && (entry.isDir() || !entry.isObjectDir()) {
+					t.Fatalf("object became directory: %+v", entry)
+				}
+				if !present && (!entry.isDir() || entry.name != "dir/") {
+					t.Fatalf("absent pending object dropped live directory prefix: %+v", entry)
+				}
 			})
-			if err != nil || calls != 1 || len(out) != 1 {
-				t.Fatalf("err=%v recoveries=%d outputs=%d", err, calls, len(out))
-			}
-			if entry := <-out; entry.isDir() || !entry.isObjectDir() {
-				t.Fatalf("object became directory: %+v", entry)
-			}
-		})
+		}
 	}
 }
 
