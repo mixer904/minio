@@ -1916,9 +1916,6 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		return ListMultipartsInfo{}, toObjectErr(err, bucket)
 	}
-	if globalAPIConfig.getMultipartListingLegacy() {
-		return z.listMultipartUploadsLegacy(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
-	}
 	scan, err := startMultipartScan(ctx, false)
 	if err != nil {
 		return ListMultipartsInfo{}, err
@@ -1926,68 +1923,20 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 	defer scan.close()
 
 	var uploads []MultipartInfo
-	var keyless bool
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		poolUploads, poolKeyless, err := pool.scanMultipartUploads(scan, bucket, idx)
+		poolUploads, err := pool.scanMultipartUploads(scan, bucket, idx)
 		if err != nil {
 			return ListMultipartsInfo{}, err
 		}
 		uploads = append(uploads, poolUploads...)
-		keyless = keyless || poolKeyless
 	}
 
-	// The old format cannot be enumerated authoritatively. Migration mode is
-	// explicit: another bucket must never silently change this API's semantics.
-	if keyless {
-		return ListMultipartsInfo{}, errMultipartListingLegacy
-	}
+	// Confirmed historical records lack a recoverable bucket/key and are
+	// omitted by the scan. They do not block listing identifiable uploads.
 	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
-}
-
-func (z *erasureServerPools) listMultipartUploadsLegacy(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
-	poolResult := ListMultipartsInfo{}
-	poolResult.MaxUploads = maxUploads
-	poolResult.KeyMarker = keyMarker
-	poolResult.Prefix = prefix
-	poolResult.Delimiter = delimiter
-
-	// if no prefix provided, return the list from cache
-	if prefix == "" {
-		if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
-			return ListMultipartsInfo{}, toObjectErr(err, bucket)
-		}
-
-		z.mpCache.Range(func(_ string, mp MultipartInfo) bool {
-			if mp.Bucket == bucket {
-				poolResult.Uploads = append(poolResult.Uploads, mp)
-			}
-			return true
-		})
-		sort.Slice(poolResult.Uploads, func(i int, j int) bool {
-			return poolResult.Uploads[i].Initiated.Before(poolResult.Uploads[j].Initiated)
-		})
-		return poolResult, nil
-	}
-
-	if z.SinglePool() {
-		return z.serverPools[0].getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
-	}
-
-	for idx, pool := range z.serverPools {
-		if z.IsSuspended(idx) {
-			continue
-		}
-		result, err := pool.getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
-		if err != nil {
-			return result, err
-		}
-		poolResult.Uploads = append(poolResult.Uploads, result.Uploads...)
-	}
-
-	return poolResult, nil
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.
@@ -2199,28 +2148,15 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
 
-	legacy := globalAPIConfig.getMultipartListingLegacy()
-	found := false
-	var firstErr error
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		poolFound, err := pool.getHashedSet(object).abortMultipartUpload(ctx, bucket, object, uploadID, opts, legacy)
-		if legacy && (poolFound || err != nil) {
-			// Match the released first-matching-pool behavior.
+		found, err := pool.getHashedSet(object).abortMultipartUpload(ctx, bucket, object, uploadID, opts)
+		if found || err != nil {
+			// Preserve the default first-matching-pool behavior.
 			return err
 		}
-		found = found || poolFound
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return firstErr
-	}
-	if found {
-		return nil
 	}
 	return InvalidUploadID{
 		Bucket:   bucket,

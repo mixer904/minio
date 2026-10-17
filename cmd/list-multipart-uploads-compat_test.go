@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -47,7 +46,7 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	z := obj.(*erasureServerPools)
-	setMultipartListingTestMode(t, false)
+
 	t.Cleanup(func() {
 		z.Shutdown(t.Context())
 		removeRoots(dirs)
@@ -182,8 +181,8 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 	}
 
 	// Simulate an upload written by a pre-upgrade server. Its key cannot be
-	// recovered by scanning the hashed namespace. Strict listing must fail;
-	// the old path is available only through an explicit migration setting.
+	// recovered by scanning the hashed namespace. Omit only that record, and
+	// preserve normal operations when its bucket, key and upload ID are known.
 	legacyObject := objects[1]
 	er := sets.getHashedSet(legacyObject)
 	fi, metadata, err := er.checkUploadIDExists(t.Context(), bucket, legacyObject, uploadIDs[legacyObject], true)
@@ -198,16 +197,25 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		er.getUploadIDDir(bucket, legacyObject, uploadIDs[legacyObject]), metadata, fi.WriteQuorum(er.defaultWQuorum())); err != nil {
 		t.Fatal(err)
 	}
-	_, err = z.ListMultipartUploads(t.Context(), bucket, legacyObject, "", "", "", 100)
-	if !errors.Is(err, errMultipartListingLegacy) {
-		t.Fatalf("legacy strict listing: %v", err)
-	}
-	setMultipartListingTestMode(t, true)
 	legacy, err := z.ListMultipartUploads(t.Context(), bucket, legacyObject, "", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireMultipartUploadKeys(t, legacy, legacyObject)
+	requireMultipartUploadKeys(t, legacy)
+	remaining, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireMultipartUploadKeys(t, remaining, objects[2:]...)
+	part, err = z.PutObjectPart(t.Context(), bucket, legacyObject, uploadIDs[legacyObject], 1,
+		mustGetPutObjReader(t, bytes.NewBufferString("old part"), 8, "", ""), ObjectOptions{})
+	if err != nil {
+		t.Fatalf("continue historical upload: %v", err)
+	}
+	if _, err = z.CompleteMultipartUpload(t.Context(), bucket, legacyObject, uploadIDs[legacyObject],
+		[]CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{}); err != nil {
+		t.Fatalf("complete historical upload: %v", err)
+	}
 }
 
 func TestPaginateMultipartUploads(t *testing.T) {
@@ -260,7 +268,7 @@ func TestPaginateMultipartUploads(t *testing.T) {
 
 func TestListMultipartUploadsGlobalPageAcrossPools(t *testing.T) {
 	z, bucket := consistencyPools(t)
-	setMultipartListingTestMode(t, false)
+
 	objects := []string{"a/one", "b/two", "c/three", "d/four"}
 	for i, object := range objects {
 		if _, err := z.serverPools[i%len(z.serverPools)].NewMultipartUpload(t.Context(), bucket, object, ObjectOptions{}); err != nil {
