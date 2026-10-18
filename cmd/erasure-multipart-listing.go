@@ -359,7 +359,7 @@ func (z *erasureServerPools) multipartPreflight(ctx context.Context) (multipartP
 		return multipartPreflightReport{}, err
 	}
 	defer s.close()
-	report := multipartPreflightReport{Complete: true, Mode: "persistent"}
+	report := multipartPreflightReport{Complete: true, Mode: "legacy"}
 	for p, pool := range z.serverPools {
 		for i, set := range pool.sets {
 			_, _ = set.scanMultipartUploads(s, "", p, i)

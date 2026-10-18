@@ -4,11 +4,10 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"testing"
 )
@@ -33,14 +32,10 @@ func removeMultipartIdentity(metadata map[string]string) {
 	delete(metadata, multipartMetaObject)
 }
 
-// The actual S3 handler must use the same semantics for every prefix and page,
-// even with old records and a stale, misleading node-local cache.
-func TestMultipartListingMixedHTTP(t *testing.T) {
-	z, set, _ := multipartListingFixture(t)
-	bucket, router, err := initAPIHandlerTest(t.Context(), z, []string{"ListMultipartUploads"}, MakeBucketOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
+// The retained diagnostic scanner handles mixed records independently of a
+// stale cache. Public HTTP behavior is tested separately.
+func TestMultipartDiagnosticMixed(t *testing.T) {
+	z, set, bucket := multipartListingFixture(t)
 	for _, key := range []string{"dir/old", "dir/a", "dir/sub/b", "outside"} {
 		mp, err := z.NewMultipartUpload(t.Context(), bucket, key, ObjectOptions{})
 		if err != nil {
@@ -54,22 +49,11 @@ func TestMultipartListingMixedHTTP(t *testing.T) {
 	z.mpCache.Store("stale", MultipartInfo{Bucket: bucket, Object: "ghost", UploadID: "stale"})
 	list := func(prefix, keyMarker, uploadMarker, delimiter string) ListMultipartUploadsResponse {
 		t.Helper()
-		req, err := newTestSignedRequestV4(http.MethodGet,
-			getListMultipartUploadsURLWithParams("", bucket, prefix, keyMarker, uploadMarker, delimiter, "1"),
-			0, nil, globalActiveCred.AccessKey, globalActiveCred.SecretKey, nil)
+		got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, prefix, keyMarker, uploadMarker, delimiter, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		var got ListMultipartUploadsResponse
-		if rec.Code != http.StatusOK {
-			t.Fatalf("list %q: HTTP %d %s", prefix, rec.Code, rec.Body.String())
-		}
-		if err := xml.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-			t.Fatal(err)
-		}
-		return got
+		return generateListMultipartUploadsResponse(bucket, got, "")
 	}
 	var keys []string
 	keyMarker, uploadMarker := "", ""
@@ -103,7 +87,7 @@ func TestMultipartListingMixedHTTP(t *testing.T) {
 	}
 }
 
-func TestMultipartListingInvalidIdentity(t *testing.T) {
+func TestMultipartDiagnosticInvalidIdentity(t *testing.T) {
 	for _, kind := range []string{"missing-bucket", "missing-object", "empty-bucket", "empty-object", "empty-both", "wrong-hash", "read-failure"} {
 		t.Run(kind, func(t *testing.T) {
 			z, set, bucket := multipartListingFixture(t)
@@ -142,7 +126,7 @@ func TestMultipartListingInvalidIdentity(t *testing.T) {
 					return disks
 				}
 			}
-			got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+			got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 			if err == nil || len(got.Uploads) != 0 || toAPIError(t.Context(), err).HTTPStatusCode != http.StatusServiceUnavailable {
 				t.Fatalf("invalid/unreadable record returned a successful page: %+v %v", got, err)
 			}
@@ -185,7 +169,14 @@ func TestMultipartListingRestart(t *testing.T) {
 	if _, cached := obj.(*erasureServerPools).mpCache.Load(mp.UploadID); cached {
 		t.Fatal("restart unexpectedly preserved the upload cache")
 	}
-	got, err := obj.ListMultipartUploads(t.Context(), bucket, "dir/", "", "", "", 10)
+	for _, prefix := range []string{"", "dir/"} {
+		got, err := obj.ListMultipartUploads(t.Context(), bucket, prefix, "", "", "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireMultipartUploadKeys(t, got)
+	}
+	got, err := obj.ListMultipartUploads(t.Context(), bucket, key, "", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,9 +184,18 @@ func TestMultipartListingRestart(t *testing.T) {
 	if got.Uploads[0].UploadID != mp.UploadID {
 		t.Fatal("restart changed upload identity")
 	}
+	part, err := obj.PutObjectPart(t.Context(), bucket, key, mp.UploadID, 1,
+		mustGetPutObjReader(t, bytes.NewBufferString("part"), 4, "", ""), ObjectOptions{})
+	if err != nil {
+		t.Fatalf("continue known upload after restart: %v", err)
+	}
+	if _, err := obj.CompleteMultipartUpload(t.Context(), bucket, key, mp.UploadID,
+		[]CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{}); err != nil {
+		t.Fatalf("complete known upload after restart: %v", err)
+	}
 }
 
-func TestMultipartListingConflictingIdentityCopies(t *testing.T) {
+func TestMultipartDiagnosticConflictingIdentityCopies(t *testing.T) {
 	for _, oldCopies := range []int{1, 3} {
 		z, set, bucket := multipartListingFixture(t)
 		mp, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
@@ -213,14 +213,14 @@ func TestMultipartListingConflictingIdentityCopies(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+		got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 		if !errors.Is(err, errMultipartListingIdentity) || len(got.Uploads) != 0 {
 			t.Fatalf("%d contradictory copies returned a successful page: %+v %v", oldCopies, got, err)
 		}
 	}
 }
 
-func TestMultipartListingUnsupportedStoredID(t *testing.T) {
+func TestMultipartDiagnosticUnsupportedStoredID(t *testing.T) {
 	for _, historical := range []bool{false, true} {
 		z, set, bucket := multipartListingFixture(t)
 		mp, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
@@ -244,7 +244,7 @@ func TestMultipartListingUnsupportedStoredID(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+		got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 		if historical {
 			if err != nil || len(got.Uploads) != 0 {
 				t.Fatalf("unidentified historical ID: %+v %v", got, err)

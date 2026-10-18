@@ -883,7 +883,7 @@ func serverHandleEnvVars() {
 	}
 	globalInplaceUpdateDisabled = true
 	if env.IsSet(api.EnvAPIMultipartListing) {
-		logger.Warning("%s is ignored: multipart listing always uses persistent metadata; uploads without identity fields are omitted", api.EnvAPIMultipartListing)
+		logger.Warning("%s is ignored: multipart listing uses the legacy cache/exact-key behavior; persistent listing is deferred", api.EnvAPIMultipartListing)
 	}
 
 	// Check if the supported credential env vars,

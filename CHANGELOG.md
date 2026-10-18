@@ -76,19 +76,16 @@ candidate's exact delta.
 
 ### Object storage and replication
 
-- Make durable `ListMultipartUploads` scanning the only listing path (#79):
-  apply prefix, delimiter, markers, ordering and the 1,000-entry page limit
-  globally across pools and sets, independently of node-local caches. Omit
-  readable historical uploads only when both bucket/key identity fields are
-  absent; malformed identities, uncertain coverage and resource limits remain
-  errors. Old uploads still support part upload, completion and cancellation
-  with a known bucket/key/upload ID. No backfill or new storage layout is added.
-  `MINIO_API_MULTIPART_LISTING` is retired and ignored with a startup warning;
-  historical shared `api multipart_listing` keys remain tolerated. The read-only
-  admin `multipart-preflight` reports `mode=persistent`; `ready` diagnoses the
-  absence of old records and no longer gates listing. Each page still scans
-  durable state within the existing 100,000-directory-entry, 30-second and
-  per-process concurrency budgets. See the
+- Withdraw default persistent `ListMultipartUploads` scanning (#79). Restore
+  node-local cache listing for an empty prefix and exact-key lookup otherwise;
+  restart omissions, true-prefix and cache-pagination limitations remain.
+  Preserve bucket/key identity metadata, path safety and stale-upload cleanup.
+  `MINIO_API_MULTIPART_LISTING` stays retired and ignored with a startup warning;
+  obsolete shared `api multipart_listing` keys remain tolerated. **Existing
+  opt-in strict users lose durable listing and strict cancellation.** The
+  read-only admin `multipart-preflight` reports `mode=legacy`; its scan budgets
+  and readiness do not gate public listing or startup. Durable, complete,
+  scalable enumeration remains deferred. See the
   [design and limits](https://silo.pgsty.com/blog/design/list-multipart-uploads/#implementation).
   Thanks to mr javad seydi (@mrjavadseydi) for the original metadata-and-scan
   implementation (#198).

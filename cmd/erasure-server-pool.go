@@ -1916,27 +1916,45 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		return ListMultipartsInfo{}, toObjectErr(err, bucket)
 	}
-	scan, err := startMultipartScan(ctx, false)
-	if err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	defer scan.close()
 
-	var uploads []MultipartInfo
+	poolResult := ListMultipartsInfo{}
+	poolResult.MaxUploads = maxUploads
+	poolResult.KeyMarker = keyMarker
+	poolResult.Prefix = prefix
+	poolResult.Delimiter = delimiter
+
+	// Preserve the legacy cache view, including its incomplete pagination.
+	// Persistent discovery remains an explicit admin diagnostic, not a
+	// prerequisite for public listing or known-upload operations.
+	if prefix == "" {
+		z.mpCache.Range(func(_ string, mp MultipartInfo) bool {
+			if mp.Bucket == bucket {
+				poolResult.Uploads = append(poolResult.Uploads, mp)
+			}
+			return true
+		})
+		sort.Slice(poolResult.Uploads, func(i int, j int) bool {
+			return poolResult.Uploads[i].Initiated.Before(poolResult.Uploads[j].Initiated)
+		})
+		return poolResult, nil
+	}
+
+	if z.SinglePool() {
+		return z.serverPools[0].getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		poolUploads, err := pool.scanMultipartUploads(scan, bucket, idx)
+		result, err := pool.getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 		if err != nil {
-			return ListMultipartsInfo{}, err
+			return result, err
 		}
-		uploads = append(uploads, poolUploads...)
+		poolResult.Uploads = append(poolResult.Uploads, result.Uploads...)
 	}
 
-	// Confirmed historical records lack a recoverable bucket/key and are
-	// omitted by the scan. They do not block listing identifiable uploads.
-	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
+	return poolResult, nil
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.

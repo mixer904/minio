@@ -408,7 +408,7 @@ func paginateMultipartUploads(uploads []MultipartInfo, prefix, keyMarker, upload
 }
 
 // listMultipartUploadsExact preserves the hashed exact-object lookup used by
-// multipart write placement. Public listing always uses the durable scan.
+// multipart write placement and nonempty public listing prefixes.
 func (er erasureObjects) listMultipartUploadsExact(ctx context.Context, bucket, object, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error) {
 	auditObjectErasureSet(ctx, "ListMultipartUploads", object, &er)
 
@@ -516,16 +516,7 @@ func (er erasureObjects) ListMultipartUploads(ctx context.Context, bucket, prefi
 	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
 		return ListMultipartsInfo{}, err
 	}
-	scan, err := startMultipartScan(ctx, false)
-	if err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	defer scan.close()
-	uploads, err := er.scanMultipartUploads(scan, bucket, 0, 0)
-	if err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
+	return er.listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 }
 
 // newMultipartUpload - wrapper for initializing a new multipart

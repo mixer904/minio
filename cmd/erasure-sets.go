@@ -886,31 +886,7 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 }
 
 func (s *erasureSets) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error) {
-	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	scan, err := startMultipartScan(ctx, false)
-	if err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	defer scan.close()
-	uploads, err := s.scanMultipartUploads(scan, bucket, 0)
-	if err != nil {
-		return ListMultipartsInfo{}, err
-	}
-	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
-}
-
-func (s *erasureSets) scanMultipartUploads(scan *multipartScan, bucket string, poolIdx int) ([]MultipartInfo, error) {
-	var uploads []MultipartInfo
-	for i, set := range s.sets {
-		setUploads, err := set.scanMultipartUploads(scan, bucket, poolIdx, i)
-		if err != nil {
-			return nil, err
-		}
-		uploads = append(uploads, setUploads...)
-	}
-	return uploads, nil
+	return s.getHashedSet(prefix).ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 }
 
 func (s *erasureSets) listMultipartUploadsExact(ctx context.Context, bucket, object string) (ListMultipartsInfo, error) {
