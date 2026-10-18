@@ -832,27 +832,17 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var decommissioned, expired int
+			var decommissioned int
 			for _, version := range fivs.Versions {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionObject, idx, bi.Name, version.Name, version.VersionID)
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bi.Name, version.Name, version) {
-					expired++
 					decommissioned++
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
-				// any object with only single DEL marker we don't need
-				// to decommission, just skip it, this also includes
-				// any other versions that have already expired.
-				remainingVersions := len(fivs.Versions) - expired
-				if version.Deleted && remainingVersions == 1 && rcfg == nil {
-					decommissioned++
-					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
-					continue
-				}
-
+				// Preserve every marker: older versions may live in another pool.
 				versionID := version.VersionID
 				if versionID == "" {
 					versionID = nullVersionID
@@ -991,15 +981,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// if all versions were decommissioned, then we can delete the object versions.
 			if decommissioned == len(fivs.Versions) {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
-				_, err := set.DeleteObject(ctx,
-					bi.Name,
-					encodeDirObject(entry.name),
-					ObjectOptions{
-						DeletePrefix:       true, // use prefix delete to delete all versions at once.
-						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-						NoAuditLog:         true,
-					},
-				)
+				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions)
 				stopFn(0, err)
 				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
 				if err != nil {
@@ -1205,10 +1187,6 @@ func (z *erasureServerPools) checkAfterDecom(ctx context.Context, idx int) error
 				for _, version := range fivs.Versions {
 					// Apply lifecycle rules on the objects that are expired.
 					if filterLifecycle(bi.Name, version.Name, version) {
-						ignored++
-						continue
-					}
-					if version.Deleted {
 						ignored++
 						continue
 					}

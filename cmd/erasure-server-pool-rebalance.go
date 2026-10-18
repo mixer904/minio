@@ -623,7 +623,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var rebalanced, expired int
+			var rebalanced int
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
@@ -635,21 +635,11 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bucket, version.Name, version) {
-					expired++
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
-				// any object with only single DEL marker we don't need
-				// to rebalance, just skip it, this also includes
-				// any other versions that have already expired.
-				remainingVersions := len(fivs.Versions) - expired
-				if version.Deleted && remainingVersions == 1 {
-					rebalanced++
-					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
-					continue
-				}
-
+				// Preserve every marker: older versions may live in another pool.
 				versionID := version.VersionID
 				if versionID == "" {
 					versionID = nullVersionID
@@ -753,15 +743,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// if all versions were rebalanced, we can delete the object versions.
 			if rebalanced == len(fivs.Versions) {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceRemoveObject, poolIdx, bucket, entry.name)
-				_, err := set.DeleteObject(ctx,
-					bucket,
-					encodeDirObject(entry.name),
-					ObjectOptions{
-						DeletePrefix:       true, // use prefix delete to delete all versions at once.
-						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-						NoAuditLog:         true,
-					},
-				)
+				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions)
 				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {

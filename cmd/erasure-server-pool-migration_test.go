@@ -116,15 +116,18 @@ func migrationTestPools(t *testing.T) (*erasureServerPools, string) {
 	t.Helper()
 	z, bucket := consistencyPools(t)
 	for _, pool := range z.serverPools {
-		for _, set := range pool.sets {
-			original := set.getDisks
-			disks := append([]StorageAPI(nil), original()...)
-			for i := range disks {
-				disks[i] = tagTestCapacityDisk{StorageAPI: disks[i]}
+		pool.erasureDisksMu.Lock()
+		previous := pool.erasureDisks
+		wrapped := make([][]StorageAPI, len(previous))
+		for i, disks := range previous {
+			wrapped[i] = append([]StorageAPI(nil), disks...)
+			for j := range wrapped[i] {
+				wrapped[i][j] = tagTestCapacityDisk{StorageAPI: wrapped[i][j]}
 			}
-			set.getDisks = func() []StorageAPI { return disks }
-			t.Cleanup(func() { set.getDisks = original })
 		}
+		pool.erasureDisks = wrapped
+		pool.erasureDisksMu.Unlock()
+		t.Cleanup(func() { pool.erasureDisksMu.Lock(); pool.erasureDisks = previous; pool.erasureDisksMu.Unlock() })
 	}
 	return z, bucket
 }
@@ -705,6 +708,7 @@ func TestPoolsMigrationKeepsCurrentCopy(t *testing.T) {
 							want, other := "source", "other"
 							if offset == 0 {
 								other = "source"
+								opts.PreserveETag = oi.ETag // interrupted copies preserve the original multipart ETag
 							} else if offset < 0 {
 								want = "other"
 							}

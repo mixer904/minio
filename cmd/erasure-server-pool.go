@@ -1251,6 +1251,25 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return ObjectInfo{}, z.deletePrefix(ctx, bucket, object)
 	}
 
+	if opts.DataMovement {
+		opts.NoLock = true
+		if _, err := z.checkDataMovementCopies(ctx, bucket, object, opts); err != nil {
+			return objInfo, err
+		}
+		// A marker still needs a destination when it is the only version of
+		// this key outside the draining pool.
+		idx, err := z.getPoolIdxNoLock(ctx, bucket, object, 0)
+		if err != nil {
+			return objInfo, err
+		}
+		if idx == opts.SrcPoolIdx {
+			return objInfo, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSrcDstPoolSame}
+		}
+		objInfo, err = z.serverPools[idx].DeleteObject(ctx, bucket, object, opts)
+		objInfo.Name = decodeDirObject(object)
+		return objInfo, err
+	}
+
 	// Resolve a physical purge by its addressed version even on a replica
 	// receiver: latest-key routing can select a different pool or miss copies.
 	// Marker creation and specialized movement/scanner operations retain their
@@ -1334,25 +1353,6 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	if pinfo.ObjInfo.DeleteMarker && opts.VersionID == "" {
 		pinfo.ObjInfo.Name = decodeDirObject(object)
 		return pinfo.ObjInfo, nil
-	}
-
-	// Datamovement must never be allowed on the same pool.
-	if opts.DataMovement && opts.SrcPoolIdx == pinfo.Index {
-		return pinfo.ObjInfo, DataMovementOverwriteErr{
-			Bucket:    bucket,
-			Object:    object,
-			VersionID: opts.VersionID,
-			Err:       errDataMovementSrcDstPoolSame,
-		}
-	}
-
-	if opts.DataMovement {
-		if _, err := z.checkDataMovementCopies(ctx, bucket, object, gopts); err != nil {
-			return pinfo.ObjInfo, err
-		}
-		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
-		objInfo.Name = decodeDirObject(object)
-		return objInfo, err
 	}
 
 	// Delete concurrently in all server pools with read quorum error for unversioned objects.

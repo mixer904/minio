@@ -2195,6 +2195,13 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	if opts.DataMovement && opts.DeleteMarker {
+		// Moving a null marker replaces any older null data/marker. Moving
+		// a UUID marker preserves it on retries instead of purging it.
+		deleteMarker = true
+		markDelete = opts.VersionID != nullVersionID
+	}
+
 	purge := opts.isVersionPurge()
 	if purge {
 		// A delete marker describes the version being removed; it is not an
