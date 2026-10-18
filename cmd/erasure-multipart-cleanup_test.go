@@ -126,8 +126,8 @@ func (d *multipartCleanupDisk) ReadVersion(context.Context, string, string, stri
 	return FileInfo{ModTime: d.modTime}, d.readErr
 }
 
-func (d *multipartCleanupDisk) StatVol(context.Context, string) (VolInfo, error) {
-	return VolInfo{Created: time.Now()}, nil
+func (d *multipartCleanupDisk) StatVol(ctx context.Context, volume string) (VolInfo, error) {
+	return (&xlStorage{drivePath: d.root}).StatVol(ctx, volume)
 }
 
 func TestCleanupStaleUploadsOnDisk(t *testing.T) {
@@ -157,7 +157,13 @@ func TestCleanupStaleUploadsOnDisk(t *testing.T) {
 			}
 			disk := &multipartCleanupDisk{root: t.TempDir(), modTime: modTime, readErr: tc.readErr}
 			uploadDir := filepath.Join(disk.root, minioMetaMultipartBucket, "sha", id)
-			if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+			for _, dir := range []string{uploadDir, filepath.Join(disk.root, minioMetaTmpDeletedBucket)} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// An old parent must not bypass a skipped upload's age or read error.
+			if err := os.Chtimes(filepath.Dir(uploadDir), modTime, modTime); err != nil {
 				t.Fatal(err)
 			}
 			erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
@@ -169,9 +175,60 @@ func TestCleanupStaleUploadsOnDisk(t *testing.T) {
 				if !os.IsNotExist(err) {
 					t.Errorf("expired upload must be removed: %v", err)
 				}
+				if _, err := os.Stat(filepath.Dir(uploadDir)); !os.IsNotExist(err) {
+					t.Errorf("empty hash directory must be removed in the same pass: %v", err)
+				}
 			} else if err != nil {
 				t.Errorf("upload must be preserved: %v", err)
 			}
 		})
+	}
+}
+
+func TestCleanupStaleUploadsEmptyHashDirectory(t *testing.T) {
+	for _, age := range []time.Duration{0, 2 * globalAPIConfig.getStaleUploadsExpiry()} {
+		t.Run(age.String(), func(t *testing.T) {
+			disk := &multipartCleanupDisk{root: t.TempDir()}
+			shaDir := filepath.Join(disk.root, minioMetaMultipartBucket, "sha")
+			for _, dir := range []string{shaDir, filepath.Join(disk.root, minioMetaTmpDeletedBucket)} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			modTime := time.Now().Add(-age)
+			if err := os.Chtimes(shaDir, modTime, modTime); err != nil {
+				t.Fatal(err)
+			}
+			erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+			if _, err := os.Stat(shaDir); !os.IsNotExist(err) {
+				t.Fatalf("empty hash directory must be removed regardless of age: %v", err)
+			}
+		})
+	}
+}
+
+func TestCleanupStaleUploadsSharedHashDirectory(t *testing.T) {
+	disk := &multipartCleanupDisk{root: t.TempDir(), readErr: errFileNotFound}
+	shaDir := filepath.Join(disk.root, minioMetaMultipartBucket, "sha")
+	now := time.Now()
+	expiredID := fmt.Sprintf("d16ad42a-6fe5-4a3b-8092-69983142238fx%d", now.Add(-2*globalAPIConfig.getStaleUploadsExpiry()).UnixNano())
+	recentID := fmt.Sprintf("4eacd477-e733-4851-b821-6fd42785ff87x%d", now.UnixNano())
+	for _, id := range []string{expiredID, recentID} {
+		if err := os.MkdirAll(filepath.Join(shaDir, id), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	partPath := filepath.Join(shaDir, recentID, "part.1")
+	const part = "recent upload part"
+	if err := os.WriteFile(partPath, []byte(part), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	erasureObjects{}.cleanupStaleUploadsOnDisk(t.Context(), disk)
+	if _, err := os.Stat(filepath.Join(shaDir, expiredID)); !os.IsNotExist(err) {
+		t.Errorf("expired upload must be removed: %v", err)
+	}
+	if got, err := os.ReadFile(partPath); err != nil || string(got) != part {
+		t.Errorf("recent upload must remain intact: got %q, err %v", got, err)
 	}
 }

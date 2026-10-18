@@ -197,6 +197,7 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 	drivePath := disk.Endpoint().Path
 
 	readDirFn(pathJoin(drivePath, minioMetaMultipartBucket), func(shaDir string, typ os.FileMode) error {
+		hasSkippedUploads := false
 		readDirFn(pathJoin(drivePath, minioMetaMultipartBucket, shaDir), func(uploadIDDir string, typ os.FileMode) error {
 			uploadIDPath := pathJoin(shaDir, uploadIDDir)
 			modTime := extractModTimeFromUploadIDDir(uploadIDDir)
@@ -205,12 +206,14 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 				wait := deleteMultipartCleanupSleeper.Timer(ctx)
 				fi, err := disk.ReadVersion(ctx, "", minioMetaMultipartBucket, uploadIDPath, "", ReadOptions{})
 				if err != nil {
+					hasSkippedUploads = true
 					return nil
 				}
 				modTime = fi.ModTime
 				wait()
 			}
 			if time.Since(modTime) < globalAPIConfig.getStaleUploadsExpiry() {
+				hasSkippedUploads = true
 				return nil
 			}
 			w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
@@ -223,24 +226,15 @@ func (er erasureObjects) cleanupStaleUploadsOnDisk(ctx context.Context, disk Sto
 				return nil
 			})
 		})
-		// Get the modtime of the shaDir.
-		vi, err := disk.StatVol(ctx, pathJoin(minioMetaMultipartBucket, shaDir))
-		if err != nil {
-			return nil
-		}
-		// Modtime is returned in the Created field. See (*xlStorage).StatVol
-		if time.Since(vi.Created) < globalAPIConfig.getStaleUploadsExpiry() {
+		if hasSkippedUploads {
 			return nil
 		}
 		w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 		return w.Run(func() error {
 			wait := deleteMultipartCleanupSleeper.Timer(ctx)
-			pathUUID := mustGetUUID()
-			targetPath := pathJoin(drivePath, minioMetaTmpDeletedBucket, pathUUID)
-
-			// We are not deleting shaDir recursively here, if shaDir is empty
-			// and its older then we can happily delete it.
-			Rename(pathJoin(drivePath, minioMetaMultipartBucket, shaDir), targetPath)
+			// Removing an upload updates the parent's mtime. Remove the parent
+			// immediately if it is empty; other uploads keep it in place.
+			_ = Remove(pathJoin(drivePath, minioMetaMultipartBucket, shaDir))
 			wait()
 			return nil
 		})
