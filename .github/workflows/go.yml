@@ -51,6 +51,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Install rebrand verification dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+
       - name: Verify rebrand compatibility contracts
         run: |
           go run ./buildscripts/rebrand-guard
