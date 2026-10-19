@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/grid"
+	"github.com/pgsty/silo-pkg/v3/ldap"
 	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
@@ -90,6 +92,133 @@ func TestIAMRevocationTombstoneReplayIsIdempotent(t *testing.T) {
 				t.Fatalf("newer recreation rejected: %v", err)
 			}
 		})
+	}
+}
+
+// An LDAP parent named by a normalized DN longer than NAME_MAX has no record
+// on object storage. Its lookups must find nothing instead of failing login.
+func TestLoadIAMRevisionNameTooLong(t *testing.T) {
+	for _, backend := range []string{"object", "etcd"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, sys, _ := prepareIAMRevisionFixture(t, backend)
+			store := sys.store.IAMStorageAPI
+			// 160 bytes of UTF-8 become 384 characters.
+			parent, err := ldap.NormalizeDN("uid=Сотрудник,ou=Отдел разработки,ou=Дирекция информационных технологий,ou=people,ou=swengg,dc=min,dc=io")
+			mustIAM(t, err)
+			if len(parent) <= 255 {
+				t.Fatalf("normalized DN has only %d characters", len(parent))
+			}
+			parentPath := getUserIdentityPath(parent, regUser)
+			for _, path := range []string{parentPath, getUserIdentityPath("missing-parent", regUser)} {
+				r, err := loadIAMRevision(ctx, store, path)
+				if err != nil || r.Deleted || !r.timestamp().IsZero() || !r.RevokedBefore.IsZero() {
+					t.Fatalf("absent revision %.40s...: %+v, %v", path, r, err)
+				}
+			}
+			if backend == "object" {
+				var invalid ObjectNameInvalid
+				if _, err := loadIAMRevision(ctx, store, iamConfigUsersPrefix+"a//b/"+iamIdentityFile); !errors.As(err, &invalid) {
+					t.Fatalf("invalid name not caused by length was masked: %v", err)
+				}
+			}
+
+			claims := map[string]any{}
+			mustIAM(t, setIAMParentRevocationClaim(ctx, store, parent, claims))
+			if _, ok := claims[iamParentRevocationClaim]; ok {
+				t.Fatalf("unexpected revocation claim: %v", claims)
+			}
+			if _, err := sys.PolicyDBGet(parent); err != nil {
+				t.Fatalf("policy lookup failed: %v", err)
+			}
+			// The call that failed in AssumeRoleWithLDAPIdentity.
+			secret, err := getTokenSigningKey()
+			mustIAM(t, err)
+			cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+			mustIAM(t, err)
+			cred.ParentUser = parent
+			_, err = sys.SetTempUser(ctx, cred.AccessKey, cred, "")
+			mustIAM(t, err)
+			if _, ok := sys.store.GetUser(cred.AccessKey); !ok {
+				t.Fatal("temporary credential not cached")
+			}
+
+			// Object storage still cannot record a revocation for this parent;
+			// the failure must be reported. Etcd has no such limit.
+			err = saveIAMRevision(ctx, store, parentPath, &iamUserRevocation{})
+			if backend == "object" {
+				if !iamConfigNameTooLong(parentPath, err) {
+					t.Fatalf("expected name-too-long error, got %v", err)
+				}
+				return
+			}
+			mustIAM(t, err)
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.Is(err, errIAMStaleUpdate) {
+				t.Fatalf("revoked parent accepted: %v", err)
+			}
+		})
+	}
+}
+
+// checkPathLength does not count backslashes outside Windows, so this escaped
+// DN passes it. Once config/iam/users exists, as after creating any built-in
+// user, the filesystem rejects the element with ENAMETOOLONG instead.
+func TestLoadIAMRevisionFilesystemNameTooLong(t *testing.T) {
+	ctx, sys, obj := prepareIAMRevisionFixture(t)
+	parent, err := ldap.NormalizeDN("cn=Сидоров П.П.,ou=Отдел ИТ-поддержки,ou=Пользователи,ou=people,ou=swengg,dc=min,dc=io")
+	mustIAM(t, err)
+	parentPath := getUserIdentityPath(parent, regUser)
+	if len(parent) <= 255 || checkPathLength(parentPath) != nil {
+		t.Fatalf("normalized DN must exceed NAME_MAX yet pass checkPathLength: %d characters, %v", len(parent), checkPathLength(parentPath))
+	}
+	_, err = sys.CreateUser(ctx, "existing-user", madmin.AddOrUpdateUserReq{SecretKey: "synthetic-user-password", Status: madmin.AccountEnabled})
+	mustIAM(t, err)
+	mustIAM(t, saveIAMRevision(ctx, sys.store.IAMStorageAPI, getMappedPolicyPath("existing-parent", stsUser, false), &MappedPolicy{Version: 1, Policies: "readwrite"}))
+	store := &IAMStoreSys{IAMStorageAPI: newIAMObjectStore(obj, LDAPUsersSysType)}
+	mustIAM(t, store.LoadIAMCache(ctx, false))
+	r, err := loadIAMRevision(ctx, store.IAMStorageAPI, parentPath)
+	if err != nil || r.Deleted || !r.timestamp().IsZero() {
+		t.Fatalf("absent revision: %+v, %v", r, err)
+	}
+	// LDAP mode reads policydb/sts-users/<DN>.json.
+	if _, err := store.PolicyDBGet(parent); err != nil {
+		t.Fatalf("policy lookup failed: %v", err)
+	}
+	secret, err := getTokenSigningKey()
+	mustIAM(t, err)
+	cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+	mustIAM(t, err)
+	cred.ParentUser = parent
+	if _, err := store.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
+		t.Fatalf("temporary credential rejected: %v", err)
+	}
+	err = saveIAMRevision(ctx, store.IAMStorageAPI, parentPath, &iamUserRevocation{})
+	if !iamConfigNameTooLong(parentPath, err) {
+		t.Fatalf("expected name-too-long error, got %v", err)
+	}
+}
+
+func TestIAMConfigNameTooLong(t *testing.T) {
+	long := iamConfigUsersPrefix + strings.Repeat("x", 256) + "/" + iamIdentityFile
+	short := iamConfigUsersPrefix + strings.Repeat("x", 200) + "/" + iamIdentityFile
+	invalid := iamConfigUsersPrefix + "a//b/" + iamIdentityFile
+	for _, tc := range []struct {
+		name string
+		path string
+		err  error
+		want bool
+	}{
+		{"NAME_MAX", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
+		{"filesystem", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, true},
+		{"drive", long, errFileNameTooLong, true},
+		{"no error", long, nil, false},
+		{"not found", long, errConfigNotFound, false},
+		{"offline drive", long, errDiskNotFound, false},
+		{"read quorum", long, InsufficientReadQuorum{}, false},
+		{"invalid name", invalid, ObjectNameInvalid{Bucket: minioMetaBucket, Object: invalid}, false},
+	} {
+		if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
+			t.Errorf("%s: got %t, want %t", tc.name, got, tc.want)
+		}
 	}
 }
 
