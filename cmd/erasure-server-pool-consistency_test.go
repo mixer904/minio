@@ -1442,3 +1442,46 @@ func TestPoolsDeleteObjectsKeepsLatestWithoutDeleteQuorum(t *testing.T) {
 		})
 	}
 }
+
+// A delete marker hides the object in every pool. When the versions of an
+// object are in two pools and the set of one of them cannot take a write, the
+// marker goes to the other pool instead of failing the delete. The versions
+// stay below the marker.
+func TestPoolsDeleteMarkerSkipsSetWithoutQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		degraded int // pool whose set loses drives
+		offline  int
+	}{
+		{"older version readable", 0, 8},
+		{"older version unreadable", 0, 9},
+		{"latest version readable", 1, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			const object = "marker-quorum"
+			v1 := putConsistencyObject(t, z, bucket, object, 0, "v1", ObjectOptions{Versioned: true, MaxParity: true, MTime: time.Now().Add(-time.Hour)})
+			v2 := putConsistencyObject(t, z, bucket, object, 1, "v2", ObjectOptions{Versioned: true, MaxParity: true})
+			set := z.serverPools[tc.degraded].getHashedSet(object)
+			getDisks := set.getDisks
+			disks := append([]StorageAPI(nil), getDisks()...)
+			for i := range tc.offline {
+				disks[i] = nil
+			}
+			set.getDisks = func() []StorageAPI { return disks }
+			defer func() { set.getDisks = getDisks }()
+			if _, err := z.DeleteObject(t.Context(), bucket, object, ObjectOptions{Versioned: true}); err != nil {
+				t.Fatalf("delete with the set of pool %d without quorum: %v", tc.degraded, err)
+			}
+			set.getDisks = getDisks
+			if _, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{}); !isErrObjectNotFound(err) && !isErrMethodNotAllowed(err) {
+				t.Errorf("object still readable after the delete: %v", err)
+			}
+			for pool, v := range []ObjectInfo{v1, v2} {
+				if _, err := z.serverPools[pool].GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: v.VersionID}); err != nil {
+					t.Errorf("pool %d lost version %s: %v", pool, v.VersionID, err)
+				}
+			}
+		})
+	}
+}

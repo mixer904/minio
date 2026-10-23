@@ -1367,6 +1367,21 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return objInfo, err
 	}
 
+	// A delete marker hides the object in every pool. When more than one pool
+	// holds the object, put the marker into the first one with a readable
+	// version whose set can take the write, so that a set without quorum does
+	// not fail the delete while another pool could take the marker.
+	if opts.VersionID == "" && len(noReadQuorumPools) > 1 {
+		for idx, pool := range z.serverPools {
+			if !poolReadable(noReadQuorumPools, idx) || deleteQuorumMissing(pool, object) {
+				continue
+			}
+			objInfo, err = pool.DeleteObject(ctx, bucket, object, opts)
+			objInfo.Name = decodeDirObject(object)
+			return objInfo, err
+		}
+	}
+
 	for _, pool := range z.serverPools {
 		objInfo, err := pool.DeleteObject(ctx, bucket, object, opts)
 		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
@@ -1419,6 +1434,16 @@ func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucke
 func deleteQuorumMissing(pool *erasureSets, object string) bool {
 	disks := pool.getHashedSet(object).getDisks()
 	return countOnlineDisks(disks) < len(disks)/2+1
+}
+
+// poolReadable reports whether pools lists pool idx with a readable version.
+func poolReadable(pools []poolErrs, idx int) bool {
+	for _, pe := range pools {
+		if pe.Index == idx {
+			return pe.Err == nil
+		}
+	}
+	return false
 }
 
 // copyWithoutDeleteQuorum reports whether a pool whose set cannot take a
