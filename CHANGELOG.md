@@ -7,6 +7,7 @@
   component over 255 bytes are treated as absent; long-DN writes still fail.
   Thanks to [@910patin](https://github.com/910patin) for the original fix and
   reproduction in [#250](https://github.com/pgsty/silo/pull/250).
+- Require Go 1.27.3 to include the crypto/x509 fix for GO-2026-6809.
 
 Preparation target: `RELEASE.2026-10-18T00-00-00Z` (package version
 `20261018000000.0.0`). **This is a tag and Draft preparation; it is not a public
