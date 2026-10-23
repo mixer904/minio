@@ -1,6 +1,6 @@
 module github.com/minio/minio
 
-go 1.27.2
+go 1.27.3
 
 // Console and MC retain their historical module paths for best-effort upstream
 // compatibility. Pin the maintained PGSTY implementations used by SILO.
