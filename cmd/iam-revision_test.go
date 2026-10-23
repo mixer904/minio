@@ -7,7 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -201,6 +204,10 @@ func TestIAMConfigNameTooLong(t *testing.T) {
 	long := iamConfigUsersPrefix + strings.Repeat("x", 256) + "/" + iamIdentityFile
 	short := iamConfigUsersPrefix + strings.Repeat("x", 200) + "/" + iamIdentityFile
 	invalid := iamConfigUsersPrefix + "a//b/" + iamIdentityFile
+	escaped := iamConfigUsersPrefix + strings.Repeat("\\d0", 86) + "/" + iamIdentityFile
+	limit := iamConfigUsersPrefix + strings.Repeat("x", 255) + "/" + iamIdentityFile
+	unicode := iamConfigUsersPrefix + strings.Repeat("界", 100) + "/" + iamIdentityFile
+	deep := iamConfigUsersPrefix + strings.Repeat("nested/", 160) + iamIdentityFile
 	for _, tc := range []struct {
 		name string
 		path string
@@ -208,17 +215,91 @@ func TestIAMConfigNameTooLong(t *testing.T) {
 		want bool
 	}{
 		{"NAME_MAX", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
-		{"filesystem", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, true},
+		{"escaped DN", escaped, ObjectNameInvalid{Bucket: minioMetaBucket, Object: escaped}, runtime.GOOS != "windows"},
+		{"short component", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, false},
+		{"exact component limit", limit, ObjectNameInvalid{Bucket: minioMetaBucket, Object: limit}, false},
+		{"unicode byte length", unicode, ObjectNameInvalid{Bucket: minioMetaBucket, Object: unicode}, false},
+		{"total path length", deep, ObjectNameInvalid{Bucket: minioMetaBucket, Object: deep}, false},
+		{"short drive path", short, errFileNameTooLong, false},
+		{"policy suffix at limit", getMappedPolicyPath(strings.Repeat("x", 250), stsUser, false), errFileNameTooLong, false},
+		{"policy suffix exceeds limit", getMappedPolicyPath(strings.Repeat("x", 251), stsUser, false), errFileNameTooLong, true},
 		{"drive", long, errFileNameTooLong, true},
+		{"wrapped drive", long, fmt.Errorf("read: %w", errFileNameTooLong), true},
+		{"wrapped object", long, fmt.Errorf("read: %w", ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}), true},
 		{"no error", long, nil, false},
 		{"not found", long, errConfigNotFound, false},
 		{"offline drive", long, errDiskNotFound, false},
 		{"read quorum", long, InsufficientReadQuorum{}, false},
+		{"access denied", long, PrefixAccessDenied{}, false},
+		{"deadline", long, context.DeadlineExceeded, false},
 		{"invalid name", invalid, ObjectNameInvalid{Bucket: minioMetaBucket, Object: invalid}, false},
+		{"invalid long name", invalid + strings.Repeat("x", 256), errFileNameTooLong, false},
 	} {
-		if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
-			t.Errorf("%s: got %t, want %t", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
+				t.Errorf("got %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// Moving a drive can make an existing record exceed the total path limit.
+// A length error must not turn that parent's revocation into a missing record.
+func TestLoadIAMRevisionDeepPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("exercises the Darwin total-path limit")
+	}
+	for _, tc := range []struct {
+		name   string
+		parent string
+	}{
+		{"ASCII", strings.Repeat("p", 200)},
+		{"Unicode", strings.Repeat("界", 100)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetTestGlobals()
+			defer resetTestGlobals()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			base := t.TempDir()
+			oldRoot := filepath.Join(base, "drive")
+			mustIAM(t, os.Mkdir(oldRoot, 0o700))
+			obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, oldRoot))
+			mustIAM(t, err)
+			defer func() { obj.Shutdown(ctx) }()
+			store := newIAMObjectStore(obj, LDAPUsersSysType)
+			cred := auth.Credentials{ParentUser: tc.parent}
+			parentPath := getUserIdentityPath(tc.parent, regUser)
+			mustIAM(t, store.saveIAMConfig(ctx, &UserIdentity{Version: 1, Deleted: true, RevokedBefore: UTCNow()}, parentPath))
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.Is(err, errIAMStaleUpdate) {
+				t.Fatalf("original parent revocation ineffective: %v", err)
+			}
+			mustIAM(t, obj.Shutdown(ctx))
+			deep := base
+			for len(deep) < 850 {
+				deep = filepath.Join(deep, strings.Repeat("d", 80))
+			}
+			mustIAM(t, os.MkdirAll(deep, 0o700))
+			newRoot := filepath.Join(deep, "drive")
+			mustIAM(t, checkPathLength(newRoot))
+			mustIAM(t, os.Rename(oldRoot, newRoot))
+			// The record still exists; a relative read avoids the total-path limit.
+			root, err := os.OpenRoot(newRoot)
+			mustIAM(t, err)
+			defer root.Close()
+			data, err := root.ReadFile(filepath.Join(minioMetaBucket, parentPath, xlStorageFormatFile))
+			mustIAM(t, err)
+			if len(data) == 0 {
+				t.Fatal("missing physical revocation record")
+			}
+			obj, _, err = initObjectLayer(ctx, mustGetPoolEndpoints(0, newRoot))
+			mustIAM(t, err)
+			store = newIAMObjectStore(obj, LDAPUsersSysType)
+			var invalid ObjectNameInvalid
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.As(err, &invalid) {
+				t.Fatalf("expected path error for an existing parent revocation, got %v", err)
+			}
+		})
 	}
 }
 

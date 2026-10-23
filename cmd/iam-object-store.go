@@ -134,20 +134,24 @@ func decryptData(data []byte, objPath string) ([]byte, error) {
 	return nil, err
 }
 
-// iamConfigNameTooLong reports whether the drives rejected objPath for its
-// length. IAM records are named after external identities: a normalized LDAP
-// DN hex-escapes every non-ASCII byte, so one Cyrillic letter takes six
-// characters. Such a record cannot have been stored. checkPathLength does not
-// count backslashes outside Windows, so an escaped DN can pass it and still
-// fail on the filesystem with ENAMETOOLONG once its parent directory exists.
-// toObjectErr reports both as ObjectNameInvalid, as it does for names that the
-// object layer rejects itself; repeat that validation to tell them apart.
+// iamConfigNameTooLong identifies length errors for valid keys with an ASCII
+// component that cannot be stored. Normalized LDAP DNs escape non-ASCII bytes.
+// Byte length alone is insufficient for Unicode filenames on macOS/Windows,
+// and a total-path limit can make an existing record unreadable after a move.
 func iamConfigNameTooLong(objPath string, err error) bool {
-	if errors.Is(err, errFileNameTooLong) {
-		return true
-	}
 	var invalid ObjectNameInvalid
-	return errors.As(err, &invalid) && checkBucketAndObjectNames(context.Background(), minioMetaBucket, objPath) == nil
+	if !errors.Is(err, errFileNameTooLong) && !errors.As(err, &invalid) {
+		return false
+	}
+	if checkBucketAndObjectNames(context.Background(), minioMetaBucket, objPath) != nil {
+		return false
+	}
+	for component := range strings.SplitSeq(objPath, SlashSeparator) {
+		if len(component) > 255 && utf8.RuneCountInString(component) == len(component) {
+			return true
+		}
+	}
+	return false
 }
 
 func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context, objPath string) ([]byte, ObjectInfo, error) {
