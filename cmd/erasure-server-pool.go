@@ -1387,36 +1387,67 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 }
 
 func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucket string, object string, opts ObjectOptions, poolIndices []poolErrs) (objInfo ObjectInfo, err error) {
-	derrs := make([]error, len(poolIndices))
-	dobjects := make([]ObjectInfo, len(poolIndices))
+	objInfo.Name = decodeDirObject(object)
 
-	// Delete concurrently in all server pools that reported no error or read quorum error
-	// where the read quorum issue is from metadata inconsistency.
-	var wg sync.WaitGroup
-	for idx, pe := range poolIndices {
+	// Delete in all server pools that reported no error or read quorum error
+	// where the read quorum issue is from metadata inconsistency. The
+	// poolIndices array is pre-sorted in order of latest ModTime. Retire the
+	// older copies first and stop at the first failure, as
+	// deleteObjectReconciled does: a failed delete then keeps the latest copy
+	// in place, instead of serving an older write of the object.
+	for idx := len(poolIndices) - 1; idx >= 0; idx-- {
+		pe := poolIndices[idx]
 		if v, ok := pe.Err.(InsufficientReadQuorum); ok && v.Type != RQInconsistentMeta {
-			derrs[idx] = InsufficientWriteQuorum{}
+			return objInfo, InsufficientWriteQuorum{}
+		}
+		dobj, derr := z.serverPools[pe.Index].DeleteObject(ctx, bucket, object, opts)
+		if idx == 0 {
+			objInfo, err = dobj, derr
+			break
+		}
+		if derr != nil && !isErrObjectNotFound(derr) && !isErrVersionNotFound(derr) {
+			dobj.Name = decodeDirObject(object)
+			return dobj, derr
+		}
+	}
+	objInfo.Name = decodeDirObject(object)
+	return objInfo, err
+}
+
+// deleteQuorumMissing reports whether the set of object in pool has fewer
+// online drives than a delete needs (N/2+1, as in erasureObjects.DeleteObjects).
+func deleteQuorumMissing(pool *erasureSets, object string) bool {
+	disks := pool.getHashedSet(object).getDisks()
+	return countOnlineDisks(disks) < len(disks)/2+1
+}
+
+// copyWithoutDeleteQuorum reports whether a pool whose set cannot take a
+// delete holds a copy of object, or of its versionID when set. Only such sets
+// are read.
+func (z *erasureServerPools) copyWithoutDeleteQuorum(ctx context.Context, bucket, object, versionID string) bool {
+	for _, pool := range z.serverPools {
+		if !deleteQuorumMissing(pool, object) {
 			continue
 		}
-		wg.Add(1)
-		pool := z.serverPools[pe.Index]
-		go func(idx int, pool *erasureSets) {
-			defer wg.Done()
-			dobjects[idx], derrs[idx] = pool.DeleteObject(ctx, bucket, object, opts)
-		}(idx, pool)
-	}
-	wg.Wait()
-
-	// the poolIndices array is pre-sorted in order of latest ModTime, we care only about pool with latest object though
-	// the delete call tries to clean up other pools during DeleteObject call.
-	objInfo = dobjects[0]
-	objInfo.Name = decodeDirObject(object)
-	for _, derr := range derrs {
-		if derr != nil && !isErrObjectNotFound(derr) && !isErrVersionNotFound(derr) {
-			return objInfo, derr
+		_, err := pool.GetObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: versionID, NoLock: true})
+		if err == nil || isErrReadQuorum(err) || isErrMethodNotAllowed(err) {
+			return true
 		}
 	}
-	return objInfo, derrs[0]
+	return false
+}
+
+// deletesData reports whether deleting obj removes an object or a version, as
+// opposed to adding a delete marker (see erasureObjects.DeleteObjects).
+func deletesData(obj ObjectToDelete, opts ObjectOptions) bool {
+	if obj.VersionID != "" {
+		return true
+	}
+	versioned := opts.Versioned
+	if opts.PrefixEnabledFn != nil {
+		versioned = opts.PrefixEnabledFn(obj.ObjectName)
+	}
+	return !versioned && !opts.VersionSuspended
 }
 
 func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
@@ -1442,25 +1473,50 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 	ctx = lkctx.Context()
 	defer multiDeleteLock.Unlock(lkctx)
 
+	// Pools delete the batch in parallel, so a pool that cannot take the
+	// delete would keep its copy while another pool removes a newer one.
+	// Leave an object or version untouched in every pool when a set without
+	// delete quorum holds a copy of it.
+	batch, batchIdx := objects, []int(nil)
+	if !z.SinglePool() {
+		batch = make([]ObjectToDelete, 0, len(objects))
+		batchIdx = make([]int, 0, len(objects))
+		for i, obj := range objects {
+			if derrs[i] == nil && deletesData(obj, opts) && z.copyWithoutDeleteQuorum(ctx, bucket, obj.ObjectName, obj.VersionID) {
+				dobjects[i] = DeletedObject{ObjectName: obj.ObjectName, VersionID: obj.VersionID}
+				derrs[i] = InsufficientWriteQuorum{}
+				continue
+			}
+			batch = append(batch, obj)
+			batchIdx = append(batchIdx, i)
+		}
+	}
+
 	dObjectsByPool := make([][]DeletedObject, len(z.serverPools))
 	dErrsByPool := make([][]error, len(z.serverPools))
 
-	eg := errgroup.WithNErrs(len(z.serverPools)).WithConcurrency(len(z.serverPools))
-	for i, pool := range z.serverPools {
-		pool := pool
-		eg.Go(func() error {
-			dObjectsByPool[i], dErrsByPool[i] = pool.DeleteObjects(ctx, bucket, objects, opts)
-			return nil
-		}, i)
+	if len(batch) > 0 {
+		eg := errgroup.WithNErrs(len(z.serverPools)).WithConcurrency(len(z.serverPools))
+		for i, pool := range z.serverPools {
+			pool := pool
+			eg.Go(func() error {
+				dObjectsByPool[i], dErrsByPool[i] = pool.DeleteObjects(ctx, bucket, batch, opts)
+				return nil
+			}, i)
+		}
+		eg.Wait() // wait to check all the pools.
 	}
-	eg.Wait() // wait to check all the pools.
 
-	for i := range dobjects {
+	for j := range batch {
+		i := j
+		if batchIdx != nil {
+			i = batchIdx[j]
+		}
 		// Iterate over pools
 		for pool := range z.serverPools {
-			if dErrsByPool[pool][i] == nil && dObjectsByPool[pool][i].found {
+			if dErrsByPool[pool][j] == nil && dObjectsByPool[pool][j].found {
 				// A fast exit when the object is found and removed
-				dobjects[i] = dObjectsByPool[pool][i]
+				dobjects[i] = dObjectsByPool[pool][j]
 				derrs[i] = nil
 				break
 			}
@@ -1468,8 +1524,20 @@ func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, o
 				// No error related to this object is found, assign this pool result
 				// whether it is nil because there is no object found or because of
 				// some other errors such erasure quorum errors.
-				dobjects[i] = dObjectsByPool[pool][i]
-				derrs[i] = dErrsByPool[pool][i]
+				dobjects[i] = dObjectsByPool[pool][j]
+				derrs[i] = dErrsByPool[pool][j]
+			}
+		}
+		// A delete marker in one pool hides the object, but an object or
+		// version removed from one pool is still served from a pool that
+		// failed to remove its copy.
+		if deletesData(batch[j], opts) {
+			for pool := range z.serverPools {
+				if err := dErrsByPool[pool][j]; err != nil {
+					dobjects[i] = dObjectsByPool[pool][j]
+					derrs[i] = err
+					break
+				}
 			}
 		}
 	}
