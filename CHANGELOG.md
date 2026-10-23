@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix LDAP login for long normalized DNs without hiding unreadable IAM
+  revocation records. Only length errors for valid keys with an ASCII path
+  component over 255 bytes are treated as absent; long-DN writes still fail.
+  Thanks to [@910patin](https://github.com/910patin) for the original fix and
+  reproduction in [#250](https://github.com/pgsty/silo/pull/250).
+
 Preparation target: `RELEASE.2026-10-18T00-00-00Z` (package version
 `20261018000000.0.0`). **This is a tag and Draft preparation; it is not a public
 Server release.** The latest published Server remains 20260916. Server 20261015
