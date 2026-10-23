@@ -134,9 +134,34 @@ func decryptData(data []byte, objPath string) ([]byte, error) {
 	return nil, err
 }
 
+// iamConfigNameTooLong identifies length errors for valid keys with an ASCII
+// component that cannot be stored. Normalized LDAP DNs escape non-ASCII bytes.
+// Byte length alone is insufficient for Unicode filenames on macOS/Windows,
+// and a total-path limit can make an existing record unreadable after a move.
+func iamConfigNameTooLong(objPath string, err error) bool {
+	var invalid ObjectNameInvalid
+	if !errors.Is(err, errFileNameTooLong) && !errors.As(err, &invalid) {
+		return false
+	}
+	if checkBucketAndObjectNames(context.Background(), minioMetaBucket, objPath) != nil {
+		return false
+	}
+	for component := range strings.SplitSeq(objPath, SlashSeparator) {
+		if len(component) > 255 && utf8.RuneCountInString(component) == len(component) {
+			return true
+		}
+	}
+	return false
+}
+
 func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context, objPath string) ([]byte, ObjectInfo, error) {
 	data, meta, err := readConfigWithMetadata(ctx, iamOS.objAPI, objPath, ObjectOptions{})
 	if err != nil {
+		if iamConfigNameTooLong(objPath, err) {
+			// A missing record, not a storage failure: lookups of the
+			// identity proceed, while saving its record still fails.
+			err = errConfigNotFound
+		}
 		return nil, meta, err
 	}
 	data, err = decryptData(data, objPath)

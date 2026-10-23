@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix LDAP login for long normalized DNs without hiding unreadable IAM
+  revocation records. Only length errors for valid keys with an ASCII path
+  component over 255 bytes are treated as absent; long-DN writes still fail.
+  Thanks to [@910patin](https://github.com/910patin) for the original fix and
+  reproduction in [#250](https://github.com/pgsty/silo/pull/250).
 - Build the server and standalone debugging tools with Go 1.27.3 and refresh
   Go dependencies. Keep the published Console, mcli and silo-pkg references.
 - Preserve Kafka's default broker protocol 2.1 and terminal-width behavior;
