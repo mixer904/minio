@@ -79,13 +79,13 @@ require (
 	github.com/minio/xxml v0.0.3
 	github.com/minio/zipindex v0.5.0
 	github.com/mitchellh/go-homedir v1.1.0
-	github.com/mixer904/minio-pkg v0.1.10
+	github.com/mixer904/minio-pkg v0.1.11
 	github.com/nats-io/nats-server/v2 v2.15.1
 	github.com/nats-io/nats.go v1.55.0
 	github.com/nats-io/stan.go v0.10.4
 	github.com/ncw/directio v1.0.5
 	github.com/nsqio/go-nsq v1.1.0
-	github.com/pgsty/silo-pkg/v3 v3.14.3
+	github.com/pgsty/silo-pkg/v3 v3.15.0
 	github.com/philhofer/fwd v1.2.1
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/pkg/errors v0.9.1
@@ -258,7 +258,7 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
-	github.com/pires/go-proxyproto v0.7.0 // indirect
+	github.com/pires/go-proxyproto v0.16.0 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/posener/complete v1.2.3 // indirect
