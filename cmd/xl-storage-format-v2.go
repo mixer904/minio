@@ -1101,7 +1101,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 				return msgp.WrapError(err, "Versions")
 			}
 			if cap(x.versions) >= int(zb0002) {
-				x.versions = (x.versions)[:zb0002]
+				x.versions = x.versions[:zb0002]
 			} else {
 				x.versions = make([]xlMetaV2ShallowVersion, zb0002, zb0002+1)
 			}
@@ -1590,6 +1590,13 @@ func (x *xlMetaV2) UpdateObjectVersion(fi FileInfo) error {
 
 // AddVersion adds a new version
 func (x *xlMetaV2) AddVersion(fi FileInfo) error {
+	// Refuse to persist metadata no shard size can be derived from. This is the
+	// single funnel every version write passes through, so rejecting here keeps
+	// the poison off disk rather than relying on every reader to cope with it.
+	if fi.HasNegativePartSize() {
+		return errFileCorrupt
+	}
+
 	if fi.VersionID == "" {
 		// this means versioning is not yet
 		// enabled or suspend i.e all versions
@@ -1623,7 +1630,7 @@ func (x *xlMetaV2) AddVersion(fi FileInfo) error {
 		ventry.DeleteMarker = &xlMetaV2DeleteMarker{
 			VersionID: uv,
 			ModTime:   fi.ModTime.UnixNano(),
-			MetaSys:   make(map[string][]byte),
+			MetaSys:   deleteMarkerMetadata(fi),
 		}
 	} else {
 		ventry.Type = ObjectType
@@ -1934,6 +1941,10 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 		// No need for non-strict checks if quorum is 1.
 		strict = true
 	}
+	// Keep the original stream shapes: pruning must not make a versioned object
+	// eligible for the single null-version recount below.
+	originalVersions := versions
+	var checkedSingleNull, singleNull, mixedECNull bool
 	// Shallow copy input
 	versions = append(make([][]xlMetaV2ShallowVersion, 0, len(versions)), versions...)
 
@@ -2008,42 +2019,26 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 					// Version IDs match, but otherwise unable to resolve.
 					// We are either strict, or don't have enough information to match.
 					// Switch to a pure counting algo.
-					x := make(map[xlMetaV2VersionHeader]int, len(tops))
-					for _, a := range tops {
-						if a.header.VersionID != ver.header.VersionID {
-							continue
-						}
-						if !strict {
-							// we must match EC, when we are not strict.
-							if !a.header.matchesEC(ver.header) {
-								continue
-							}
-
-							a.header.Signature = [4]byte{}
-						}
-						x[a.header]++
-					}
-					latestCount = 0
-					for k, v := range x {
-						if v < latestCount {
-							continue
-						}
-						if v == latestCount && latest.header.sortsBefore(k) {
-							// Tiebreak, use sort.
-							continue
-						}
-						for _, a := range tops {
-							hdr := a.header
-							if !strict {
-								hdr.Signature = [4]byte{}
-							}
-							if hdr == k {
-								latest = a
-							}
-						}
-						latestCount = v
-					}
+					latest, latestCount = countXLV2Versions(tops, ver.header, latest, strict, false)
 					break
+				}
+			}
+			if latestCount < quorum {
+				if !checkedSingleNull {
+					singleNull = singleNullVersionStreams(originalVersions, false)
+					// Availability-optimized writes can change EC while a drive
+					// is offline. Only latest-only non-strict reads may recount
+					// these ordinary null versions across separate modern EC groups.
+					mixedECNull = !singleNull && !strict && requestedVersions == 1 &&
+						singleNullVersionStreams(originalVersions, true)
+					checkedSingleNull = true
+				}
+				if singleNull || mixedECNull {
+					// A newer minority at the end can hide an older quorum from
+					// the selection loop. Recount before discarding the null ID.
+					if candidate, count := countXLV2Versions(tops, latest.header, latest, strict, mixedECNull); count >= quorum {
+						latest, latestCount = candidate, count
+					}
 				}
 			}
 			if latestCount >= quorum {
@@ -2104,6 +2099,86 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 		}
 	}
 	return merged
+}
+
+// singleNullVersionStreams excludes histories and other version types from the
+// additional recount. Check the original inputs, before any stream is pruned.
+// Mixed EC groups require known modern EC headers on every non-empty stream.
+func singleNullVersionStreams(versions [][]xlMetaV2ShallowVersion, allowMixedEC bool) bool {
+	var ec xlMetaV2VersionHeader
+	var haveEC bool
+	for _, stream := range versions {
+		if len(stream) == 0 {
+			continue
+		}
+		if len(stream) != 1 {
+			return false
+		}
+		h := stream[0].header
+		if h.VersionID != [16]byte{} || h.Type != ObjectType || h.FreeVersion() {
+			return false
+		}
+		if allowMixedEC && !h.hasEC() {
+			return false
+		}
+		if !allowMixedEC && haveEC && (h.EcN != ec.EcN || h.EcM != ec.EcM) {
+			return false
+		}
+		ec, haveEC = h, true
+	}
+	return haveEC
+}
+
+// countXLV2Versions selects the most frequent compatible header for reference's
+// VersionID and the last matching entry. The mixed-EC null-version recount adds
+// a stable EC tiebreak without changing the ordinary counting path.
+func countXLV2Versions(tops []xlMetaV2ShallowVersion, reference xlMetaV2VersionHeader, latest xlMetaV2ShallowVersion, strict, allowMixedEC bool) (xlMetaV2ShallowVersion, int) {
+	x := make(map[xlMetaV2VersionHeader]int, len(tops))
+	for _, a := range tops {
+		if a.header.VersionID != reference.VersionID {
+			continue
+		}
+		if !strict {
+			// The narrow null-version recount can consider other EC groups,
+			// but EcN/EcM stay in the map key: their votes never combine.
+			if !allowMixedEC && !a.header.matchesEC(reference) {
+				continue
+			}
+			a.header.Signature = [4]byte{}
+		}
+		x[a.header]++
+	}
+	var latestCount int
+	for k, v := range x {
+		if v < latestCount {
+			continue
+		}
+		if v == latestCount {
+			if allowMixedEC {
+				current := latest.header
+				current.Signature = [4]byte{}
+				// Signatures are not part of these groups. Use EC counts as
+				// the final tiebreak when the existing sort fields are equal.
+				if current.sortsBefore(k) || !k.sortsBefore(current) &&
+					(current.EcM > k.EcM || current.EcM == k.EcM && current.EcN > k.EcN) {
+					continue
+				}
+			} else if latest.header.sortsBefore(k) {
+				continue
+			}
+		}
+		for _, a := range tops {
+			hdr := a.header
+			if !strict {
+				hdr.Signature = [4]byte{}
+			}
+			if hdr == k {
+				latest = a
+			}
+		}
+		latestCount = v
+	}
+	return latest, latestCount
 }
 
 type xlMetaBuf []byte

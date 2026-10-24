@@ -4,20 +4,20 @@ set -E
 set -o pipefail
 set -x
 
-if [ ! -x "$PWD/minio" ]; then
-	echo "minio executable binary not found in current directory"
+if [ ! -x "$PWD/silo" ]; then
+	echo "Silo executable binary not found in current directory"
 	exit 1
 fi
 
 WORK_DIR="$(mktemp -d)"
-MINIO_CONFIG_DIR="$WORK_DIR/.minio"
-MINIO=("$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" server)
+SILO_CONFIG_DIR="$WORK_DIR/.silo"
+SILO=("$PWD/silo" --config-dir "$SILO_CONFIG_DIR" server)
 
-function start_minio() {
+function start_silo() {
 	start_port=$1
 
-	export MINIO_ROOT_USER=minio
-	export MINIO_ROOT_PASSWORD=minio123
+	export MINIO_ROOT_USER=silo
+	export MINIO_ROOT_PASSWORD=silo1234
 	unset MINIO_KMS_AUTO_ENCRYPTION # do not auto-encrypt objects
 	unset MINIO_CI_CD
 	unset CI
@@ -28,7 +28,7 @@ function start_minio() {
 	done
 
 	for i in $(seq 1 4); do
-		"${MINIO[@]}" --address ":$((start_port + i))" ${args[@]} 2>&1 >"${WORK_DIR}/server$i.log" &
+		"${SILO[@]}" --address ":$((start_port + i))" ${args[@]} 2>&1 >"${WORK_DIR}/server$i.log" &
 	done
 
 	# Wait until all nodes return 403
@@ -60,7 +60,7 @@ function prepare_block_devices() {
 # Start a distributed MinIO setup, unmount one disk and check if it is formatted
 function main() {
 	start_port=$(shuf -i 10000-65000 -n 1)
-	start_minio ${start_port}
+	start_silo ${start_port}
 
 	# Unmount the disk, after the unmount the device id
 	# /tmp/xxx/mnt/disk4 will be the same as '/' and it
@@ -82,7 +82,7 @@ function main() {
 }
 
 function cleanup() {
-	pkill minio
+	pkill silo
 	sudo umount ${WORK_DIR}/mnt/disk{1..3}/
 	sudo rm /dev/minio-loopdisk*
 	rm -rf "$WORK_DIR"

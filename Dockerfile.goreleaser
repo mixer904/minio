@@ -1,4 +1,15 @@
-FROM golang:1.26.4-alpine AS build
+FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS curl-build
+ARG TARGETARCH
+COPY dockerscripts/build-static-curl.sh /build/build-static-curl
+RUN /bin/sh /build/build-static-curl
+
+# Exercise the exact shipped curl without a dynamic loader or shared libraries.
+FROM scratch AS curl-runtime
+COPY --from=curl-build /go/bin/curl /curl
+COPY --from=curl-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/curl"]
+
+FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
 
 ARG TARGETARCH
 
@@ -6,7 +17,9 @@ ENV GOPATH=/go
 ENV CGO_ENABLED=0
 
 ARG MC_REPO=pgsty/mc
-ARG MC_VERSION=latest
+ARG MC_VERSION=RELEASE.2026-10-18T00-00-00Z
+ARG MC_AMD64_SHA256=b5392a642dbc9685b517ee901f032d1d5e88f41704436f0f08dde6060b577db3
+ARG MC_ARM64_SHA256=17f3eb694ed34e155b331b1215832140749656d8d4b60e2e3a4d0573b8f320d7
 
 RUN apk add -U --no-cache \
     ca-certificates \
@@ -14,8 +27,8 @@ RUN apk add -U --no-cache \
     curl \
     jq && \
     case "${TARGETARCH}" in \
-      amd64) MC_ARCH=amd64 ;; \
-      arm64) MC_ARCH=arm64 ;; \
+      amd64) MC_ARCH=amd64; MC_PINNED_SHA256="${MC_AMD64_SHA256}" ;; \
+      arm64) MC_ARCH=arm64; MC_PINNED_SHA256="${MC_ARM64_SHA256}" ;; \
       *) echo "Unsupported TARGETARCH=${TARGETARCH}"; exit 1 ;; \
     esac && \
     if [ "${MC_VERSION}" = "latest" ]; then \
@@ -39,7 +52,8 @@ RUN apk add -U --no-cache \
     EXPECTED=$(grep "  ${ARCHIVE_NAME}$" /tmp/mcli_checksums.txt | awk '{print $1}') && \
     ACTUAL=$(sha256sum /tmp/mcli.tar.gz | awk '{print $1}') && \
     [ -n "${EXPECTED}" ] || { echo "Checksum entry not found for ${ARCHIVE_NAME}"; exit 1; } && \
-    [ "${EXPECTED}" = "${ACTUAL}" ] || { echo "Checksum mismatch: expected ${EXPECTED}, got ${ACTUAL}"; exit 1; } && \
+    [ "${EXPECTED}" = "${MC_PINNED_SHA256}" ] || { echo "Published checksum drift for ${ARCHIVE_NAME}"; exit 1; } && \
+    [ "${MC_PINNED_SHA256}" = "${ACTUAL}" ] || { echo "Checksum mismatch: expected ${MC_PINNED_SHA256}, got ${ACTUAL}"; exit 1; } && \
     echo "Checksum OK: ${ACTUAL}" && \
     mkdir -p /tmp/mcli-extract && \
     tar -xzf /tmp/mcli.tar.gz -C /tmp/mcli-extract/ && \
@@ -53,44 +67,58 @@ RUN apk add -U --no-cache \
     chmod +x /go/bin/mcli && \
     ln -sf mcli /go/bin/mc
 
-COPY dockerscripts/download-static-curl.sh /build/download-static-curl
-RUN chmod +x /build/download-static-curl && \
-    /build/download-static-curl
-
-FROM registry.access.redhat.com/ubi9/ubi:latest AS certs
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3 AS certs
+# Native root blocklist mitigation: https://access.redhat.com/security/vulnerabilities/RHSB-2026-012
 RUN dnf -y install ca-certificates && \
+    if [ -d /etc/pki/ca-trust/source/blocklist ]; then \
+      blocklist=/etc/pki/ca-trust/source/blocklist; \
+    else \
+      blocklist=/etc/pki/ca-trust/source/blacklist; \
+    fi && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=Comodo%20AAA%20Services%20root;type=cert' \
+      "$blocklist/Comodo_AAA_Services_root.pem" && \
+    trust extract --overwrite --format=pem-bundle \
+      --filter='pkcs11:object=emSign%20ECC%20Root%20CA%20-%20G3;type=cert' \
+      "$blocklist/emSign_ECC_Root_CA_-_G3.pem" && \
     update-ca-trust && \
     cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tmp/ca-certificates.crt && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:5be877a2a280ae36eb9ab80ca4efb28bbf77c57abbba38137cdc37a03b8465e6
 
-LABEL maintainer="pgsty <https://github.com/pgsty/minio>" \
-      description="MinIO community fork, build by pgsty"
+LABEL org.opencontainers.image.title="Silo" \
+      org.opencontainers.image.description="S3-Interface Libre Object Storage" \
+      org.opencontainers.image.url="https://silo.pgsty.com" \
+      org.opencontainers.image.source="https://github.com/pgsty/silo" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      maintainer="PGSTY <https://silo.pgsty.com>"
 
 ENV MINIO_ACCESS_KEY_FILE=access_key \
     MINIO_SECRET_KEY_FILE=secret_key \
     MINIO_ROOT_USER_FILE=access_key \
     MINIO_ROOT_PASSWORD_FILE=secret_key \
     MINIO_KMS_SECRET_KEY_FILE=kms_master_key \
-    MINIO_UPDATE_MINISIGN_PUBKEY="RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav" \
     MINIO_CONFIG_ENV_FILE=config.env \
+    HOME=/tmp \
     MC_CONFIG_DIR=/tmp/.mc
 
 COPY --from=certs /tmp/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY minio /usr/bin/minio
+COPY silo /usr/bin/silo
 COPY --from=build /go/bin/mcli /usr/bin/mcli
-COPY --from=build /go/bin/curl* /usr/bin/
+COPY --from=curl-build /go/bin/curl /usr/bin/curl
+COPY --from=curl-build /go/share/curl /licenses/curl
 COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 COPY LICENSE /licenses/LICENSE
+COPY NOTICE /licenses/NOTICE
 COPY CREDITS /licenses/CREDITS
 
-RUN chmod +x /usr/bin/minio /usr/bin/mcli /usr/bin/docker-entrypoint.sh && \
+RUN chmod +x /usr/bin/silo /usr/bin/mcli /usr/bin/docker-entrypoint.sh && \
     ln -sf mcli /usr/bin/mc
 
 EXPOSE 9000
 VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
-CMD ["minio"]
+CMD ["silo"]

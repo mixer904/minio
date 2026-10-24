@@ -9,7 +9,7 @@ export CI=1
 
 make || exit 255
 
-killall -9 minio || true
+killall -9 silo || true
 
 rm -rf /tmp/xl/
 mkdir -p /tmp/xl/1/ /tmp/xl/2/
@@ -26,39 +26,39 @@ for i in $(seq 1 $NODES); do
 done
 
 for i in $(seq 1 $NODES); do
-	./minio server --address "127.0.0.1:$((9000 + i))" ${args1[@]} & # | tee /tmp/minio/node.$i &
-	./minio server --address "127.0.0.1:$((9100 + i))" ${args2[@]} & # | tee /tmp/minio/node.$i &
+	./silo server --address "127.0.0.1:$((9000 + i))" ${args1[@]} & # | tee /tmp/minio/node.$i &
+	./silo server --address "127.0.0.1:$((9100 + i))" ${args2[@]} & # | tee /tmp/minio/node.$i &
 done
 
 sleep 10
 
-./mc alias set myminio1 http://localhost:9001 minioadmin minioadmin
-./mc alias set myminio2 http://localhost:9101 minioadmin minioadmin
+./mc alias set mysilo1 http://localhost:9001 minioadmin minioadmin
+./mc alias set mysilo2 http://localhost:9101 minioadmin minioadmin
 
-./mc ready myminio1
-./mc ready myminio2
+./mc ready mysilo1
+./mc ready mysilo2
 sleep 1
 
-./mc mb myminio1/testbucket/ --with-lock
-./mc mb myminio2/testbucket/ --with-lock
+./mc mb mysilo1/testbucket/ --with-lock
+./mc mb mysilo2/testbucket/ --with-lock
 
-./mc encrypt set sse-s3 my-minio-key myminio1/testbucket/
-./mc encrypt set sse-s3 my-minio-key myminio2/testbucket/
+./mc encrypt set sse-s3 my-minio-key mysilo1/testbucket/
+./mc encrypt set sse-s3 my-minio-key mysilo2/testbucket/
 
-./mc replicate add myminio1/testbucket --remote-bucket http://minioadmin:minioadmin@localhost:9101/testbucket --priority 1
-./mc replicate add myminio2/testbucket --remote-bucket http://minioadmin:minioadmin@localhost:9001/testbucket --priority 1
+./mc replicate add mysilo1/testbucket --remote-bucket http://minioadmin:minioadmin@localhost:9101/testbucket --priority 1
+./mc replicate add mysilo2/testbucket --remote-bucket http://minioadmin:minioadmin@localhost:9001/testbucket --priority 1
 
 sleep 1
 
 cp README.md internal.tar
 
-./mc cp internal.tar myminio1/testbucket/dir/1.tar
-./mc cp internal.tar myminio2/testbucket/dir/2.tar
+./mc cp internal.tar mysilo1/testbucket/dir/1.tar
+./mc cp internal.tar mysilo2/testbucket/dir/2.tar
 
 sleep 1
 
-./mc ls -r --versions myminio1/testbucket/dir/ >/tmp/dir_1.txt
-./mc ls -r --versions myminio2/testbucket/dir/ >/tmp/dir_2.txt
+./mc ls -r --versions mysilo1/testbucket/dir/ >/tmp/dir_1.txt
+./mc ls -r --versions mysilo2/testbucket/dir/ >/tmp/dir_2.txt
 
 out=$(diff -qpruN /tmp/dir_1.txt /tmp/dir_2.txt)
 ret=$?

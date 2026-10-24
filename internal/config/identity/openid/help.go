@@ -69,7 +69,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         Vendor,
-			Description: `Specify vendor type for vendor specific behavior to checking validity of temporary credentials and service accounts on MinIO` + defaultHelpPostfix(Vendor),
+			Description: `Specify vendor type for vendor-specific behavior when checking temporary credentials and service accounts on Silo` + defaultHelpPostfix(Vendor),
 			Optional:    true,
 			Type:        "string",
 		},

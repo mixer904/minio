@@ -69,7 +69,7 @@ func newParallelReader(readers []io.ReaderAt, e Erasure, offset, totalLength int
 		offset:        (offset / e.blockSize) * e.ShardSize(),
 		shardSize:     e.ShardSize(),
 		shardFileSize: e.ShardFileSize(totalLength),
-		buf:           make([][]byte, len(readers)),
+		buf:           bufs,
 		readerToBuf:   r2b,
 		stashBuffer:   b,
 	}
@@ -106,8 +106,7 @@ func (p *parallelReader) preferReaders(prefer []bool) {
 		// Move reader with index i to index next.
 		// Do this by swapping next and i
 		p.readers[next], p.readers[i] = p.readers[i], p.readers[next]
-		p.readerToBuf[next] = i
-		p.readerToBuf[i] = next
+		p.readerToBuf[next], p.readerToBuf[i] = p.readerToBuf[i], p.readerToBuf[next]
 		next++
 	}
 }

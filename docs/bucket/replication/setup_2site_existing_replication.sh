@@ -18,9 +18,9 @@ catch() {
 		done
 	fi
 
-	echo "Cleaning up instances of MinIO"
-	pkill minio
-	pkill -9 minio
+	echo "Cleaning up instances of Silo"
+	pkill silo
+	pkill -9 silo
 	rm -rf /tmp/multisitea
 	rm -rf /tmp/multisiteb
 	rm -rf /tmp/data
@@ -35,7 +35,7 @@ set -e
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="minio123"
+export MINIO_ROOT_PASSWORD="silo12345"
 export MINIO_KMS_AUTO_ENCRYPTION=off
 export MINIO_PROMETHEUS_AUTH_TYPE=public
 export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw=
@@ -45,22 +45,21 @@ unset MINIO_KMS_KES_ENDPOINT
 unset MINIO_KMS_KES_KEY_NAME
 
 if [ ! -f ./mc ]; then
-	wget --quiet -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
-		chmod +x mc
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 fi
 
-minio server --address 127.0.0.1:9001 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9001 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_1.log 2>&1 &
-minio server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_2.log 2>&1 &
 
-minio server --address 127.0.0.1:9003 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9003 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/multisiteb/data/disterasure/xl{5...8}" >/tmp/siteb_1.log 2>&1 &
-minio server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/multisiteb/data/disterasure/xl{5...8}" >/tmp/siteb_2.log 2>&1 &
 
-export MC_HOST_sitea=http://minio:minio123@127.0.0.1:9001
-export MC_HOST_siteb=http://minio:minio123@127.0.0.1:9004
+export MC_HOST_sitea=http://minio:silo12345@127.0.0.1:9001
+export MC_HOST_siteb=http://minio:silo12345@127.0.0.1:9004
 
 ./mc ready sitea
 ./mc ready siteb
@@ -84,7 +83,7 @@ done
 
 echo "adding replication rule for site a -> site b"
 ./mc replicate add sitea/bucket/ \
-	--remote-bucket http://minio:minio123@127.0.0.1:9004/bucket
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket
 
 remote_arn=$(./mc replicate ls sitea/bucket --json | jq -r .rule.Destination.Bucket)
 sleep 1
@@ -138,7 +137,7 @@ fi
 
 echo "adding replication rule for site a -> site b"
 ./mc replicate add sitea/bucket-version/ \
-	--remote-bucket http://minio:minio123@127.0.0.1:9004/bucket-version
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket-version
 
 ./mc mb sitea/bucket-version/directory/
 

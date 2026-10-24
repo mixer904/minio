@@ -22,9 +22,11 @@ package ioutil
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -115,6 +117,12 @@ type ioret[V any] struct {
 	err error
 }
 
+// maxDeadlineWorkPanicStacks caps how many full stack traces WithDeadline will
+// write to stderr over the process lifetime. See the recover in WithDeadline.
+const maxDeadlineWorkPanicStacks = 10
+
+var deadlineWorkPanics atomic.Int64
+
 // WithDeadline will execute a function with a deadline and return a value of a given type.
 // If the deadline/context passes before the function finishes executing,
 // the zero value and the context error is returned.
@@ -124,6 +132,29 @@ func WithDeadline[V any](ctx context.Context, timeout time.Duration, work func(c
 
 	c := make(chan ioret[V], 1)
 	go func() {
+		// work() runs on a goroutine of its own, so a panic inside it is
+		// reachable by no recover() the caller can install: net/http and
+		// internal/grid each recover only on the goroutine they own. Left
+		// unhandled it terminates the entire process, which turns any
+		// malformed internode payload that trips a bug in work() into a
+		// remote node kill. Convert it to an error, the way the grid and HTTP
+		// request boundaries already do, and leave the stack on stderr so the
+		// underlying bug stays diagnosable.
+		defer func() {
+			if r := recover(); r != nil {
+				// Only the first few stacks are dumped. The panic is by
+				// definition reachable from untrusted input, so writing a full
+				// stack per occurrence would trade a node kill for unbounded
+				// log amplification - one small request each. The error below
+				// is returned every time regardless, so the caller's own
+				// (rate-limited) logging still sees each occurrence.
+				if deadlineWorkPanics.Add(1) <= maxDeadlineWorkPanicStacks {
+					fmt.Fprintf(os.Stderr, "panic in deadline-bounded work: %v\n%s\n", r, debug.Stack())
+				}
+				var zero V
+				c <- ioret[V]{val: zero, err: fmt.Errorf("panic in deadline-bounded work: %v", r)}
+			}
+		}()
 		v, err := work(ctx)
 		c <- ioret[V]{val: v, err: err}
 	}()

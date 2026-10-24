@@ -18,7 +18,10 @@
 package cmd
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -64,5 +67,69 @@ func TestGetMissingSiteNames(t *testing.T) {
 		if len(names) != len(tc.expNames) {
 			t.Errorf("Test %d: Expected `%v`, got `%v`", i+1, tc.expNames, names)
 		}
+	}
+}
+
+// TestSRBucketMetaCorsRoundTrip verifies that a CORS bucket-meta item
+// survives the JSON transport used by SRPeerReplicateBucketItem and that
+// the base64-encoded payload decodes back to the original XML bytes. This
+// mirrors the initial-sync push, the peer-apply path, and the heal path,
+// all of which carry the config through SRBucketMeta.Cors as base64.
+func TestSRBucketMetaCorsRoundTrip(t *testing.T) {
+	const corsXML = `<CORSConfiguration><CORSRule><AllowedOrigin>https://app.example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`
+	b64 := base64.StdEncoding.EncodeToString([]byte(corsXML))
+	updatedAt := time.Now().UTC().Truncate(time.Second)
+
+	item := madmin.SRBucketMeta{
+		Type:      madmin.SRBucketMetaTypeCorsConfig,
+		Bucket:    "testbucket",
+		Cors:      &b64,
+		UpdatedAt: updatedAt,
+	}
+
+	data, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var got madmin.SRBucketMeta
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if got.Type != madmin.SRBucketMetaTypeCorsConfig {
+		t.Fatalf("type mismatch: got %q", got.Type)
+	}
+	if got.Cors == nil {
+		t.Fatal("expected non-nil Cors after round-trip")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*got.Cors)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if string(decoded) != corsXML {
+		t.Fatalf("payload mismatch:\n got %q\nwant %q", decoded, corsXML)
+	}
+	if !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("UpdatedAt mismatch: got %v want %v", got.UpdatedAt, updatedAt)
+	}
+
+	// A deletion is signaled with a nil Cors pointer; it must survive too.
+	del := madmin.SRBucketMeta{
+		Type:      madmin.SRBucketMetaTypeCorsConfig,
+		Bucket:    "testbucket",
+		Cors:      nil,
+		UpdatedAt: updatedAt,
+	}
+	data, err = json.Marshal(del)
+	if err != nil {
+		t.Fatalf("marshal (delete) failed: %v", err)
+	}
+	var gotDel madmin.SRBucketMeta
+	if err := json.Unmarshal(data, &gotDel); err != nil {
+		t.Fatalf("unmarshal (delete) failed: %v", err)
+	}
+	if gotDel.Cors != nil {
+		t.Fatalf("expected nil Cors for deletion, got %q", *gotDel.Cors)
 	}
 }

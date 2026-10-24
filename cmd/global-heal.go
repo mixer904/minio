@@ -35,9 +35,9 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/console"
-	"github.com/minio/pkg/v3/wildcard"
-	"github.com/minio/pkg/v3/workers"
+	"github.com/pgsty/silo-pkg/v3/console"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
+	"github.com/pgsty/silo-pkg/v3/workers"
 )
 
 const (
@@ -165,6 +165,12 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
 		return errServerNotInitialized
+	}
+	healInPool := er.HealObject
+	if z, ok := objAPI.(*erasureServerPools); ok && !z.SinglePool() {
+		healInPool = func(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
+			return z.healObjectInPool(ctx, er, bucket, object, versionID, opts)
+		}
 	}
 
 	started := tracker.Started
@@ -419,7 +425,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			var result healEntryResult
 			fivs, err := entry.fileInfoVersions(bucket)
 			if err != nil {
-				res, err := er.HealObject(ctx, bucket, encodedEntryName, "",
+				res, err := healInPool(ctx, bucket, encodedEntryName, "",
 					madmin.HealOpts{
 						ScanMode: scanMode,
 						Remove:   healDeleteDangling,
@@ -455,7 +461,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					continue
 				}
 
-				res, err := er.HealObject(ctx, bucket, encodedEntryName,
+				res, err := healInPool(ctx, bucket, encodedEntryName,
 					version.VersionID, madmin.HealOpts{
 						ScanMode: scanMode,
 						Remove:   healDeleteDangling,

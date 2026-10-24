@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "MinIO Grafana Dashboard - https://min.io/",
+  "description": "Silo Grafana Dashboard - https://silo.pgsty.com/",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "gnetId": 15306,
@@ -4207,7 +4207,7 @@
     ]
   },
   "timezone": "",
-  "title": "MinIO Bucket Dashboard",
+  "title": "Silo Bucket Dashboard",
   "uid": "TgmJnqnnk2",
   "version": 1,
   "weekStart": ""

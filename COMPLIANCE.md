@@ -1,7 +1,17 @@
 # AGPLv3 Compliance
 
-We have designed MinIO as an Open Source software for the Open Source software community. This requires applications to consider whether their usage of MinIO is in compliance with the GNU AGPLv3 [license](https://github.com/minio/minio/blob/master/LICENSE).
+Silo is distributed under the [GNU Affero General Public License v3.0](LICENSE).
+It incorporates source code from the MinIO project and preserves the original
+copyright, license, and attribution notices in [`NOTICE`](NOTICE),
+[`CREDITS`](CREDITS), and source-file headers.
 
-MinIO cannot make the determination as to whether your application's usage of MinIO is in compliance with the AGPLv3 license requirements. You should instead rely on your own legal counsel or licensing specialists to audit and ensure your application is in compliance with the licenses of MinIO and all other open-source projects with which your application integrates or interacts. We understand that AGPLv3 licensing is complex and nuanced. It is for that reason we strongly encourage using experts in licensing to make any such determinations around compliance instead of relying on apocryphal or anecdotal advice.
+You are responsible for determining how the AGPLv3 applies to your use,
+modification, deployment, and distribution of Silo and its dependencies. The
+Silo maintainers cannot provide legal advice or determine whether a particular
+application or service satisfies the license. Consult qualified counsel when
+the obligations are material to your deployment.
 
-[MinIO Commercial Licensing](https://min.io/pricing) is the best option for applications that trigger AGPLv3 obligations (e.g. open sourcing your application). Applications using MinIO - or any other OSS-licensed code - without validating their usage do so at their own risk.
+If you convey modified binaries or provide network access to a modified
+version, review the complete AGPLv3 text and ensure that the corresponding
+source and notices are made available as required. Dependency licenses and
+separate notices continue to apply independently.

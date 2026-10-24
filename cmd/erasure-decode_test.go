@@ -26,7 +26,91 @@ import (
 	"testing"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/bpool"
 )
+
+func TestNewParallelReaderUsesPooledStashBuffer(t *testing.T) {
+	erasure, err := NewErasure(t.Context(), 4, 4, blockSizeV2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousPool := globalBytePoolCap.Load()
+	pool := bpool.NewBytePoolCap(1, blockSizeV2, blockSizeV2*2)
+	globalBytePoolCap.Store(pool)
+	t.Cleanup(func() {
+		globalBytePoolCap.Store(previousPool)
+	})
+
+	readers := make([]io.ReaderAt, 8)
+	reader := newParallelReader(readers, erasure, 0, blockSizeV2)
+	t.Cleanup(reader.Done)
+	if reader.stashBuffer == nil {
+		t.Fatal("expected a pooled stash buffer")
+	}
+
+	shardSize := int(erasure.ShardSize())
+	stash := reader.stashBuffer[:cap(reader.stashBuffer)]
+	for i, buf := range reader.buf {
+		if len(buf) != shardSize {
+			t.Fatalf("buffer %d has length %d, want %d", i, len(buf), shardSize)
+		}
+		buf[0] = byte(i + 1)
+		if got := stash[i*shardSize]; got != byte(i+1) {
+			t.Fatalf("buffer %d does not use the pooled stash buffer", i)
+		}
+	}
+}
+
+func TestParallelReaderPreferReadersMaintainsBufferMapping(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefer []bool
+		want   []int
+	}{
+		{
+			name:   "adjacent preferred readers",
+			prefer: []bool{false, true, true, false},
+			want:   []int{1, 2, 0, 3},
+		},
+		{
+			name:   "sparse preferred readers",
+			prefer: []bool{false, true, false, true},
+			want:   []int{1, 3, 2, 0},
+		},
+		{
+			name:   "preferred prefix",
+			prefer: []bool{true, true, false, false},
+			want:   []int{0, 1, 2, 3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := make([]io.ReaderAt, len(tt.prefer))
+			readerToBuf := make([]int, len(tt.prefer))
+			for i := range original {
+				original[i] = bytes.NewReader([]byte{byte(i)})
+				readerToBuf[i] = i
+			}
+
+			reader := parallelReader{
+				orgReaders:  original,
+				readerToBuf: readerToBuf,
+			}
+			reader.preferReaders(tt.prefer)
+
+			for i, originalIndex := range tt.want {
+				if reader.readers[i] != original[originalIndex] {
+					t.Errorf("reader %d maps to the wrong original reader", i)
+				}
+				if got := reader.readerToBuf[i]; got != originalIndex {
+					t.Errorf("reader %d maps to buffer %d, want %d", i, got, originalIndex)
+				}
+			}
+		})
+	}
+}
 
 func (a badDisk) ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error) {
 	return 0, errFaultyDisk

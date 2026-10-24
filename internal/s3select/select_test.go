@@ -26,6 +26,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/cpuid/v2"
@@ -70,6 +71,17 @@ func (w *testResponseWriter) WriteHeader(statusCode int) {
 func (w *testResponseWriter) Flush() {
 }
 
+type testResponseBody struct {
+	io.Reader
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (b *testResponseBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
 func evaluateSelectForTest(t *testing.T, requestXML, input []byte) ([]byte, error) {
 	t.Helper()
 
@@ -85,18 +97,24 @@ func evaluateSelectForTest(t *testing.T, requestXML, input []byte) ([]byte, erro
 	s3Select.Evaluate(w)
 	s3Select.Close()
 
+	body := &testResponseBody{
+		Reader: bytes.NewReader(w.response),
+		closed: make(chan struct{}),
+	}
 	resp := http.Response{
 		StatusCode:    http.StatusOK,
-		Body:          io.NopCloser(bytes.NewReader(w.response)),
+		Body:          body,
 		ContentLength: int64(len(w.response)),
 	}
 	res, err := minio.NewSelectResults(&resp, "testbucket")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Close()
-
-	return io.ReadAll(res)
+	result, readErr := io.ReadAll(res)
+	// minio-go's parser closes the response after signaling EOF or an event
+	// error. Wait for that owner instead of racing it with SelectResults.Close.
+	<-body.closed
+	return result, readErr
 }
 
 func TestJSONLinesRejectsOversizedRecord(t *testing.T) {

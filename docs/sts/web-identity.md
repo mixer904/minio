@@ -1,21 +1,21 @@
-# AssumeRoleWithWebIdentity [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# AssumeRoleWithWebIdentity
 
 ## Introduction
 
-MinIO supports the standard AssumeRoleWithWebIdentity STS API to enable integration with OIDC/OpenID based identity provider environments. This allows the generation of temporary credentials with pre-defined access policies for applications/users to interact with MinIO object storage.
+Silo supports the standard AssumeRoleWithWebIdentity STS API to enable integration with OIDC/OpenID based identity provider environments. This allows the generation of temporary credentials with pre-defined access policies for applications/users to interact with Silo object storage.
 
-Calling AssumeRoleWithWebIdentity does not require the use of MinIO root or IAM credentials. Therefore, you can distribute an application (for example, on mobile devices) that requests temporary security credentials without including MinIO long lasting credentials in the application. Instead, the identity of the caller is validated by using a JWT id_token from the web identity provider. The temporary security credentials returned by this API consists of an access key, a secret key, and a security token. Applications can use these temporary security credentials to sign calls to MinIO API operations.
+Calling AssumeRoleWithWebIdentity does not require the use of Silo root or IAM credentials. Therefore, you can distribute an application (for example, on mobile devices) that requests temporary security credentials without including Silo long lasting credentials in the application. Instead, the identity of the caller is validated by using a JWT id_token from the web identity provider. The temporary security credentials returned by this API consists of an access key, a secret key, and a security token. Applications can use these temporary security credentials to sign calls to Silo API operations.
 
-**Breaking change (`CVE-2026-33322`)**: releases after `RELEASE.2026-03-25T00-00-00Z` validate the `id_token` with the provider JWKS endpoint advertised by the OpenID discovery document at `MINIO_IDENTITY_OPENID_CONFIG_URL`. In practice, MinIO currently accepts the RSA PKCS#1 v1.5 and ECDSA families already implemented in the verifier (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, plus the existing `RS3*` and `ES3*` aliases). HMAC-signed tokens such as `HS256`, `HS384`, and `HS512` are rejected. Algorithms such as `PS256` and `EdDSA` are not currently supported. `MINIO_IDENTITY_OPENID_CLIENT_SECRET` is used for OpenID/OAuth client interactions only and is not used as a JWT verification key. If your provider previously issued HMAC-signed `id_token`s, reconfigure it to publish RSA or ECDSA signing keys through JWKS before upgrading.
+**Breaking change (`CVE-2026-33322`)**: releases after `RELEASE.2026-03-25T00-00-00Z` validate the `id_token` with the provider JWKS endpoint advertised by the OpenID discovery document at `MINIO_IDENTITY_OPENID_CONFIG_URL`. In practice, Silo currently accepts the RSA PKCS#1 v1.5 and ECDSA families already implemented in the verifier (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, plus the existing `RS3*` and `ES3*` aliases). HMAC-signed tokens such as `HS256`, `HS384`, and `HS512` are rejected. Algorithms such as `PS256` and `EdDSA` are not currently supported. `MINIO_IDENTITY_OPENID_CLIENT_SECRET` is used for OpenID/OAuth client interactions only and is not used as a JWT verification key. If your provider previously issued HMAC-signed `id_token`s, reconfigure it to publish RSA or ECDSA signing keys through JWKS before upgrading.
 
 By default, the temporary security credentials created by AssumeRoleWithWebIdentity last for one hour. However, the optional DurationSeconds parameter can be used to specify the validity duration of the generated credentials. This value varies from 900 seconds (15 minutes) up to the maximum session duration of 365 days.
 
-## Configuring OpenID Identity Provider on MinIO
+## Configuring OpenID Identity Provider on Silo
 
-Configuration can be performed via MinIO's standard configuration API (i.e. using `mc admin config set/get` commands) or equivalently via environment variables. For brevity we show only environment variables here:
+Configuration can be performed via Silo's standard configuration API (i.e. using `mc admin config set/get` commands) or equivalently via environment variables. For brevity we show only environment variables here:
 
 ```
-$ mc admin config set myminio identity_openid --env
+$ mc admin config set mysilo identity_openid --env
 KEY:
 identity_openid[:name]  enable OpenID SSO support
 
@@ -28,7 +28,7 @@ MINIO_IDENTITY_OPENID_CLIENT_SECRET*        (string)    secret for the unique pu
 MINIO_IDENTITY_OPENID_ROLE_POLICY           (string)    Set the IAM access policies applicable to this client application and IDP e.g. "app-bucket-write,app-bucket-list"
 MINIO_IDENTITY_OPENID_CLAIM_NAME            (string)    JWT canned policy claim name (default: 'policy')
 MINIO_IDENTITY_OPENID_SCOPES                (csv)       Comma separated list of OpenID scopes for server, defaults to advertised scopes from discovery document e.g. "email,admin"
-MINIO_IDENTITY_OPENID_VENDOR                (string)    Specify vendor type for vendor specific behavior to checking validity of temporary credentials and service accounts on MinIO
+MINIO_IDENTITY_OPENID_VENDOR                (string)    Specify vendor type for vendor specific behavior to checking validity of temporary credentials and service accounts on Silo
 MINIO_IDENTITY_OPENID_CLAIM_USERINFO        (on|off)    Enable fetching claims from UserInfo Endpoint for authenticated user
 MINIO_IDENTITY_OPENID_KEYCLOAK_REALM        (string)    Specify Keycloak 'realm' name, only honored if vendor was set to 'keycloak' as value, if no realm is specified 'master' is default
 MINIO_IDENTITY_OPENID_KEYCLOAK_ADMIN_URL    (string)    Specify Keycloak 'admin' REST API endpoint e.g. http://localhost:8080/auth/admin/
@@ -40,7 +40,7 @@ MINIO_IDENTITY_OPENID_COMMENT               (sentence)  optionally add a comment
 
 Either `MINIO_IDENTITY_OPENID_ROLE_POLICY` (recommended) or `MINIO_IDENTITY_OPENID_CLAIM_NAME` must be specified but not both. See the section Access Control Policies to understand the differences between the two.
 
-**NOTE**: When configuring multiple OpenID based authentication providers on a MinIO cluster, any number of Role Policy based providers may be configured, and at most one JWT Claim based provider may be configured.
+**NOTE**: When configuring multiple OpenID based authentication providers on a Silo cluster, any number of Role Policy based providers may be configured, and at most one JWT Claim based provider may be configured.
 
 <details><summary>Example 1: Two role policy providers</summary>
 
@@ -83,23 +83,23 @@ MINIO_IDENTITY_OPENID_CLAIM_NAME="groups"
 
 ### Redirection from OpenID Provider
 
-To login to MinIO, the user first loads the MinIO console on their browser, and selects the OpenID Provider they wish to use (the `MINIO_IDENTITY_OPENID_DISPLAY_NAME` value is shown here). The user is then redirected to the OpenID provider's login page and performs necessary login actions (e.g. entering credentials, responding to MFA authentication challenges, etc). After successful login, the user is redirected back to the MinIO console. This redirect URL is specified as a parameter by MinIO when the user is redirected to the OpenID Provider in the beginning. For some setups, extra configuration may be required for this step to work correctly.
+To login to Silo, the user first loads the Silo console on their browser, and selects the OpenID Provider they wish to use (the `MINIO_IDENTITY_OPENID_DISPLAY_NAME` value is shown here). The user is then redirected to the OpenID provider's login page and performs necessary login actions (e.g. entering credentials, responding to MFA authentication challenges, etc). After successful login, the user is redirected back to the Silo console. This redirect URL is specified as a parameter by Silo when the user is redirected to the OpenID Provider in the beginning. For some setups, extra configuration may be required for this step to work correctly.
 
-For a simple setup where the user/client app accesses MinIO directly (i.e. with no intervening proxies/load-balancers), and each MinIO server (if there are more than one) has a unique domain name, this redirection should work automatically with no further configuration. For example, if the MinIO service is being accessed by the browser at the URL `https://minio-node-1.example.org`, the redirect URL will be `https://minio-node-1.example.org/oauth_callback` and all is well.
+For a simple setup where the user/client app accesses Silo directly (i.e. with no intervening proxies/load-balancers), and each Silo server (if there are more than one) has a unique domain name, this redirection should work automatically with no further configuration. For example, if the Silo service is being accessed by the browser at the URL `https://silo-node-1.example.org`, the redirect URL will be `https://silo-node-1.example.org/oauth_callback` and all is well.
 
-For deployments with a load-balancer (LB), it is required that the LB is configured to send requests from the same user/client-app to the same backend MinIO server (at least for the initial login request and subsequent redirection, as the OpenID auth flow's state parameter is currently local to the MinIO server). For this setup, set the `MINIO_BROWSER_REDIRECT_URL` parameter to the publicly/client-accessible endpoint for the MinIO Console. For example `MINIO_BROWSER_REDIRECT_URL=https://console.minio.example.org`. This will ensure that the redirect URL is set to `https://console.minio.example.org/oauth_callback` and the login process should work correctly.
+For deployments with a load-balancer (LB), it is required that the LB is configured to send requests from the same user/client-app to the same backend Silo server (at least for the initial login request and subsequent redirection, as the OpenID auth flow's state parameter is currently local to the Silo server). For this setup, set the `MINIO_BROWSER_REDIRECT_URL` parameter to the publicly/client-accessible endpoint for the Silo Console. For example `MINIO_BROWSER_REDIRECT_URL=https://console.silo.example.org`. This will ensure that the redirect URL is set to `https://console.silo.example.org/oauth_callback` and the login process should work correctly.
 
-For deployments employing DNS round-robin on a single domain to all the MinIO servers, it is possible that after redirection the browser may land on a different MinIO server. For example, the domain `console.minio.example.org` may resolve to `console-X.minio.example.org`, where `X` is `1`, `2`, `3` or `4`. For the login to work, if the user first landed on `console-1.minio.example.org`, they must be redirected back to the same place after logging in at the OpenID provider's web-page. To ensure this, set the `MINIO_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC=on` parameter - this lets MinIO set the redirect URL based on the "Host" header of the (initial login) request.
+For deployments employing DNS round-robin on a single domain to all the Silo servers, it is possible that after redirection the browser may land on a different Silo server. For example, the domain `console.silo.example.org` may resolve to `console-X.silo.example.org`, where `X` is `1`, `2`, `3` or `4`. For the login to work, if the user first landed on `console-1.silo.example.org`, they must be redirected back to the same place after logging in at the OpenID provider's web-page. To ensure this, set the `MINIO_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC=on` parameter - this lets Silo set the redirect URL based on the "Host" header of the (initial login) request.
 
 The **deprecated** parameter `MINIO_IDENTITY_OPENID_REDIRECT_URI` works similar to the `MINIO_BROWSER_REDIRECT_URL` but needs to include the `/oauth_callback` suffix. Please do not use it, as it is sufficient to the set the `MINIO_BROWSER_REDIRECT_URL` parameter (which is required anyway for most load-balancer based setups to work correctly). This deprecated parameter **will be removed** in a future release. 
 
 ## Specifying Access Control with IAM Policies
 
-The STS API authenticates the user by verifying the JWT provided in the request. However access to object storage resources are controlled via named IAM policies defined in the MinIO instance. Once authenticated via the STS API, the MinIO server applies one or more IAM policies to the generated credentials. MinIO's AssumeRoleWithWebIdentity implementation supports specifying IAM policies in two ways:
+The STS API authenticates the user by verifying the JWT provided in the request. However access to object storage resources are controlled via named IAM policies defined in the Silo instance. Once authenticated via the STS API, the Silo server applies one or more IAM policies to the generated credentials. Silo's AssumeRoleWithWebIdentity implementation supports specifying IAM policies in two ways:
 
-1. Role Policy (Recommended): When specified as part of the OpenID provider configuration, all users authenticating via this provider are authorized to (only) use the specified role policy. The policy to associate with such users is specified via the `role_policy` configuration parameter or the `MINIO_IDENTITY_OPENID_ROLE_POLICY` environment variable. The value is a comma-separated list of IAM access policy names already defined in the server. In this situation, the server prints a role ARN at startup that must be specified as a `RoleArn` API request parameter in the STS AssumeRoleWithWebIdentity API call. When using Role Policies, multiple OpenID providers and/or client applications (with unique client IDs) may be configured with independent role policies. Each configuration is assigned a unique RoleARN by the MinIO server and this is used to select the policies to apply to temporary credentials generated in the AssumeRoleWithWebIdentity call.
+1. Role Policy (Recommended): When specified as part of the OpenID provider configuration, all users authenticating via this provider are authorized to (only) use the specified role policy. The policy to associate with such users is specified via the `role_policy` configuration parameter or the `MINIO_IDENTITY_OPENID_ROLE_POLICY` environment variable. The value is a comma-separated list of IAM access policy names already defined in the server. In this situation, the server prints a role ARN at startup that must be specified as a `RoleArn` API request parameter in the STS AssumeRoleWithWebIdentity API call. When using Role Policies, multiple OpenID providers and/or client applications (with unique client IDs) may be configured with independent role policies. Each configuration is assigned a unique RoleARN by the Silo server and this is used to select the policies to apply to temporary credentials generated in the AssumeRoleWithWebIdentity call.
 
-2. `id_token` claims: When the role policy is not configured, MinIO looks for a specific claim in the `id_token` (JWT) returned by the OpenID provider in the STS request. The default claim is `policy` and can be overridden by the `claim_name` configuration parameter or the `MINIO_IDENTITY_OPENID_CLAIM_NAME` environment variable. The claim value can be a string (comma-separated list) or an array of IAM access policy names defined in the server. A `RoleArn` API request parameter *must not* be specified in the STS AssumeRoleWithWebIdentity API call.
+2. `id_token` claims: When the role policy is not configured, Silo looks for a specific claim in the `id_token` (JWT) returned by the OpenID provider in the STS request. The default claim is `policy` and can be overridden by the `claim_name` configuration parameter or the `MINIO_IDENTITY_OPENID_CLAIM_NAME` environment variable. The claim value can be a string (comma-separated list) or an array of IAM access policy names defined in the server. A `RoleArn` API request parameter *must not* be specified in the STS AssumeRoleWithWebIdentity API call.
 
 ## API Request Parameters
 
@@ -113,7 +113,7 @@ The OAuth 2.0 id_token that is provided by the web identity provider. Applicatio
 | *Length Constraints* | *Minimum length of 4. Maximum length of 2048.* |
 | *Required*           | *Yes*                                          |
 
-### WebIdentityAccessToken (MinIO Extension)
+### WebIdentityAccessToken (Silo Extension)
 
 There are situations when identity provider does not provide user claims in `id_token` instead it needs to be retrieved from UserInfo endpoint, this extension is only useful in this scenario. This is rare so use it accordingly depending on your Identity provider implementation. `access_token` is available as part of the OIDC authentication flow similar to `id_token`.
 
@@ -171,7 +171,7 @@ XML error response for this API is similar to [AWS STS AssumeRoleWithWebIdentity
 ## Sample `POST` Request
 
 ```
-http://minio.cluster:9000?Action=AssumeRoleWithWebIdentity&DurationSeconds=3600&WebIdentityToken=eyJ4NXQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJraWQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJQb0VnWFA2dVZPNDVJc0VOUm5nRFhqNUF1NVlhIiwiYXpwIjoiUG9FZ1hQNnVWTzQ1SXNFTlJuZ0RYajVBdTVZYSIsImlzcyI6Imh0dHBzOlwvXC9sb2NhbGhvc3Q6OTQ0M1wvb2F1dGgyXC90b2tlbiIsImV4cCI6MTU0MTgwOTU4MiwiaWF0IjoxNTQxODA1OTgyLCJqdGkiOiI2Y2YyMGIwZS1lNGZmLTQzZmQtYTdiYS1kYTc3YTE3YzM2MzYifQ.Jm29jPliRvrK6Os34nSK3rhzIYLFjE__zdVGNng3uGKXGKzP3We_i6NPnhA0szJXMOKglXzUF1UgSz8MctbaxFS8XDusQPVe4LkB_45hwBm6TmBxzui911nt-1RbBLN_jZIlvl2lPrbTUH5hSn9kEkph6seWanTNQpz9tNEoVa6R_OX3kpJqxe8tLQUWw453A1JTwFNhdHa6-f1K8_Q_eEZ_4gOYINQ9t_fhTibdbkXZkJQFLop-Jwoybi9s4nwQU_dATocgcufq5eCeNItQeleT-23lGxIz0X7CiJrJynYLdd-ER0F77SumqEb5iCxhxuf4H7dovwd1kAmyKzLxpw&Version=2011-06-15
+http://silo.cluster:9000?Action=AssumeRoleWithWebIdentity&DurationSeconds=3600&WebIdentityToken=eyJ4NXQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJraWQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJQb0VnWFA2dVZPNDVJc0VOUm5nRFhqNUF1NVlhIiwiYXpwIjoiUG9FZ1hQNnVWTzQ1SXNFTlJuZ0RYajVBdTVZYSIsImlzcyI6Imh0dHBzOlwvXC9sb2NhbGhvc3Q6OTQ0M1wvb2F1dGgyXC90b2tlbiIsImV4cCI6MTU0MTgwOTU4MiwiaWF0IjoxNTQxODA1OTgyLCJqdGkiOiI2Y2YyMGIwZS1lNGZmLTQzZmQtYTdiYS1kYTc3YTE3YzM2MzYifQ.Jm29jPliRvrK6Os34nSK3rhzIYLFjE__zdVGNng3uGKXGKzP3We_i6NPnhA0szJXMOKglXzUF1UgSz8MctbaxFS8XDusQPVe4LkB_45hwBm6TmBxzui911nt-1RbBLN_jZIlvl2lPrbTUH5hSn9kEkph6seWanTNQpz9tNEoVa6R_OX3kpJqxe8tLQUWw453A1JTwFNhdHa6-f1K8_Q_eEZ_4gOYINQ9t_fhTibdbkXZkJQFLop-Jwoybi9s4nwQU_dATocgcufq5eCeNItQeleT-23lGxIz0X7CiJrJynYLdd-ER0F77SumqEb5iCxhxuf4H7dovwd1kAmyKzLxpw&Version=2011-06-15
 ```
 
 ## Sample Response
@@ -199,18 +199,18 @@ http://minio.cluster:9000?Action=AssumeRoleWithWebIdentity&DurationSeconds=3600&
 
 ```
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
+export MINIO_ROOT_PASSWORD=silo123
 export MINIO_IDENTITY_OPENID_CONFIG_URL=https://accounts.google.com/.well-known/openid-configuration
 export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
 # Optional: Allow to specify the requested OpenID scopes (OpenID only requires the `openid` scope)
 #export MINIO_IDENTITY_OPENID_SCOPES="openid,profile,email"
-minio server /mnt/export
+silo server /mnt/export
 ```
 
 or using `mc`
 
 ```
-mc admin config get myminio identity_openid
+mc admin config get mysilo identity_openid
 identity_openid config_url=https://accounts.google.com/.well-known/openid-configuration client_id=843351d4-1080-11ea-aa20-271ecba3924a
 ```
 
@@ -246,32 +246,32 @@ $ go run web-identity.go -cid 204367807228-ok7601k6gj1pgge7m09h7d79co8p35xx.apps
 - Visit <http://localhost:8080>, login will direct the user to the Google OAuth2 Auth URL to obtain a permission grant.
 - The redirection URI (callback handler) receives the OAuth2 callback, verifies the state parameter, and obtains a Token.
 - Using the id_token the callback handler further talks to Google OAuth2 Token URL to obtain an JWT id_token.
-- Once obtained the JWT id_token is further sent to STS endpoint i.e MinIO to retrieve temporary credentials.
+- Once obtained the JWT id_token is further sent to STS endpoint i.e Silo to retrieve temporary credentials.
 - Temporary credentials are displayed on the browser upon successful retrieval.
 
-## Using MinIO Console
+## Using Silo Console
 
-To support WebIdentity based login for MinIO Console, set openid configuration and restart MinIO
-
-```
-mc admin config set myminio identity_openid config_url="<CONFIG_URL>" client_id="<client_identifier>"
-```
+To support WebIdentity based login for Silo Console, set openid configuration and restart Silo
 
 ```
-mc admin service restart myminio
+mc admin config set mysilo identity_openid config_url="<CONFIG_URL>" client_id="<client_identifier>"
+```
+
+```
+mc admin service restart mysilo
 ```
 
 Sample URLs for Keycloak are
 
 `config_url` - `http://localhost:8080/auth/realms/demo/.well-known/openid-configuration`
 
-JWT token returned by the Identity Provider should include a custom claim for the policy, this is required to create a STS user in MinIO. The name of the custom claim could be either `policy` or `<NAMESPACE_PREFIX>policy`.  If there is no namespace then `claim_prefix` can be ignored. For example if the custom claim name is `https://min.io/policy` then, `claim_prefix` should be set as `https://min.io/`.
+JWT token returned by the Identity Provider should include a custom claim for the policy, this is required to create a STS user in Silo. The name of the custom claim could be either `policy` or `<NAMESPACE_PREFIX>policy`.  If there is no namespace then `claim_prefix` can be ignored. For example if the custom claim name is `https://min.io/policy` then, `claim_prefix` should be set as `https://min.io/`.
 
-- Open MinIO Console and click `Login with SSO`
+- Open Silo Console and click `Login with SSO`
 - The user will be redirected to the Identity Provider login page
-- Upon successful login on Identity Provider page the user will be automatically logged into MinIO Console.
+- Upon successful login on Identity Provider page the user will be automatically logged into Silo Console.
 
 ## Explore Further
 
-- [MinIO Admin Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Silo Admin Complete Guide](https://silo.pgsty.com/reference/minio-mc-admin/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)

@@ -1,12 +1,12 @@
-# AssumeRoleWithClientGrants [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# AssumeRoleWithClientGrants
 
 ## Introduction
 
 Returns a set of temporary security credentials for applications/clients who have been authenticated through client credential grants provided by identity provider. Example providers include KeyCloak, Okta etc.
 
-Calling AssumeRoleWithClientGrants does not require the use of MinIO default credentials. Therefore, client application can be distributed that requests temporary security credentials without including MinIO default credentials. Instead, the identity of the caller is validated by using a JWT access token from the identity provider. The temporary security credentials returned by this API consists of an access key, a secret key, and a security token. Applications can use these temporary security credentials to sign calls to MinIO API operations.
+Calling AssumeRoleWithClientGrants does not require the use of Silo default credentials. Therefore, client application can be distributed that requests temporary security credentials without including Silo default credentials. Instead, the identity of the caller is validated by using a JWT access token from the identity provider. The temporary security credentials returned by this API consists of an access key, a secret key, and a security token. Applications can use these temporary security credentials to sign calls to Silo API operations.
 
-**Breaking change (`CVE-2026-33322`)**: releases after `RELEASE.2026-03-25T00-00-00Z` validate the JWT access token with the provider JWKS endpoint advertised by the configured OpenID discovery document. In practice, MinIO currently accepts the RSA PKCS#1 v1.5 and ECDSA families already implemented in the verifier (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, plus the existing `RS3*` and `ES3*` aliases). HMAC-signed tokens such as `HS256`, `HS384`, and `HS512` are rejected. Algorithms such as `PS256` and `EdDSA` are not currently supported. `MINIO_IDENTITY_OPENID_CLIENT_SECRET` is used for OpenID/OAuth client interactions only and is not used as a JWT verification key. If your provider previously issued HMAC-signed access tokens for this flow, reconfigure it to publish RSA or ECDSA signing keys through JWKS before upgrading.
+**Breaking change (`CVE-2026-33322`)**: releases after `RELEASE.2026-03-25T00-00-00Z` validate the JWT access token with the provider JWKS endpoint advertised by the configured OpenID discovery document. In practice, Silo currently accepts the RSA PKCS#1 v1.5 and ECDSA families already implemented in the verifier (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, plus the existing `RS3*` and `ES3*` aliases). HMAC-signed tokens such as `HS256`, `HS384`, and `HS512` are rejected. Algorithms such as `PS256` and `EdDSA` are not currently supported. `MINIO_IDENTITY_OPENID_CLIENT_SECRET` is used for OpenID/OAuth client interactions only and is not used as a JWT verification key. If your provider previously issued HMAC-signed access tokens for this flow, reconfigure it to publish RSA or ECDSA signing keys through JWKS before upgrading.
 
 By default, the temporary security credentials created by AssumeRoleWithClientGrants last for one hour. However, use the optional DurationSeconds parameter to specify the duration of the credentials. This value varies from 900 seconds (15 minutes) up to the maximum session duration of 365 days.
 
@@ -62,7 +62,7 @@ XML error response for this API is similar to [AWS STS AssumeRoleWithWebIdentity
 ## Sample `POST` Request
 
 ```
-http://minio.cluster:9000?Action=AssumeRoleWithClientGrants&DurationSeconds=3600&Token=eyJ4NXQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJraWQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJQb0VnWFA2dVZPNDVJc0VOUm5nRFhqNUF1NVlhIiwiYXpwIjoiUG9FZ1hQNnVWTzQ1SXNFTlJuZ0RYajVBdTVZYSIsImlzcyI6Imh0dHBzOlwvXC9sb2NhbGhvc3Q6OTQ0M1wvb2F1dGgyXC90b2tlbiIsImV4cCI6MTU0MTgwOTU4MiwiaWF0IjoxNTQxODA1OTgyLCJqdGkiOiI2Y2YyMGIwZS1lNGZmLTQzZmQtYTdiYS1kYTc3YTE3YzM2MzYifQ.Jm29jPliRvrK6Os34nSK3rhzIYLFjE__zdVGNng3uGKXGKzP3We_i6NPnhA0szJXMOKglXzUF1UgSz8MctbaxFS8XDusQPVe4LkB_45hwBm6TmBxzui911nt-1RbBLN_jZIlvl2lPrbTUH5hSn9kEkph6seWanTNQpz9tNEoVa6R_OX3kpJqxe8tLQUWw453A1JTwFNhdHa6-f1K8_Q_eEZ_4gOYINQ9t_fhTibdbkXZkJQFLop-Jwoybi9s4nwQU_dATocgcufq5eCeNItQeleT-23lGxIz0X7CiJrJynYLdd-ER0F77SumqEb5iCxhxuf4H7dovwd1kAmyKzLxpw&Version=2011-06-15
+http://silo.cluster:9000?Action=AssumeRoleWithClientGrants&DurationSeconds=3600&Token=eyJ4NXQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJraWQiOiJOVEF4Wm1NeE5ETXlaRGczTVRVMVpHTTBNekV6T0RKaFpXSTRORE5sWkRVMU9HRmtOakZpTVEiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiJQb0VnWFA2dVZPNDVJc0VOUm5nRFhqNUF1NVlhIiwiYXpwIjoiUG9FZ1hQNnVWTzQ1SXNFTlJuZ0RYajVBdTVZYSIsImlzcyI6Imh0dHBzOlwvXC9sb2NhbGhvc3Q6OTQ0M1wvb2F1dGgyXC90b2tlbiIsImV4cCI6MTU0MTgwOTU4MiwiaWF0IjoxNTQxODA1OTgyLCJqdGkiOiI2Y2YyMGIwZS1lNGZmLTQzZmQtYTdiYS1kYTc3YTE3YzM2MzYifQ.Jm29jPliRvrK6Os34nSK3rhzIYLFjE__zdVGNng3uGKXGKzP3We_i6NPnhA0szJXMOKglXzUF1UgSz8MctbaxFS8XDusQPVe4LkB_45hwBm6TmBxzui911nt-1RbBLN_jZIlvl2lPrbTUH5hSn9kEkph6seWanTNQpz9tNEoVa6R_OX3kpJqxe8tLQUWw453A1JTwFNhdHa6-f1K8_Q_eEZ_4gOYINQ9t_fhTibdbkXZkJQFLop-Jwoybi9s4nwQU_dATocgcufq5eCeNItQeleT-23lGxIz0X7CiJrJynYLdd-ER0F77SumqEb5iCxhxuf4H7dovwd1kAmyKzLxpw&Version=2011-06-15
 ```
 
 ## Sample Response
@@ -90,14 +90,14 @@ http://minio.cluster:9000?Action=AssumeRoleWithClientGrants&DurationSeconds=3600
 
 ```
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
+export MINIO_ROOT_PASSWORD=silo123
 export MINIO_IDENTITY_OPENID_CONFIG_URL=http://localhost:8080/auth/realms/demo/.well-known/openid-configuration
 export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
-minio server /mnt/export
+silo server /mnt/export
 ```
 
 Testing with an example
-> Obtaining client ID and secrets follow [Keycloak configuring documentation](https://github.com/pgsty/minio/blob/master/docs/sts/keycloak.md)
+> Obtaining client ID and secrets follow [Keycloak configuring documentation](https://github.com/pgsty/silo/blob/main/docs/sts/keycloak.md)
 
 ```
 $ go run client-grants.go -cid PoEgXP6uVO45IsENRngDXj5Au5Ya -csec eKsw6z8CtOJVBtrOWvhRWL4TUCga
@@ -113,5 +113,5 @@ $ go run client-grants.go -cid PoEgXP6uVO45IsENRngDXj5Au5Ya -csec eKsw6z8CtOJVBt
 
 ## Explore Further
 
-- [MinIO Admin Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Silo Admin Complete Guide](https://silo.pgsty.com/reference/minio-mc-admin/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)

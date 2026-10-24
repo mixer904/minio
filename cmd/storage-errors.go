@@ -26,7 +26,7 @@ import (
 var errMaxVersionsExceeded = StorageErr("maximum versions exceeded, please delete few versions to proceed")
 
 // errUnexpected - unexpected error, requires manual intervention.
-var errUnexpected = StorageErr("unexpected error, please report this issue at https://github.com/minio/minio/issues")
+var errUnexpected = StorageErr("unexpected error, please report this issue at https://github.com/pgsty/silo/issues")
 
 // errCorruptedFormat - corrupted format.
 var errCorruptedFormat = StorageErr("corrupted format")
@@ -69,6 +69,11 @@ var errDiskAccessDenied = StorageErr("drive access denied")
 
 // errFileNotFound - cannot find the file.
 var errFileNotFound = StorageErr("file not found")
+
+// errCommitMetaMissing - the staged xl.meta disappeared between the
+// data rename and the meta-file commit; a write-quorum failure, not
+// a missing object.
+var errCommitMetaMissing = StorageErr("commit metadata is missing")
 
 // errFileNotFound - cannot find requested file version.
 var errFileVersionNotFound = StorageErr("file version not found")

@@ -37,8 +37,8 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/dsync"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/console"
-	"github.com/minio/pkg/v3/sync/errgroup"
+	"github.com/pgsty/silo-pkg/v3/console"
+	"github.com/pgsty/silo-pkg/v3/sync/errgroup"
 	"github.com/puzpuzpuz/xsync/v3"
 )
 
@@ -839,6 +839,8 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 
 	cpSrcDstSame := srcSet == dstSet
 	// Check if this request is only metadata update.
+	// CopyObjectHandler predicts the outcome of this decision in
+	// copyRewritesObjectData(); keep the two in sync.
 	if cpSrcDstSame && srcInfo.metadataOnly {
 		// Version ID is set for the destination and source == destination version ID.
 		// perform an in-place update.
@@ -867,21 +869,28 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 		ServerSideEncryption:       dstOpts.ServerSideEncryption,
 		UserDefined:                srcInfo.UserDefined,
 		Versioned:                  dstOpts.Versioned,
+		VersionSuspended:           dstOpts.VersionSuspended,
 		VersionID:                  dstOpts.VersionID,
 		MTime:                      dstOpts.MTime,
+		NoLock:                     dstOpts.NoLock,
 		EncryptFn:                  dstOpts.EncryptFn,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
+		ReplicationRequest:         dstOpts.ReplicationRequest,
+		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
+		DataMovement:               dstOpts.DataMovement,
+		replicaObjectInfo:          dstOpts.replicaObjectInfo,
 	}
 
 	return dstSet.putObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
 }
 
 func (s *erasureSets) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error) {
-	// In list multipart uploads we are going to treat input prefix as the object,
-	// this means that we are not supporting directory navigation.
-	set := s.getHashedSet(prefix)
-	return set.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	return s.getHashedSet(prefix).ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+}
+
+func (s *erasureSets) listMultipartUploadsExact(ctx context.Context, bucket, object string) (ListMultipartsInfo, error) {
+	return s.getHashedSet(object).listMultipartUploadsExact(ctx, bucket, object, "", "", "", maxUploadsList)
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.
@@ -1051,7 +1060,7 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 	if !reflect.DeepEqual(s.format, refFormat) {
 		// Format is corrupted and unrecognized by the running instance.
-		healingLogIf(ctx, fmt.Errorf("Unable to heal the newly replaced drives due to format.json inconsistencies, please engage MinIO support for further assistance: %w",
+		healingLogIf(ctx, fmt.Errorf("Unable to heal the newly replaced drives due to format.json inconsistencies; please report this to Silo maintainers at https://github.com/pgsty/silo/issues: %w",
 			errCorruptedFormat))
 		return res, errCorruptedFormat
 	}

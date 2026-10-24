@@ -2,6 +2,7 @@
 cover.out
 *~
 minio
+silo
 !*/
 site/
 **/*.test
@@ -55,7 +56,6 @@ xattr
 xl-meta
 
 .gitignore
-.goreleaser.yml
 
 dist/
 
@@ -64,3 +64,8 @@ dist/
 .codex/
 _bmad/
 _bmad-output/
+# Investigation and editorial working files belong outside this repository.
+docs/investigations/
+docs/security/
+docs/rebranding.md
+.release-sign/

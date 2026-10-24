@@ -18,7 +18,9 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -28,7 +30,88 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/valyala/bytebufferpool"
 )
+
+func TestDownloadBinaryReturnsOwnedBuffers(t *testing.T) {
+	previousDisabled := globalInplaceUpdateDisabled
+	globalInplaceUpdateDisabled = false
+	t.Cleanup(func() { globalInplaceUpdateDisabled = previousDisabled })
+	previousMaxProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() {
+		runtime.GOMAXPROCS(previousMaxProcs)
+	})
+
+	payload := []byte("minio update payload")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed, downloaded, err := downloadBinary(u, "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(downloaded, payload) {
+		t.Fatalf("downloaded binary is %q, want %q", downloaded, payload)
+	}
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(decoder.Close)
+	decompressed, err := decoder.DecodeAll(compressed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decompressed, payload) {
+		t.Fatalf("decompressed binary is %q, want %q", decompressed, payload)
+	}
+	wantCompressed := bytes.Clone(compressed)
+	wantDownloaded := bytes.Clone(downloaded)
+
+	// Reuse buffers returned to bytebufferpool. downloadBinary's results must
+	// remain valid after the function returns, regardless of later pool users.
+	pooled := make([]*bytebufferpool.ByteBuffer, 8)
+	for i := range pooled {
+		pooled[i] = bytebufferpool.Get()
+		if cap(pooled[i].B) > 0 {
+			pooled[i].B = pooled[i].B[:cap(pooled[i].B)]
+			for j := range pooled[i].B {
+				pooled[i].B[j] = 0xa5
+			}
+		}
+	}
+	for _, b := range pooled {
+		bytebufferpool.Put(b)
+	}
+
+	if !bytes.Equal(compressed, wantCompressed) {
+		t.Fatal("compressed download aliases a buffer returned to bytebufferpool")
+	}
+	if !bytes.Equal(downloaded, wantDownloaded) {
+		t.Fatal("downloaded binary aliases a buffer returned to bytebufferpool")
+	}
+}
+
+func TestInplaceUpdateCannotBeEnabled(t *testing.T) {
+	previousDisabled := globalInplaceUpdateDisabled
+	globalInplaceUpdateDisabled = true
+	t.Cleanup(func() { globalInplaceUpdateDisabled = previousDisabled })
+
+	if err := verifyBinary(nil, nil, "", "", nil); !errors.Is(err, errInplaceUpdateDisabled) {
+		t.Fatalf("verifyBinary error = %v, want %v", err, errInplaceUpdateDisabled)
+	}
+	if err := commitBinary(); !errors.Is(err, errInplaceUpdateDisabled) {
+		t.Fatalf("commitBinary error = %v, want %v", err, errInplaceUpdateDisabled)
+	}
+}
 
 func TestMinioVersionToReleaseTime(t *testing.T) {
 	testCases := []struct {
@@ -101,19 +184,11 @@ func TestDownloadURL(t *testing.T) {
 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
 	durl := getDownloadURL(minioVersion1)
 	if IsDocker() {
-		if durl != "podman pull quay.io/minio/minio:"+minioVersion1 {
-			t.Errorf("Expected %s, got %s", "podman pull quay.io/minio/minio:"+minioVersion1, durl)
+		if durl != "podman pull docker.io/pgsty/silo:"+minioVersion1 {
+			t.Errorf("Expected %s, got %s", "podman pull docker.io/pgsty/silo:"+minioVersion1, durl)
 		}
-	} else {
-		if runtime.GOOS == "windows" {
-			if durl != MinioReleaseURL+"minio.exe" {
-				t.Errorf("Expected %s, got %s", MinioReleaseURL+"minio.exe", durl)
-			}
-		} else {
-			if durl != MinioReleaseURL+"minio" {
-				t.Errorf("Expected %s, got %s", MinioReleaseURL+"minio", durl)
-			}
-		}
+	} else if durl != siloDownloadPage {
+		t.Errorf("Expected %s, got %s", siloDownloadPage, durl)
 	}
 
 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
@@ -141,19 +216,19 @@ func TestUserAgent(t *testing.T) {
 			envName:     "",
 			envValue:    "",
 			mode:        globalMinioModeFS,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
+			expectedStr: fmt.Sprintf("Silo (%s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeFS),
 		},
 		{
 			envName:     "MESOS_CONTAINER_NAME",
 			envValue:    "mesos-11111",
 			mode:        globalMinioModeErasure,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "dcos", "mesos-1111"),
+			expectedStr: fmt.Sprintf("Silo (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET universe-%s", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "dcos", "mesos-1111"),
 		},
 		{
 			envName:     "KUBERNETES_SERVICE_HOST",
 			envValue:    "10.11.148.5",
 			mode:        globalMinioModeErasure,
-			expectedStr: fmt.Sprintf("MinIO (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "kubernetes"),
+			expectedStr: fmt.Sprintf("Silo (%s; %s; %s; %s; source DEVELOPMENT.GOGET DEVELOPMENT.GOGET DEVELOPMENT.GOGET", runtime.GOOS, runtime.GOARCH, globalMinioModeErasure, "kubernetes"),
 		},
 	}
 

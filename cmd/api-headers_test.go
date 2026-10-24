@@ -18,8 +18,17 @@
 package cmd
 
 import (
+	"net/http/httptest"
 	"testing"
 )
+
+func TestCommonHeadersUseSiloProductName(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	setCommonHeaders(recorder)
+	if got := recorder.Header().Get("Server"); got != "Silo" {
+		t.Fatalf("Server header = %q, want Silo", got)
+	}
+}
 
 func TestNewRequestID(t *testing.T) {
 	// Ensure that it returns an alphanumeric result of length 16.

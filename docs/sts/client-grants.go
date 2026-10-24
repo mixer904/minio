@@ -102,7 +102,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Uncomment this to use MinIO API operations by initializing minio
+	// Uncomment this to use Silo API operations with the compatible minio-go client.
 	// client with obtained credentials.
 
 	opts := &minio.Options{

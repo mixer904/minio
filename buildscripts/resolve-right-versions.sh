@@ -6,38 +6,29 @@ set -x
 set -e
 
 WORK_DIR="$PWD/.verify-$RANDOM"
-MINIO_CONFIG_DIR="$WORK_DIR/.minio"
-MINIO=("$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" server)
+SILO_CONFIG_DIR="$WORK_DIR/.silo"
+SILO=("$PWD/silo" --config-dir "$SILO_CONFIG_DIR" server)
 
-if [ ! -x "$PWD/minio" ]; then
-	echo "minio executable binary not found in current directory"
+if [ ! -x "$PWD/silo" ]; then
+	echo "Silo executable binary not found in current directory"
 	exit 1
 fi
 
-function start_minio_5drive() {
+function start_silo_5drive() {
 	start_port=$1
 
-	export MINIO_ROOT_USER=minio
-	export MINIO_ROOT_PASSWORD=minio123
-	export MC_HOST_minio="http://minio:minio123@127.0.0.1:${start_port}/"
+	export MINIO_ROOT_USER=silo
+	export MINIO_ROOT_PASSWORD=silo1234
+	export MC_HOST_silo="http://silo:silo1234@127.0.0.1:${start_port}/"
 	unset MINIO_KMS_AUTO_ENCRYPTION # do not auto-encrypt objects
 	export MINIO_CI_CD=1
 
-	MC_BUILD_DIR="mc-$RANDOM"
-	if ! git clone --quiet https://github.com/minio/mc "$MC_BUILD_DIR"; then
-		echo "failed to download https://github.com/minio/mc"
-		purge "${MC_BUILD_DIR}"
-		exit 1
-	fi
-
-	(cd "${MC_BUILD_DIR}" && go build -o "$WORK_DIR/mc")
-
-	# remove mc source.
-	purge "${MC_BUILD_DIR}"
+	mkdir -p "${WORK_DIR}"
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" "${WORK_DIR}/mc"
 
 	"${WORK_DIR}/mc" cp --quiet -r "buildscripts/cicd-corpus/" "${WORK_DIR}/cicd-corpus/"
 
-	"${MINIO[@]}" --address ":$start_port" "${WORK_DIR}/cicd-corpus/disk{1...5}" >"${WORK_DIR}/server1.log" 2>&1 &
+	"${SILO[@]}" --address ":$start_port" "${WORK_DIR}/cicd-corpus/disk{1...5}" >"${WORK_DIR}/server1.log" 2>&1 &
 	pid=$!
 	disown $pid
 	sleep 5
@@ -50,16 +41,16 @@ function start_minio_5drive() {
 		exit 1
 	fi
 
-	"${WORK_DIR}/mc" stat minio/bucket/testobj
+	"${WORK_DIR}/mc" stat silo/bucket/testobj
 
-	pkill minio
+	pkill silo
 	sleep 3
 }
 
 function main() {
 	start_port=$(shuf -i 10000-65000 -n 1)
 
-	start_minio_5drive ${start_port}
+	start_silo_5drive ${start_port}
 }
 
 function purge() {

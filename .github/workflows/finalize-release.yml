@@ -1,0 +1,234 @@
+name: Finalize Release Packages
+
+# Manual-only lane that runs AFTER the maintainer has GPG-signed the RPMs in a
+# Draft release (buildscripts/sign-release-rpms.sh --upload) and BEFORE the
+# release is published. GPG signing rewrites the RPM bytes, which strands the
+# SBOMs, the packages checksum manifest, and the attestations that release.yml
+# generated from the as-built packages. This lane regenerates those materials
+# from the published (signed) bytes under the workflow identity, so the
+# sigstore layer describes exactly what the release ships.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Draft RELEASE.* tag whose signed RPMs need refreshed SBOMs and checksums"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify workflow identity matches release source
+        run: |
+          set -euo pipefail
+          CHECKED_OUT_REVISION="$(git rev-parse HEAD)"
+          if [ "${CHECKED_OUT_REVISION}" != "${GITHUB_SHA}" ]; then
+            echo "Checked out ${CHECKED_OUT_REVISION}, but workflow identity is ${GITHUB_SHA}. Dispatch from the release tag." >&2
+            exit 1
+          fi
+
+      - name: Compute release variables
+        env:
+          # Environment passthrough keeps the dispatch input out of the script
+          # source, mirroring release.yml.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG}"
+          if [[ ! "${TAG}" =~ ^RELEASE\.[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z$ ]]; then
+            echo "Invalid release tag format: ${TAG}" >&2
+            exit 1
+          fi
+          VERSION_HYPHEN="${TAG#RELEASE.}"
+          PKG_VERSION="$(echo "${VERSION_HYPHEN}" | sed -E 's/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1\2\3\4\5\6.0.0/')"
+          {
+            echo "RELEASE_TAG=${TAG}"
+            echo "PKG_VERSION=${PKG_VERSION}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Refuse to touch a published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "${RELEASE_TAG} is not a Draft release; finalize runs only before publishing." >&2
+            exit 1
+          fi
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.2
+
+      - name: Download and verify the package set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # sign-release-rpms.sh owns the package identity; import its values
+          # the same way test-release.yml does so the lanes cannot drift.
+          eval "$(grep -E '^expected_(release|fingerprint)=' buildscripts/sign-release-rpms.sh)"
+          test -n "${expected_release}"
+          test -n "${expected_fingerprint}"
+
+          packages_dir="finalize/packages"
+          sidecar_dir="finalize/sidecars"
+          mkdir -p "${packages_dir}" "${sidecar_dir}"
+
+          manifest="silo_${PKG_VERSION}_packages_checksums.txt"
+
+          # Exactly the twelve manifest subjects land in packages_dir; the
+          # tarball SBOMs in the release root do not match these patterns.
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${packages_dir}" \
+            --pattern '*.rpm' --pattern '*.deb' --pattern '*.apk' \
+            --pattern '*.rpm.sbom.json' --pattern '*.deb.sbom.json' --pattern '*.apk.sbom.json'
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${sidecar_dir}" \
+            --pattern '*.rpm.sha256sum' --pattern "${manifest}"
+
+          cd "${packages_dir}"
+          subject_count="$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [ "${subject_count}" -ne 12 ]; then
+            echo "Expected twelve package subjects, found ${subject_count}" >&2
+            find . -maxdepth 1 -type f >&2
+            exit 1
+          fi
+
+          # The signed RPMs must match the .sha256sum sidecars the signing
+          # script regenerated and uploaded alongside them.
+          for rpm_file in "silo-${PKG_VERSION}-${expected_release}.x86_64.rpm" \
+                          "silo-${PKG_VERSION}-${expected_release}.aarch64.rpm"; do
+            test -s "${rpm_file}"
+            actual="$(sha256sum "${rpm_file}" | awk '{print $1}')"
+            recorded="$(awk '{print $1}' "../sidecars/${rpm_file}.sha256sum")"
+            if [ "${actual}" != "${recorded}" ]; then
+              echo "Digest mismatch for ${rpm_file}: sidecar ${recorded}, asset ${actual}" >&2
+              exit 1
+            fi
+          done
+
+          # Everything the maintainer did not re-sign must still match the
+          # manifest release.yml generated: this lane refreshes RPM materials,
+          # it does not accept drift anywhere else.
+          for package_file in *.deb *.apk *.deb.sbom.json *.apk.sbom.json; do
+            awk -v name="${package_file}" '$2 == name' "../sidecars/${manifest}" | sha256sum --check
+          done
+
+      - name: Verify RPM GPG signatures
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^expected_fingerprint=' buildscripts/sign-release-rpms.sh)"
+          sudo apt-get update
+          sudo apt-get install --yes rpm
+          sudo rpmkeys --import buildscripts/pgsty-rpm-signing-key.asc
+          key_id="$(printf '%s' "${expected_fingerprint}" | tail -c 8 | tr '[:upper:]' '[:lower:]')"
+          for rpm_file in finalize/packages/*.rpm; do
+            signature_output="$(sudo rpmkeys --checksig --verbose "${rpm_file}")"
+            printf '%s\n' "${signature_output}"
+            if ! printf '%s\n' "${signature_output}" | tr '[:upper:]' '[:lower:]' | grep -q "key id ${key_id}: ok"; then
+              echo "Signature verification failed for ${rpm_file}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Regenerate RPM SBOMs and the packages checksum manifest
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          cd finalize/packages
+          for rpm_file in *.rpm; do
+            rm -f "${rpm_file}.sbom.json"
+            syft "${rpm_file}" --output "spdx-json=${rpm_file}.sbom.json"
+          done
+
+          manifest="silo_${PKG_VERSION}_packages_checksums.txt"
+          mapfile -t subjects < <(find . -maxdepth 1 -type f \
+            \( -name '*.rpm' -o -name '*.deb' -o -name '*.apk' -o -name '*.sbom.json' \) | sort)
+          if [ "${#subjects[@]}" -ne 12 ]; then
+            echo "Expected six packages and six SBOMs, found ${#subjects[@]} subjects" >&2
+            exit 1
+          fi
+          sha256sum "${subjects[@]}" | sed 's#  \./#  #' > "${manifest}"
+          cosign sign-blob --bundle="${manifest}.sigstore.json" "${manifest}" --yes
+
+      - name: Attest the finalized package artifacts
+        id: attest-finalize
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            finalize/packages/*.rpm
+            finalize/packages/*.rpm.sbom.json
+            finalize/packages/*_checksums.txt
+            finalize/packages/*_checksums.txt.sigstore.json
+            finalize/sidecars/*.rpm.sha256sum
+
+      - name: Preserve finalize provenance bundle as a release asset
+        env:
+          BUNDLE_PATH: ${{ steps.attest-finalize.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -s "${BUNDLE_PATH}"
+          cp "${BUNDLE_PATH}" "finalize/packages/silo_${PKG_VERSION}_packages_provenance.sigstore.json"
+
+      - name: Upload finalized assets to the Draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^expected_release=' buildscripts/sign-release-rpms.sh)"
+          manifest="silo_${PKG_VERSION}_packages_checksums.txt"
+          cd finalize/packages
+          files=(
+            "silo-${PKG_VERSION}-${expected_release}.x86_64.rpm.sbom.json"
+            "silo-${PKG_VERSION}-${expected_release}.aarch64.rpm.sbom.json"
+            "${manifest}"
+            "${manifest}.sigstore.json"
+            "silo_${PKG_VERSION}_packages_provenance.sigstore.json"
+          )
+          gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${files[@]}"
+
+          for asset in "${files[@]}"; do
+            local_digest="sha256:$(sha256sum "${asset}" | awk '{print $1}')"
+            remote_digest=""
+            for attempt in 1 2 3 4 5; do
+              remote_digest="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets \
+                --jq ".assets[] | select(.name == \"${asset}\") | .digest")"
+              if [ "${local_digest}" = "${remote_digest}" ]; then
+                break
+              fi
+              if [ "${attempt}" -lt 5 ]; then
+                sleep 2
+              fi
+            done
+            if [ "${local_digest}" != "${remote_digest}" ]; then
+              echo "GitHub asset digest mismatch for ${asset}" >&2
+              echo "Local:  ${local_digest}" >&2
+              echo "Remote: ${remote_digest}" >&2
+              exit 1
+            fi
+            echo "Verified GitHub asset: ${asset} ${remote_digest}"
+          done

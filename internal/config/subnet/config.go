@@ -25,13 +25,8 @@ import (
 	"sync"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v3/env"
-	xnet "github.com/minio/pkg/v3/net"
-)
-
-const (
-	baseURL    = "https://subnet.min.io"
-	baseURLDev = "http://localhost:9000"
+	"github.com/pgsty/silo-pkg/v3/env"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // DefaultKVS - default KV config for subnet settings
@@ -70,29 +65,21 @@ type Config struct {
 
 var configLock sync.RWMutex
 
-// Registered indicates if cluster is registered or not
+// Registered reports false because Silo does not use MinIO SUBNET. The
+// inherited credentials remain parseable for configuration compatibility.
 func (c *Config) Registered() bool {
-	configLock.RLock()
-	defer configLock.RUnlock()
-
-	return len(c.APIKey) > 0
+	return false
 }
 
 // ApplyEnv - applies the current subnet config to Console UI specific environment variables.
 func (c *Config) ApplyEnv() {
-	configLock.RLock()
-	defer configLock.RUnlock()
-
-	if c.License != "" {
-		os.Setenv("CONSOLE_SUBNET_LICENSE", c.License)
-	}
-	if c.APIKey != "" {
-		os.Setenv("CONSOLE_SUBNET_API_KEY", c.APIKey)
-	}
-	if c.Proxy != "" {
-		os.Setenv("CONSOLE_SUBNET_PROXY", c.Proxy)
-	}
-	os.Setenv("CONSOLE_SUBNET_URL", c.BaseURL)
+	// Do not expose inherited commercial-service credentials or an endpoint to
+	// the embedded Console. These names are outputs, not the MINIO_* input
+	// compatibility surface.
+	os.Unsetenv("CONSOLE_SUBNET_LICENSE")
+	os.Unsetenv("CONSOLE_SUBNET_API_KEY")
+	os.Unsetenv("CONSOLE_SUBNET_PROXY")
+	os.Unsetenv("CONSOLE_SUBNET_URL")
 }
 
 // Update - in-place update with new license and registration information.
@@ -103,15 +90,12 @@ func (c *Config) Update(ncfg Config, isDevEnv bool) {
 	c.License = ncfg.License
 	c.APIKey = ncfg.APIKey
 	c.Proxy = ncfg.Proxy
-	c.transport = ncfg.transport
-	c.BaseURL = baseURL
+	c.transport = nil
+	c.BaseURL = ""
 
-	if isDevEnv {
-		c.BaseURL = os.Getenv("_MINIO_SUBNET_URL")
-		if c.BaseURL == "" {
-			c.BaseURL = baseURLDev
-		}
-	}
+	// Retain the hidden compatibility input but deliberately ignore its value.
+	_ = os.Getenv("_MINIO_SUBNET_URL")
+	_ = isDevEnv
 }
 
 // LookupConfig - lookup config and override with valid environment settings if any.

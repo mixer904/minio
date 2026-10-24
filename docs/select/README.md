@@ -1,4 +1,4 @@
-# Select API Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# Select API Quickstart Guide
 
 Traditional retrieval of objects is always as whole entities, i.e GetObject for a 5 GiB object, will always return 5 GiB of data. S3 Select API allows us to retrieve a subset of data by using simple SQL expressions. By using Select API to retrieve only the data needed by the application, drastic performance improvements can be achieved.
 
@@ -12,9 +12,9 @@ You can use the Select API to query objects with following features:
 
 Type inference and automatic conversion of values is performed based on the context when the value is un-typed (such as when reading CSV data). If present, the CAST function overrides automatic conversion.
 
-The [mc sql](https://docs.min.io/community/minio-object-store/reference/minio-mc/mc-sql.html) command can be used for executing queries using the command line.
+The [mc sql](https://silo.pgsty.com/reference/minio-mc/mc-sql/) command can be used for executing queries using the command line.
 
-(*) Parquet is disabled on the MinIO server by default. See below how to enable it.
+(*) Parquet is disabled on the Silo server by default. See below how to enable it.
 
 ## Enabling Parquet Format
 
@@ -27,7 +27,7 @@ To enable Parquet set the environment variable `MINIO_API_SELECT_PARQUET=on`.
 
 ### 1. Prerequisites
 
-- Install MinIO Server from [here](https://docs.min.io/community/minio-object-store/operations/deployments/baremetal-deploy-minio-on-redhat-linux.html#procedure).
+- Install Silo Server from [here](https://silo.pgsty.com/operations/deployments/baremetal-deploy-minio-on-redhat-linux/#procedure).
 - Familiarity with AWS S3 API.
 - Familiarity with Python and installing dependencies.
 
@@ -48,7 +48,7 @@ import boto3
 s3 = boto3.client('s3',
                   endpoint_url='http://localhost:9000',
                   aws_access_key_id='minio',
-                  aws_secret_access_key='minio123',
+                  aws_secret_access_key='silo123',
                   region_name='us-east-1')
 
 r = s3.select_object_content(
@@ -79,13 +79,13 @@ for event in r['Payload']:
 
 ## 4. Run the Program
 
-Upload a sample dataset to MinIO using the following commands.
+Upload a sample dataset to Silo using the following commands.
 
 ```sh
 curl "https://population.un.org/wpp/Download/Files/1_Indicators%20(Standard)/CSV_FILES/WPP2019_TotalPopulationBySex.csv" > TotalPopulation.csv
-mc mb myminio/mycsvbucket
+mc mb mysilo/mycsvbucket
 gzip TotalPopulation.csv
-mc cp TotalPopulation.csv.gz myminio/mycsvbucket/sampledata/
+mc cp TotalPopulation.csv.gz mysilo/mycsvbucket/sampledata/
 ```
 
 Now let us proceed to run our select example to query for `Location` which matches `United States`.
@@ -113,11 +113,11 @@ For a more detailed SELECT SQL reference, please see [here](https://docs.aws.ama
 
 ## 5. Explore Further
 
-- [Use `mc` with MinIO Server](https://docs.min.io/community/minio-object-store/reference/minio-mc.html)
-- [Use `mc sql` with MinIO Server](https://docs.min.io/community/minio-object-store/reference/minio-mc/mc-sql.html#command-mc.sql)
-- [Use `minio-go` SDK with MinIO Server](https://docs.min.io/community/minio-object-store/developers/go/minio-go.html)
-- [Use `aws-cli` with MinIO Server](https://docs.min.io/community/minio-object-store/integrations/aws-cli-with-minio.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Use `mc` with Silo Server](https://silo.pgsty.com/reference/minio-mc/)
+- [Use `mc sql` with Silo Server](https://silo.pgsty.com/reference/minio-mc/mc-sql/#command-mc.sql)
+- [Use `minio-go` SDK with Silo Server](https://silo.pgsty.com/developers/go/minio-go/)
+- [Use `aws-cli` with Silo Server](https://silo.pgsty.com/integrations/aws-cli-with-minio/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)
 
 ## 6. Implementation Status
 

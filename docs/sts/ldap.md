@@ -1,35 +1,35 @@
-# AssumeRoleWithLDAPIdentity [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# AssumeRoleWithLDAPIdentity
 
 ## Introduction
 
-MinIO provides a custom STS API that allows integration with LDAP based corporate environments including Microsoft Active Directory. The MinIO server uses a separate LDAP service account to lookup user information. The login flow for a user is as follows:
+Silo provides a custom STS API that allows integration with LDAP based corporate environments including Microsoft Active Directory. The Silo server uses a separate LDAP service account to lookup user information. The login flow for a user is as follows:
 
 - User provides their AD/LDAP username and password to the STS API.
-- MinIO looks up the user's information (specifically the user's Distinguished Name) in the LDAP server.
-- On finding the user's info, MinIO verifies the login credentials with the AD/LDAP server.
-- MinIO optionally queries the AD/LDAP server for a list of groups that the user is a member of.
-- MinIO then checks if there are any policies [explicitly associated](#managing-usergroup-access-policy) with the user or their groups.
-- On finding at least one associated policy, MinIO generates temporary credentials for the user storing the list of groups in a cryptographically secure session token. The temporary access key, secret key and session token are returned to the user.
-- The user can now use these credentials to make requests to the MinIO server.
+- Silo looks up the user's information (specifically the user's Distinguished Name) in the LDAP server.
+- On finding the user's info, Silo verifies the login credentials with the AD/LDAP server.
+- Silo optionally queries the AD/LDAP server for a list of groups that the user is a member of.
+- Silo then checks if there are any policies [explicitly associated](#managing-usergroup-access-policy) with the user or their groups.
+- On finding at least one associated policy, Silo generates temporary credentials for the user storing the list of groups in a cryptographically secure session token. The temporary access key, secret key and session token are returned to the user.
+- The user can now use these credentials to make requests to the Silo server.
 
-The administrator will associate IAM access policies with each group and if required with the user too. The MinIO server then evaluates applicable policies on a user (these are the policies associated with the groups along with the policy on the user if any) to check if the request should be allowed or denied.
+The administrator will associate IAM access policies with each group and if required with the user too. The Silo server then evaluates applicable policies on a user (these are the policies associated with the groups along with the policy on the user if any) to check if the request should be allowed or denied.
 
-To ensure that changes in the LDAP directory are reflected in object storage access changes, MinIO performs an **Automatic LDAP sync**. MinIO periodically queries the LDAP service to:
+To ensure that changes in the LDAP directory are reflected in object storage access changes, Silo performs an **Automatic LDAP sync**. Silo periodically queries the LDAP service to:
 
-- find accounts (user DNs) that have been removed; any active STS credentials or MinIO service accounts belonging to these users are purged.
+- find accounts (user DNs) that have been removed; any active STS credentials or Silo service accounts belonging to these users are purged.
 
 - find accounts whose group memberships have changed; access policies available to a credential are updated to reflect the change, i.e. they will lose any privileges associated with a group they are removed from, and gain any privileges associated with a group they are added to.
 
-**Please note that when AD/LDAP is configured, MinIO will not support long term users defined internally.** Only AD/LDAP users (and the root user) are allowed. In addition to this, the server will not support operations on users or groups using `mc admin user` or `mc admin group` commands except `mc admin user info` and `mc admin group info` to list set policies for users and groups. This is because users and groups are defined externally in AD/LDAP.
+**Please note that when AD/LDAP is configured, Silo will not support long term users defined internally.** Only AD/LDAP users (and the root user) are allowed. In addition to this, the server will not support operations on users or groups using `mc admin user` or `mc admin group` commands except `mc admin user info` and `mc admin group info` to list set policies for users and groups. This is because users and groups are defined externally in AD/LDAP.
 
-## Configuring AD/LDAP on MinIO
+## Configuring AD/LDAP on Silo
 
-LDAP STS configuration can be performed via MinIO's standard configuration API (i.e. using `mc admin config set/get` commands) or equivalently via environment variables. For brevity we refer to environment variables here.
+LDAP STS configuration can be performed via Silo's standard configuration API (i.e. using `mc admin config set/get` commands) or equivalently via environment variables. For brevity we refer to environment variables here.
 
 LDAP is configured via the following environment variables:
 
 ```
-$ mc admin config set myminio identity_ldap --env
+$ mc admin config set mysilo identity_ldap --env
 KEY:
 identity_ldap  enable LDAP SSO support
 
@@ -64,21 +64,21 @@ MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection 
 
 The server address variable is _required_. TLS is assumed to be on by default. The port in the server address is optional and defaults to 636 if not provided.
 
-**MinIO sends LDAP credentials to the LDAP server for validation. So we _strongly recommend_ to use MinIO with AD/LDAP server over TLS or StartTLS _only_. Using plain-text connection between MinIO and LDAP server means _credentials can be compromised_ by anyone listening to network traffic.**
+**Silo sends LDAP credentials to the LDAP server for validation. So we _strongly recommend_ to use Silo with AD/LDAP server over TLS or StartTLS _only_. Using plain-text connection between Silo and LDAP server means _credentials can be compromised_ by anyone listening to network traffic.**
 
-If a self-signed certificate is being used, the certificate can be added to MinIO's certificates directory, so it can be trusted by the server.
+If a self-signed certificate is being used, the certificate can be added to Silo's certificates directory, so it can be trusted by the server.
 
 #### DNS SRV Records
 
 Many Active Directory and other LDAP services are setup with [DNS SRV Records](https://ldap.com/dns-srv-records-for-ldap/) for high-availability of the directory service. To use this to find LDAP servers to connect to, an LDAP client makes a DNS SRV record request to the DNS service on a domain that looks like `_service._proto.example.com`. For LDAP the `proto` value is always `tcp`, and `service` is usually `ldap` or `ldaps`.
 
-To enable MinIO to use the SRV records, specify the `srv_record_name` config parameter (or equivalently the `MINIO_IDENTITY_LDAP_SRV_RECORD_NAME` environment variable). This parameter can be set to `ldap` or `ldaps` and MinIO will substitute it into the `service` value. For example, when `server_addr=myldapserver.com` and `srv_record_name=ldap`, MinIO will lookup the SRV record for `_ldap._tcp.myldapserver.com` and pick an appropriate target for LDAP requests.
+To enable Silo to use the SRV records, specify the `srv_record_name` config parameter (or equivalently the `MINIO_IDENTITY_LDAP_SRV_RECORD_NAME` environment variable). This parameter can be set to `ldap` or `ldaps` and Silo will substitute it into the `service` value. For example, when `server_addr=myldapserver.com` and `srv_record_name=ldap`, Silo will lookup the SRV record for `_ldap._tcp.myldapserver.com` and pick an appropriate target for LDAP requests.
 
 If the DNS SRV record is at an entirely different place, say `_ldapsrv._tcpish.myldapserver.com`, then set `srv_record_name` to the special value `on` and set `server_addr=_ldapsrv._tcpish.myldapserver.com`.
 
 When using this feature, do not specify a port in the `server_addr` as the port is picked up automatically from the SRV record.
 
-With the default (empty) value for `srv_record_name`, MinIO **will not** perform any SRV record request.
+With the default (empty) value for `srv_record_name`, Silo **will not** perform any SRV record request.
 
 The value of `srv_record_name` does not affect any TLS settings - they must be configured with their own parameters.
 
@@ -86,7 +86,7 @@ The value of `srv_record_name` does not affect any TLS settings - they must be c
 
 LDAP STS rate limiting is enforced before each LDAP bind. Requests are tracked by source IP. A login attempt is throttled when that bucket is exhausted. Rate limiting is deliberately not keyed by username: a username-keyed bucket is shared across all sources, so an attacker could drain a known account's bucket with bad-password attempts and lock the legitimate user out. The per-source bucket caps the attempt rate from any single source, while the uniform auth-failure response is what conceals whether a username exists. This combination does not stop attackers who spread requests across many source IPs (botnets, IPv6 address rotation) or the residual bind-timing side channel; those are accepted limitations of an in-memory, per-source control.
 
-By default, the source IP used for this key is the socket peer address. This is the safe default because MinIO does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
+By default, the source IP used for this key is the socket peer address. This is the safe default because Silo does **not** trust `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` headers for this security-sensitive rate-limit key unless you opt in explicitly.
 
 Each login attempt reserves capacity for the duration of the LDAP bind. Successful logins and LDAP infrastructure failures refund that reservation. Only real authentication failures permanently consume tokens. Concurrent bursts above the burst capacity can still receive `429` responses even if those in-flight requests later succeed.
 
@@ -101,11 +101,11 @@ Each login attempt reserves capacity for the duration of the LDAP bind. Successf
 | Scope | Per-node, in-memory, not cluster-wide |
 | Configurability | Not currently configurable |
 
-In a multi-node deployment behind a load balancer, each MinIO node tracks its own buckets. The effective aggregate budget therefore depends on how requests are distributed across nodes.
+In a multi-node deployment behind a load balancer, each Silo node tracks its own buckets. The effective aggregate budget therefore depends on how requests are distributed across nodes.
 
 #### Trusted proxies
 
-If MinIO is deployed behind a trusted reverse proxy, load balancer, or API gateway and you want LDAP STS throttling to bucket by the forwarded client IP instead of the proxy peer address, configure:
+If Silo is deployed behind a trusted reverse proxy, load balancer, or API gateway and you want LDAP STS throttling to bucket by the forwarded client IP instead of the proxy peer address, configure:
 
 ```
 MINIO_IDENTITY_LDAP_STS_TRUSTED_PROXIES     (list)      comma/semicolon/whitespace-separated list of trusted proxy IPs or CIDRs
@@ -119,9 +119,11 @@ Only requests whose peer address matches this allowlist may supply forwarded cli
 
 The RFC 7239 `Forwarded` header is not used for this bucket; deployments that only send `Forwarded` fall back to the peer-address bucket.
 
+This allowlist governs LDAP STS rate-limit bucketing only. The client address used for `aws:SourceIp`, audit logs and event notifications is governed separately by `MINIO_API_TRUSTED_PROXIES` — see [Client source address trust](https://silo.pgsty.com/reference/minio-server/settings/core/#client-source-address-trust). The two use the same list syntax and the same chain-walking rules, and in most deployments should be set to the same value. They differ deliberately in one respect: this setting prefers `X-Real-IP` over `X-Forwarded-For`, while `MINIO_API_TRUSTED_PROXIES` prefers the chain-validated `X-Forwarded-For`, because it decides access control rather than rate-limit bucketing. Neither order is safe for every proxy; the linked document explains the trade-off.
+
 ### Lookup-Bind
 
-A low-privilege read-only LDAP service account is configured in the MinIO server by providing the account's Distinguished Name (DN) and password. This service account is used to perform directory lookups as needed.
+A low-privilege read-only LDAP service account is configured in the Silo server by providing the account's Distinguished Name (DN) and password. This service account is used to perform directory lookups as needed.
 
 ```
 MINIO_IDENTITY_LDAP_LOOKUP_BIND_DN*          (string)    DN for LDAP read-only service account used to perform DN and group lookups
@@ -132,7 +134,7 @@ If you set an empty lookup bind password, the lookup bind will use the unauthent
 
 ### User lookup
 
-When a user provides their LDAP credentials, MinIO runs a lookup query to find the user's Distinguished Name (DN). The search filter and base DN used in this lookup query are configured via the following variables:
+When a user provides their LDAP credentials, Silo runs a lookup query to find the user's Distinguished Name (DN). The search filter and base DN used in this lookup query are configured via the following variables:
 
 ```
 MINIO_IDENTITY_LDAP_USER_DN_SEARCH_BASE_DN*  (list)      ";" separated list of user search base DNs e.g. "dc=myldapserver,dc=com"
@@ -151,7 +153,7 @@ is optional and can be used to specify additional attributes to lookup on the Us
 
 ### Group membership search
 
-MinIO can be optionally configured to find the groups of a user from AD/LDAP by specifying the following variables:
+Silo can be optionally configured to find the groups of a user from AD/LDAP by specifying the following variables:
 
 ```
 MINIO_IDENTITY_LDAP_GROUP_SEARCH_FILTER     (string)    search filter for groups e.g. "(&(objectclass=groupOfNames)(memberUid=%s))"
@@ -194,30 +196,30 @@ In the configuration variables, `%s` is substituted with the _username_ from the
 
 ## Managing User/Group Access Policy
 
-Access policies may be associated by their name with a group or user directly. Access policies are first defined on the MinIO server using IAM policy JSON syntax. To define a new policy, you can use the [AWS policy generator](https://awspolicygen.s3.amazonaws.com/policygen.html). Copy the policy into a text file `mypolicy.json` and issue the command like so:
+Access policies may be associated by their name with a group or user directly. Access policies are first defined on the Silo server using IAM policy JSON syntax. To define a new policy, you can use the [AWS policy generator](https://awspolicygen.s3.amazonaws.com/policygen.html). Copy the policy into a text file `mypolicy.json` and issue the command like so:
 
 ```sh
-mc admin policy create myminio mypolicy mypolicy.json
+mc admin policy create mysilo mypolicy mypolicy.json
 ```
 
 To associate the policy with an LDAP user or group, use the full DN of the user or group:
 
 ```sh
-mc idp ldap policy attach myminio mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
+mc idp ldap policy attach mysilo mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
 ```
 
 ```sh
-mc idp ldap policy attach myminio mypolicy ----group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
+mc idp ldap policy attach mysilo mypolicy ----group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
 ```
 
 To remove a policy association, use the similar `detach` command:
 
 ```sh
-mc idp ldap policy detach myminio mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
+mc idp ldap policy detach mysilo mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
 ```
 
 ```sh
-mc idp ldap policy detach myminio mypolicy ----group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
+mc idp ldap policy detach mysilo mypolicy ----group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
 ```
 
 
@@ -228,12 +230,12 @@ Note that the commands above attempt to validate if the given entity (user or gr
 Please **do not use** these as they may be removed or their behavior may change.
 
 ```sh
-mc admin policy attach myminio mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
+mc admin policy attach mysilo mypolicy --user='uid=james,cn=accounts,dc=myldapserver,dc=com'
 ```
 
 
 ```sh
-mc admin policy attach myminio mypolicy --group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
+mc admin policy attach mysilo mypolicy --group='cn=projectx,ou=groups,ou=hwengg,dc=min,dc=io'
 ```
 
 </details>
@@ -310,7 +312,7 @@ Authentication failures caused by unknown users and invalid passwords intentiona
 ## Sample `POST` Request
 
 ```
-http://minio.cluster:9000?Action=AssumeRoleWithLDAPIdentity&LDAPUsername=foouser&LDAPPassword=foouserpassword&Version=2011-06-15&DurationSeconds=7200
+http://silo.cluster:9000?Action=AssumeRoleWithLDAPIdentity&LDAPUsername=foouser&LDAPPassword=foouserpassword&Version=2011-06-15&DurationSeconds=7200
 ```
 
 ## Sample Response
@@ -340,16 +342,16 @@ With multiple OU hierarchies for users, and multiple group search base DN's.
 
 ```
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
+export MINIO_ROOT_PASSWORD=silo123
 export MINIO_IDENTITY_LDAP_SERVER_ADDR='my.ldap-active-dir-server.com:636'
 export MINIO_IDENTITY_LDAP_LOOKUP_BIND_DN='cn=admin,dc=min,dc=io'
 export MINIO_IDENTITY_LDAP_LOOKUP_BIND_PASSWORD=admin
 export MINIO_IDENTITY_LDAP_GROUP_SEARCH_BASE_DN='dc=minioad,dc=local;dc=somedomain,dc=com'
 export MINIO_IDENTITY_LDAP_GROUP_SEARCH_FILTER='(&(objectclass=groupOfNames)(member=%d))'
-minio server ~/test
+silo server ~/test
 ```
 
-You can make sure it works appropriately using our [example program](https://raw.githubusercontent.com/pgsty/minio/master/docs/sts/ldap.go):
+You can make sure it works appropriately using our [example program](https://raw.githubusercontent.com/pgsty/silo/main/docs/sts/ldap.go):
 
 ```
 $ go run ldap.go -u foouser -p foopassword
@@ -365,5 +367,5 @@ $ go run ldap.go -u foouser -p foopassword
 
 ## Explore Further
 
-- [MinIO Admin Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Silo Admin Complete Guide](https://silo.pgsty.com/reference/minio-mc-admin/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)

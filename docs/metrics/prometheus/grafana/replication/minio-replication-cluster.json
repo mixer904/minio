@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "MinIO Grafana Dashboard - https://min.io/",
+  "description": "Silo Grafana Dashboard - https://silo.pgsty.com/",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "gnetId": 15306,
@@ -2945,7 +2945,7 @@
     ]
   },
   "timezone": "",
-  "title": "MinIO Cluster Replication Dashboard",
+  "title": "Silo Cluster Replication Dashboard",
   "uid": "TgmJnnqnk3",
   "version": 1,
   "weekStart": ""

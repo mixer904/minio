@@ -239,7 +239,7 @@ func main() {
 
 		clnt, err := minio.New(u.Host, opts)
 		if err != nil {
-			log.Println(fmt.Errorf("Error while initializing Minio client, %s", err))
+			log.Println(fmt.Errorf("error while initializing minio-go client: %s", err))
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

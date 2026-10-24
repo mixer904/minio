@@ -21,7 +21,7 @@
 package main
 
 // This programs mocks user interaction against Dex IDP and generates STS
-// credentials. It is for MinIO testing purposes only.
+// credentials. It is for Silo testing purposes only.
 //
 // Run like:
 //
@@ -43,7 +43,7 @@ func main() {
 
 	endpoint := os.Getenv("MINIO_ENDPOINT")
 	if endpoint == "" {
-		log.Fatalf("Please specify a MinIO server endpoint environment variable like:\n\n\texport MINIO_ENDPOINT=http://localhost:9000")
+		log.Fatalf("Please specify a Silo server endpoint environment variable like:\n\n\texport MINIO_ENDPOINT=http://localhost:9000")
 	}
 
 	appParams := cmd.OpenIDClientAppParams{

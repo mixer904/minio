@@ -713,7 +713,12 @@ func (p *xlStorageDiskIDCheck) StatInfoFile(ctx context.Context, volume, path st
 }
 
 func (p *xlStorageDiskIDCheck) ReadParts(ctx context.Context, volume string, partMetaPaths ...string) ([]*ObjectPartInfo, error) {
-	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadParts, volume, path.Dir(partMetaPaths[0]))
+	// Merely for tracing storage
+	partPath := ""
+	if len(partMetaPaths) > 0 {
+		partPath = path.Dir(partMetaPaths[0])
+	}
+	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadParts, volume, partPath)
 	if err != nil {
 		return nil, err
 	}

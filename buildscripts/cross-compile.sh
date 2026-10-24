@@ -8,8 +8,11 @@ function _init() {
 	## All binaries are static make sure to disable CGO.
 	export CGO_ENABLED=0
 
-	## List of architectures and OS to test coss compilation.
-	SUPPORTED_OSARCH="linux/ppc64le linux/mips64 linux/amd64 linux/arm64 linux/s390x darwin/arm64 darwin/amd64 freebsd/amd64 windows/amd64 linux/arm linux/386 netbsd/amd64 linux/mips openbsd/amd64 linux/riscv64"
+	## Cross-compile only the OS/arch combinations we actually publish, kept in
+	## sync with the goos/goarch matrix in .github/goreleaser.yml. Compile-checking
+	## targets we never ship (ppc64le, s390x, mips*, riscv64, 386, arm, the BSDs)
+	## spent CI minutes on unshipped code and timed the gate out on a cold cache.
+	SUPPORTED_OSARCH="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64"
 }
 
 function _build() {

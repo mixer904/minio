@@ -128,7 +128,7 @@ var stsErrCodes = stsErrorCodeMap{
 	},
 	ErrSTSInvalidClientGrantsToken: {
 		Code:           "InvalidClientGrantsToken",
-		Description:    "The client grants token that was passed could not be validated by MinIO.",
+		Description:    "The client grants token that was passed could not be validated by Silo.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrSTSMalformedPolicyDocument: {

@@ -38,7 +38,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 const (
@@ -69,11 +69,6 @@ const (
 	EnvPostgresFormat             = "MINIO_NOTIFY_POSTGRES_FORMAT"
 	EnvPostgresConnectionString   = "MINIO_NOTIFY_POSTGRES_CONNECTION_STRING"
 	EnvPostgresTable              = "MINIO_NOTIFY_POSTGRES_TABLE"
-	EnvPostgresHost               = "MINIO_NOTIFY_POSTGRES_HOST"
-	EnvPostgresPort               = "MINIO_NOTIFY_POSTGRES_PORT"
-	EnvPostgresUsername           = "MINIO_NOTIFY_POSTGRES_USERNAME"
-	EnvPostgresPassword           = "MINIO_NOTIFY_POSTGRES_PASSWORD"
-	EnvPostgresDatabase           = "MINIO_NOTIFY_POSTGRES_DATABASE"
 	EnvPostgresQueueDir           = "MINIO_NOTIFY_POSTGRES_QUEUE_DIR"
 	EnvPostgresQueueLimit         = "MINIO_NOTIFY_POSTGRES_QUEUE_LIMIT"
 	EnvPostgresMaxOpenConnections = "MINIO_NOTIFY_POSTGRES_MAX_OPEN_CONNECTIONS"
@@ -403,25 +398,41 @@ func (target *PostgreSQLTarget) initPostgreSQL() error {
 	return nil
 }
 
+// quoteConnParam renders a value for a libpq keyword/value connection string.
+// Parameters are separated by whitespace, so an unquoted value containing a
+// space is read as the start of the next keyword and the connection fails on a
+// string the operator never wrote. Single quotes make the value opaque;
+// backslash and the quote itself are the only characters that need escaping
+// inside them.
+//
+// Quoting unconditionally rather than only when required keeps the two cases
+// from diverging: libpq treats 'localhost' and localhost identically, so there
+// is nothing to gain by deciding per value which form to emit.
+func quoteConnParam(v string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
+}
+
 // NewPostgreSQLTarget - creates new PostgreSQL target.
 func NewPostgreSQLTarget(id string, args PostgreSQLArgs, loggerOnce logger.LogOnce) (*PostgreSQLTarget, error) {
 	params := []string{args.ConnectionString}
 	if args.ConnectionString == "" {
 		params = []string{}
 		if !args.Host.IsEmpty() {
-			params = append(params, "host="+args.Host.String())
+			params = append(params, "host="+quoteConnParam(args.Host.String()))
 		}
 		if args.Port != "" {
-			params = append(params, "port="+args.Port)
+			params = append(params, "port="+quoteConnParam(args.Port))
 		}
 		if args.Username != "" {
-			params = append(params, "username="+args.Username)
+			// libpq's keyword is "user"; "username" is rejected by the server
+			// as an unrecognized configuration parameter.
+			params = append(params, "user="+quoteConnParam(args.Username))
 		}
 		if args.Password != "" {
-			params = append(params, "password="+args.Password)
+			params = append(params, "password="+quoteConnParam(args.Password))
 		}
 		if args.Database != "" {
-			params = append(params, "dbname="+args.Database)
+			params = append(params, "dbname="+quoteConnParam(args.Database))
 		}
 	}
 	connStr := strings.Join(params, " ")

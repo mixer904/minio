@@ -19,8 +19,8 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -33,7 +33,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/grid"
 	"github.com/tinylib/msgp/msgp"
 
@@ -45,10 +44,26 @@ import (
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 var errDiskStale = errors.New("drive stale")
+
+// maxAppendFilePrealloc bounds how much AppendFileHandler reserves up front
+// from the caller-declared Content-Length. It only affects pre-reservation:
+// bodies larger than this are still read in full, they just grow into place.
+//
+// Kept small deliberately. The reservation happens before a single body byte
+// arrives, so whatever it is, an attacker gets it for free on every concurrent
+// request - a large bound simply moves the exhaustion threshold rather than
+// removing it. 1 MiB matches the common erasure block size, so the ordinary
+// append still completes in one allocation.
+const maxAppendFilePrealloc = 1 << 20
+
+// maxReadFileLength caps ReadFileHandler's buffer. ReadFile serves the legacy
+// whole-file bitrot reader, whose length is ShardFileOffset over a single part,
+// and an S3 part is at most 5 GiB -- so no legitimate call can ask for more.
+const maxReadFileLength = 5 << 30
 
 // To abstract a disk over network.
 type storageRESTServer struct {
@@ -75,6 +90,10 @@ var (
 	storageListDirRPC          = grid.NewStream[*grid.MSS, grid.NoPayload, *ListDirResult](grid.HandlerListDir, grid.NewMSS, nil, func() *ListDirResult { return &ListDirResult{} }).WithOutCapacity(1)
 )
 
+// getStorageViaEndpoint returns the drive UNGUARDED. It is for local callers
+// only, whose arguments the server itself constructed. Anything serving a
+// remote peer must go through storageRESTServer.getStorage(), which wraps this
+// in guardedStorage to reject traversal in wire-supplied paths.
 func getStorageViaEndpoint(endpoint Endpoint) StorageAPI {
 	globalLocalDrivesMu.RLock()
 	defer globalLocalDrivesMu.RUnlock()
@@ -85,7 +104,18 @@ func getStorageViaEndpoint(endpoint Endpoint) StorageAPI {
 }
 
 func (s *storageRESTServer) getStorage() StorageAPI {
-	return getStorageViaEndpoint(s.endpoint)
+	st := getStorageViaEndpoint(s.endpoint)
+	if st == nil {
+		// Must stay an untyped nil. IsAuthValid and checkID compare the result
+		// against nil before authenticating, and a nil interface wrapped in a
+		// value struct does not compare equal to nil - that would turn an
+		// unauthenticated request against a drive that has not come up yet
+		// into a nil dereference.
+		return nil
+	}
+	// Reject traversal in paths carried by request bodies and grid RPC frames,
+	// neither of which the global HTTP middleware can see. See guardedStorage.
+	return guardedStorage{st}
 }
 
 func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
@@ -260,6 +290,9 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 		for update := range updates {
 			resp := storageNSScannerRPC.NewResponse()
 			resp.Update = &update
+			// Pooled responses may carry fields from a previous
+			// scan, always clear the fields not being set.
+			resp.Final = nil
 			out <- resp
 		}
 	}()
@@ -271,6 +304,7 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 	// Send final response.
 	resp := storageNSScannerRPC.NewResponse()
 	resp.Final = &ui
+	resp.Update = nil
 	out <- resp
 	return nil
 }
@@ -319,12 +353,32 @@ func (s *storageRESTServer) AppendFileHandler(w http.ResponseWriter, r *http.Req
 	volume := r.Form.Get(storageRESTVolume)
 	filePath := r.Form.Get(storageRESTFilePath)
 
-	buf := make([]byte, r.ContentLength)
-	_, err := io.ReadFull(r.Body, buf)
+	if r.ContentLength < 0 {
+		s.writeErrorResponse(w, errInvalidArgument)
+		return
+	}
+
+	// Reserve from the declared Content-Length only up to a bound, then let the
+	// buffer grow with the bytes actually delivered. Content-Length is a header
+	// the caller writes, and setRequestLimitMiddleware only wraps the body in a
+	// MaxBytesReader sized at requestMaxBodySize (5 TiB) - it never checks the
+	// declaration. Sizing the buffer from it therefore lets a request that
+	// sends no body at all reserve arbitrary memory and take the node down.
+	//
+	// The cap governs how much is pre-reserved, never which requests are
+	// accepted, so a body larger than it is still read in full.
+	var body bytes.Buffer
+	body.Grow(int(min(r.ContentLength, maxAppendFilePrealloc)))
+	n, err := body.ReadFrom(io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		s.writeErrorResponse(w, err)
 		return
 	}
+	if n != r.ContentLength {
+		s.writeErrorResponse(w, io.ErrUnexpectedEOF)
+		return
+	}
+	buf := body.Bytes()
 	err = s.getStorage().AppendFile(r.Context(), volume, filePath, buf)
 	if err != nil {
 		s.writeErrorResponse(w, err)
@@ -545,11 +599,14 @@ func (s *storageRESTServer) ReadPartsHandler(w http.ResponseWriter, r *http.Requ
 
 	done := keepHTTPResponseAlive(w)
 	infos, err := s.getStorage().ReadParts(r.Context(), volume, preq.Paths...)
-	done(nil)
 	if err != nil {
-		s.writeErrorResponse(w, err)
+		// The keep-alive stream owns the response body from here on, so the
+		// error has to travel through done(); writing a header afterwards is
+		// too late and leaves the client decoding the error text as msgpack.
+		done(err)
 		return
 	}
+	done(nil)
 
 	presp := &ReadPartsResp{Infos: infos}
 	storageLogIf(r.Context(), msgp.Encode(w, presp))
@@ -587,6 +644,17 @@ func (s *storageRESTServer) ReadFileHandler(w http.ResponseWriter, r *http.Reque
 		}
 		verifier = NewBitrotVerifier(BitrotAlgorithmFromString(r.Form.Get(storageRESTBitrotAlgo)), hash)
 	}
+	// The declared length sizes the buffer before anything is read and arrives
+	// in a query argument, so an unbounded value lets a small request reserve
+	// arbitrary memory. A legitimate read cannot exceed one erasure shard, and
+	// a shard never exceeds the S3 part it encodes, so anything above that
+	// ceiling is provably not a real read. This bounds the reservation at what
+	// normal operation already reaches; it does not make GiB-scale reads free.
+	if int64(length) > maxReadFileLength {
+		s.writeErrorResponse(w, errInvalidArgument)
+		return
+	}
+
 	buf := make([]byte, length)
 	defer metaDataPoolPut(buf) // Reuse if we can.
 	_, err = s.getStorage().ReadFile(r.Context(), volume, filePath, int64(offset), buf, verifier)
@@ -671,15 +739,27 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 		return
 	}
 
-	versions := make([]FileInfoVersions, totalVersions)
+	if totalVersions < 0 {
+		s.writeErrorResponse(w, errInvalidArgument)
+		return
+	}
+
+	// Grow as the body decodes rather than trusting the declared count. The
+	// count arrives in a query argument, so pre-allocating from it lets a
+	// ~10-byte request reserve gigabytes (FileInfoVersions is 104 bytes, so
+	// total-versions=100000000 asks for ~9.7 GiB) and take the node down by
+	// memory exhaustion. Growing means the allocation stays proportional to
+	// the bytes the caller actually sent.
+	versions := make([]FileInfoVersions, 0, min(totalVersions, 1024))
 	decoder := msgpNewReader(r.Body)
 	defer readMsgpReaderPoolPut(decoder)
-	for i := range totalVersions {
-		dst := &versions[i]
+	for range totalVersions {
+		var dst FileInfoVersions
 		if err := dst.DecodeMsg(decoder); err != nil {
 			s.writeErrorResponse(w, err)
 			return
 		}
+		versions = append(versions, dst)
 	}
 
 	done := keepHTTPResponseAlive(w)
@@ -687,7 +767,7 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 	errs := s.getStorage().DeleteVersions(r.Context(), volume, versions, opts)
 	done(nil)
 
-	dErrsResp := &DeleteVersionsErrsResp{Errs: make([]string, totalVersions)}
+	dErrsResp := &DeleteVersionsErrsResp{Errs: make([]string, len(versions))}
 	for idx := range versions {
 		if errs[idx] != nil {
 			dErrsResp.Errs[idx] = errs[idx].Error()
@@ -961,157 +1041,6 @@ func waitForHTTPResponse(respBody io.Reader) (io.Reader, error) {
 	}
 }
 
-// httpStreamResponse allows streaming a response, but still send an error.
-type httpStreamResponse struct {
-	done  chan error
-	block chan []byte
-	err   error
-}
-
-// Write part of the streaming response.
-// Note that upstream errors are currently not forwarded, but may be in the future.
-func (h *httpStreamResponse) Write(b []byte) (int, error) {
-	if len(b) == 0 || h.err != nil {
-		// Ignore 0 length blocks
-		return 0, h.err
-	}
-	tmp := make([]byte, len(b))
-	copy(tmp, b)
-	h.block <- tmp
-	return len(b), h.err
-}
-
-// CloseWithError will close the stream and return the specified error.
-// This can be done several times, but only the first error will be sent.
-// After calling this the stream should not be written to.
-func (h *httpStreamResponse) CloseWithError(err error) {
-	if h.done == nil {
-		return
-	}
-	h.done <- err
-	h.err = err
-	// Indicates that the response is done.
-	<-h.done
-	h.done = nil
-}
-
-// streamHTTPResponse can be used to avoid timeouts with long storage
-// operations, such as bitrot verification or data usage scanning.
-// Every 10 seconds a space character is sent.
-// The returned function should always be called to release resources.
-// An optional error can be sent which will be picked as text only error,
-// without its original type by the receiver.
-// waitForHTTPStream should be used to the receiving side.
-func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
-	doneCh := make(chan error)
-	blockCh := make(chan []byte)
-	h := httpStreamResponse{done: doneCh, block: blockCh}
-	go func() {
-		canWrite := true
-		write := func(b []byte) {
-			if canWrite {
-				n, err := w.Write(b)
-				if err != nil || n != len(b) {
-					canWrite = false
-				}
-			}
-		}
-
-		ticker := time.NewTicker(time.Second * 10)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Response not ready, write a filler byte.
-				write([]byte{32})
-				if canWrite {
-					xhttp.Flush(w)
-				}
-			case err := <-doneCh:
-				if err != nil {
-					write([]byte{1})
-					write([]byte(err.Error()))
-				} else {
-					write([]byte{0})
-				}
-				xioutil.SafeClose(doneCh)
-				return
-			case block := <-blockCh:
-				var tmp [5]byte
-				tmp[0] = 2
-				binary.LittleEndian.PutUint32(tmp[1:], uint32(len(block)))
-				write(tmp[:])
-				write(block)
-				if canWrite {
-					xhttp.Flush(w)
-				}
-			}
-		}
-	}()
-	return &h
-}
-
-var poolBuf8k = bpool.Pool[*[]byte]{
-	New: func() *[]byte {
-		b := make([]byte, 8192)
-		return &b
-	},
-}
-
-// waitForHTTPStream will wait for responses where
-// streamHTTPResponse has been used.
-// The returned reader contains the payload and must be closed if no error is returned.
-func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
-	var tmp [1]byte
-	// 8K copy buffer, reused for less allocs...
-	bufp := poolBuf8k.Get()
-	buf := *bufp
-	defer poolBuf8k.Put(bufp)
-
-	for {
-		_, err := io.ReadFull(respBody, tmp[:])
-		if err != nil {
-			return err
-		}
-		// Check if we have a response ready or a filler byte.
-		switch tmp[0] {
-		case 0:
-			// 0 is unbuffered, copy the rest.
-			_, err := io.CopyBuffer(w, respBody, buf)
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		case 1:
-			errorText, err := io.ReadAll(respBody)
-			if err != nil {
-				return err
-			}
-			return errors.New(string(errorText))
-		case 2:
-			// Block of data
-			var tmp [4]byte
-			_, err := io.ReadFull(respBody, tmp[:])
-			if err != nil {
-				return err
-			}
-			length := binary.LittleEndian.Uint32(tmp[:])
-			n, err := io.CopyBuffer(w, io.LimitReader(respBody, int64(length)), buf)
-			if err != nil {
-				return err
-			}
-			if n != int64(length) {
-				return io.ErrUnexpectedEOF
-			}
-			continue
-		case 32:
-			continue
-		default:
-			return fmt.Errorf("unexpected filler byte: %d", tmp[0])
-		}
-	}
-}
-
 // VerifyFileHandler - Verify all part of file for bitrot errors.
 func (s *storageRESTServer) VerifyFileHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -1187,17 +1116,17 @@ func logFatalErrs(err error, endpoint Endpoint, exit bool) {
 	case errors.Is(err, errUnsupportedDisk):
 		var hint string
 		if endpoint.URL != nil {
-			hint = fmt.Sprintf("Drive '%s' does not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support", endpoint.Path)
+			hint = fmt.Sprintf("Drive '%s' does not support O_DIRECT flags, Silo erasure coding requires filesystems with O_DIRECT support", endpoint.Path)
 		} else {
-			hint = "Drives do not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support"
+			hint = "Drives do not support O_DIRECT flags, Silo erasure coding requires filesystems with O_DIRECT support"
 		}
 		logger.Fatal(config.ErrUnsupportedBackend(err).Hint("%s", hint), "Unable to initialize backend")
 	case errors.Is(err, errDiskNotDir):
 		var hint string
 		if endpoint.URL != nil {
-			hint = fmt.Sprintf("Drive '%s' is not a directory, MinIO erasure coding needs a directory", endpoint.Path)
+			hint = fmt.Sprintf("Drive '%s' is not a directory, Silo erasure coding needs a directory", endpoint.Path)
 		} else {
-			hint = "Drives are not directories, MinIO erasure coding needs directories"
+			hint = "Drives are not directories, Silo erasure coding needs directories"
 		}
 		logger.Fatal(config.ErrUnableToWriteInBackend(err).Hint("%s", hint), "Unable to initialize backend")
 	case errors.Is(err, errDiskAccessDenied):

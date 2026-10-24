@@ -9,6 +9,6 @@ services:
       - "389:389"
       - "636:636"
     environment:
-      LDAP_ORGANIZATION: "MinIO Inc"
+      LDAP_ORGANIZATION: "Silo Inc"
       LDAP_DOMAIN: "min.io"
       LDAP_ADMIN_PASSWORD: "admin"

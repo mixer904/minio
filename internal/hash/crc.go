@@ -35,16 +35,20 @@ func (c *Checksum) AddPart(other Checksum, size int64) error {
 	if !other.Type.CanMerge() {
 		return fmt.Errorf("checksum type cannot be merged")
 	}
-	if size == 0 {
-		return nil
-	}
 	if !c.Type.Is(other.Type.Base()) {
 		return fmt.Errorf("checksum type does not match got %s and %s", c.Type.String(), other.Type.String())
 	}
 	// If never set, just add first checksum.
+	// This must happen before the zero size check below, otherwise an object
+	// with no content at all never seeds the accumulator and ends up with no
+	// checksum instead of the checksum of zero bytes.
 	if len(c.Raw) == 0 {
 		c.Raw = other.Raw
 		c.Encoded = other.Encoded
+		return nil
+	}
+	// Appending zero bytes leaves the checksum unchanged.
+	if size == 0 {
 		return nil
 	}
 	if !c.Valid() {

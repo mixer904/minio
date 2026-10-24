@@ -43,6 +43,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/crypto"
+	minhash "github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	ioutilx "github.com/minio/minio/internal/ioutil"
@@ -978,7 +979,10 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
 		}
 
-		rs := partNumberToRangeSpec(oinfo, partNumber)
+		rs, err := partNumberToRangeSpec(oinfo, partNumber)
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
+		}
 		size, err := oinfo.GetActualSize()
 		if err != nil {
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
@@ -1795,6 +1799,12 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 		req.Header.Set("X-Amz-Copy-Source", url.QueryEscape(pathJoin(bucketName, objectName)))
 		req.Header.Set("X-Amz-Copy-Source-Range", fmt.Sprintf("bytes=%d-%d", a, b))
 
+		// Re-sign so the copy-source x-amz-* headers are covered by the
+		// signature, as real clients do; the verifier rejects unsigned x-amz-*.
+		if err = signRequestV4(req, credentials.AccessKey, credentials.SecretKey); err != nil {
+			t.Fatalf("Test failed to re-sign HTTP request for copy object part: <ERROR> %v", err)
+		}
+
 		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler, `func (api objectAPIHandlers) CopyObjectHandler` handles the request.
 		a = globalMinPartSize + 1
@@ -2193,6 +2203,15 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 				req.Header.Set("X-Amz-Copy-Source-Range", "") // specifically test for S3 errors in this scenario.
 			} else {
 				req.Header.Set("X-Amz-Copy-Source-Range", testCase.copySourceRange)
+			}
+		}
+
+		// Re-sign so the copy-source x-amz-* headers set above are covered by
+		// the signature, as real clients do; the verifier rejects unsigned
+		// x-amz-* headers.
+		if testCase.accessKey != "" && testCase.secretKey != "" {
+			if err = signRequestV4(req, testCase.accessKey, testCase.secretKey); err != nil {
+				t.Fatalf("Test %d: Failed to re-sign HTTP request for copy Object: <ERROR> %v", i+1, err)
 			}
 		}
 
@@ -2621,6 +2640,16 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		}
 		if testCase.metadataGarbage {
 			req.Header.Set("X-Amz-Metadata-Directive", "Unknown")
+		}
+		// The x-amz-copy-source and related x-amz-* headers set above must be
+		// part of the SigV4 signature, exactly as real S3 clients send them.
+		// Re-sign now that they are present; the verifier rejects unsigned
+		// x-amz-* headers (an unsigned x-amz-copy-source could otherwise turn a
+		// PUT grant into a server-side copy).
+		if testCase.accessKey != "" && testCase.secretKey != "" {
+			if err = signRequestV4(req, testCase.accessKey, testCase.secretKey); err != nil {
+				t.Fatalf("Test %d: Failed to re-sign HTTP request for copy Object: <ERROR> %v", i, err)
+			}
 		}
 		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler, `func (api objectAPIHandlers) CopyObjectHandler` handles the request.
@@ -3384,6 +3413,62 @@ func testAPICompleteMultipartHandler(obj ObjectLayer, instanceType, bucketName s
 	// execute the object layer set to `nil` test.
 	// `ExecObjectLayerAPINilTest` manages the operation.
 	ExecObjectLayerAPINilTest(t, nilBucket, nilObject, instanceType, apiRouter, nilReq)
+}
+
+// TestGenerateCompleteMultipartUploadResponseChecksumType verifies that
+// ChecksumType is populated as FULL_OBJECT/COMPOSITE when the object carries
+// a checksum, and omitted from the XML entirely when it doesn't.
+func TestGenerateCompleteMultipartUploadResponseChecksumType(t *testing.T) {
+	bucket, key := "test-bucket", "test-object"
+
+	testCases := []struct {
+		name             string
+		checksum         *minhash.Checksum
+		wantChecksumType string
+	}{
+		{
+			name:             "no checksum",
+			checksum:         nil,
+			wantChecksumType: "",
+		},
+		{
+			name:             "full object checksum",
+			checksum:         minhash.NewChecksumFromData(minhash.ChecksumCRC32, []byte("full-object-data")),
+			wantChecksumType: xhttp.AmzChecksumTypeFullObject,
+		},
+		{
+			name: "composite multipart checksum",
+			checksum: func() *minhash.Checksum {
+				c := minhash.NewChecksumFromData(minhash.ChecksumCRC32C|minhash.ChecksumMultipart, []byte("combined-part-checksums"))
+				c.WantParts = 2
+				return c
+			}(),
+			wantChecksumType: xhttp.AmzChecksumTypeComposite,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			oi := ObjectInfo{ETag: "d41d8cd98f00b204e9800998ecf8427e"}
+			if tt.checksum != nil {
+				oi.Checksum = tt.checksum.AppendTo(nil, nil)
+			}
+
+			resp := generateCompleteMultipartUploadResponse(bucket, key, getGetObjectURL("", bucket, key), oi, nil)
+			if resp.ChecksumType != tt.wantChecksumType {
+				t.Fatalf("ChecksumType: got %q, want %q", resp.ChecksumType, tt.wantChecksumType)
+			}
+
+			encoded, err := xml.Marshal(resp)
+			if err != nil {
+				t.Fatalf("failed to marshal response: %v", err)
+			}
+			gotTag := strings.Contains(string(encoded), "<ChecksumType>")
+			if wantTag := tt.wantChecksumType != ""; gotTag != wantTag {
+				t.Fatalf("ChecksumType tag presence: got %v, want %v (xml: %s)", gotTag, wantTag, encoded)
+			}
+		})
+	}
 }
 
 // The UploadID from the response body is parsed and its existence is asserted with an attempt to ListParts using it.

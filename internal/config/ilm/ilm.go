@@ -21,7 +21,7 @@ import (
 	"strconv"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/env"
 )
 
 // DefaultKVS default configuration values for ILM subsystem
@@ -42,6 +42,20 @@ type Config struct {
 	ExpirationWorkers int
 }
 
+// Accept stored access-tier settings without re-enabling the retired feature.
+var deprecatedKeys = []string{
+	"access_tiering",
+	"access_pools",
+	"access_max_size",
+	"access_promote_watermark",
+	"access_bin_width",
+	"access_bins",
+	"access_flush",
+	"access_min_residency",
+	"access_workers",
+	"access_max_tracked",
+}
+
 // LookupConfig - lookup ilm config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	cfg = Config{
@@ -49,7 +63,7 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		ExpirationWorkers: 100,
 	}
 
-	if err = config.CheckValidKeys(config.ILMSubSys, kvs, DefaultKVS); err != nil {
+	if err = config.CheckValidKeys(config.ILMSubSys, kvs, DefaultKVS, deprecatedKeys...); err != nil {
 		return cfg, err
 	}
 

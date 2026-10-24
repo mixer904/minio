@@ -1,6 +1,6 @@
-# MinIO Multi-user Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# Silo Multi-user Quickstart Guide
 
-MinIO supports multiple long term users in addition to default user created during server startup. New users can be added after server starts up, and server can be configured to deny or allow access to buckets and resources to each of these users. This document explains how to add/remove users and modify their access rights.
+Silo supports multiple long term users in addition to default user created during server startup. New users can be added after server starts up, and server can be configured to deny or allow access to buckets and resources to each of these users. This document explains how to add/remove users and modify their access rights.
 
 ## Get started
 
@@ -8,13 +8,13 @@ In this document we will explain in detail on how to configure multiple users.
 
 ### 1. Prerequisites
 
-- Install mc - [MinIO Client Quickstart Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc.html#quickstart)
-- Install MinIO - [MinIO Quickstart Guide](https://docs.min.io/community/minio-object-store/operations/deployments/baremetal-deploy-minio-on-redhat-linux.html)
-- Configure etcd - [Etcd V3 Quickstart Guide](https://github.com/pgsty/minio/blob/master/docs/sts/etcd.md)
+- Install mc - [Silo Client Quickstart Guide](https://silo.pgsty.com/reference/minio-mc/#quickstart)
+- Install Silo - [Silo Quickstart Guide](https://silo.pgsty.com/operations/deployments/baremetal-deploy-minio-on-redhat-linux/)
+- Configure etcd - [Etcd V3 Quickstart Guide](https://github.com/pgsty/silo/blob/main/docs/sts/etcd.md)
 
 ### 2. Create a new user with canned policy
 
-Use [`mc admin policy`](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin/mc-admin-policy.html) to create canned policies. Server provides a default set of canned policies namely `writeonly`, `readonly` and `readwrite` *(these policies apply to all resources on the server)*. These can be overridden by custom policies using `mc admin policy` command.
+Use [`mc admin policy`](https://silo.pgsty.com/reference/minio-mc-admin/mc-admin-policy/) to create canned policies. Server provides a default set of canned policies namely `writeonly`, `readonly` and `readwrite` *(these policies apply to all resources on the server)*. These can be overridden by custom policies using `mc admin policy` command.
 
 Create new canned policy file `getonly.json`. This policy enables users to download all objects under `my-bucketname`.
 
@@ -41,31 +41,31 @@ EOF
 Create new canned policy by name `getonly` using `getonly.json` policy file.
 
 ```
-mc admin policy create myminio getonly getonly.json
+mc admin policy create mysilo getonly getonly.json
 ```
 
-Create a new user `newuser` on MinIO use `mc admin user`.
+Create a new user `newuser` on Silo use `mc admin user`.
 
 ```
-mc admin user add myminio newuser newuser123
+mc admin user add mysilo newuser newuser123
 ```
 
 Once the user is successfully created you can now apply the `getonly` policy for this user.
 
 ```
-mc admin policy attach myminio getonly --user=newuser
+mc admin policy attach mysilo getonly --user=newuser
 ```
 
 ### 3. Create a new group
 
 ```
-mc admin group add myminio newgroup newuser
+mc admin group add mysilo newgroup newuser
 ```
 
 Once the group is successfully created you can now apply the `getonly` policy for this group.
 
 ```
-mc admin policy attach myminio getonly --group=newgroup
+mc admin policy attach mysilo getonly --group=newgroup
 ```
 
 ### 4. Disable user
@@ -73,13 +73,13 @@ mc admin policy attach myminio getonly --group=newgroup
 Disable user `newuser`.
 
 ```
-mc admin user disable myminio newuser
+mc admin user disable mysilo newuser
 ```
 
 Disable group `newgroup`.
 
 ```
-mc admin group disable myminio newgroup
+mc admin group disable mysilo newgroup
 ```
 
 ### 5. Remove user
@@ -87,19 +87,19 @@ mc admin group disable myminio newgroup
 Remove the user `newuser`.
 
 ```
-mc admin user remove myminio newuser
+mc admin user remove mysilo newuser
 ```
 
 Remove the user `newuser` from a group.
 
 ```
-mc admin group remove myminio newgroup newuser
+mc admin group remove mysilo newgroup newuser
 ```
 
 Remove the group `newgroup`.
 
 ```
-mc admin group remove myminio newgroup
+mc admin group remove mysilo newgroup
 ```
 
 ### 6. Change user or group policy
@@ -107,13 +107,13 @@ mc admin group remove myminio newgroup
 Change the policy for user `newuser` to `putonly` canned policy.
 
 ```
-mc admin policy attach myminio putonly --user=newuser
+mc admin policy attach mysilo putonly --user=newuser
 ```
 
 Change the policy for group `newgroup` to `putonly` canned policy.
 
 ```
-mc admin policy attach myminio putonly --group=newgroup
+mc admin policy attach mysilo putonly --group=newgroup
 ```
 
 ### 7. List all users or groups
@@ -121,27 +121,27 @@ mc admin policy attach myminio putonly --group=newgroup
 List all enabled and disabled users.
 
 ```
-mc admin user list myminio
+mc admin user list mysilo
 ```
 
 List all enabled or disabled groups.
 
 ```
-mc admin group list myminio
+mc admin group list mysilo
 ```
 
 ### 8. Configure `mc`
 
 ```
-mc alias set myminio-newuser http://localhost:9000 newuser newuser123 --api s3v4
-mc cat myminio-newuser/my-bucketname/my-objectname
+mc alias set mysilo-newuser http://localhost:9000 newuser newuser123 --api s3v4
+mc cat mysilo-newuser/my-bucketname/my-objectname
 ```
 
 ### Policy Variables
 
 You can use policy variables in the *Resource* element and in string comparisons in the *Condition* element.
 
-You can use a policy variable in the Resource element, but only in the resource portion of the ARN. This portion of the ARN appears after the 5th colon (:). You can't use a variable to replace parts of the ARN before the 5th colon, such as the service or account. The following policy might be attached to a group. It gives each of the users in the group full programmatic access to a user-specific object (their own "home directory") in MinIO.
+You can use a policy variable in the Resource element, but only in the resource portion of the ARN. This portion of the ARN appears after the 5th colon (:). You can't use a variable to replace parts of the ARN before the 5th colon, such as the service or account. The following policy might be attached to a group. It gives each of the users in the group full programmatic access to a user-specific object (their own "home directory") in Silo.
 
 ```
 {
@@ -190,7 +190,7 @@ If the user is authenticating using an STS credential which was authorized from 
 - `jwt:scope`
 - `jwt:client_id`
 
-Following example shows OpenID users with full programmatic access to a OpenID user-specific directory (their own "home directory") in MinIO.
+Following example shows OpenID users with full programmatic access to a OpenID user-specific directory (their own "home directory") in Silo.
 
 ```
 {
@@ -222,7 +222,7 @@ Currently supports
 - `ldap:user`
 - `ldap:groups`
 
-Following example shows LDAP users full programmatic access to a LDAP user-specific directory (their own "home directory") in MinIO.
+Following example shows LDAP users full programmatic access to a LDAP user-specific directory (their own "home directory") in Silo.
 
 ```
 {
@@ -250,9 +250,9 @@ Following example shows LDAP users full programmatic access to a LDAP user-speci
 
 - `aws:CurrentTime` - This can be used for conditions that check the date and time.
 - `aws:EpochTime` - This is the date in epoch or Unix time, for use with date/time conditions.
-- `aws:PrincipalType` - This value indicates whether the principal is an account (Root credential), user (MinIO user), or assumed role (STS)
+- `aws:PrincipalType` - This value indicates whether the principal is an account (Root credential), user (Silo user), or assumed role (STS)
 - `aws:SecureTransport` - This is a Boolean value that represents whether the request was sent over TLS.
-- `aws:SourceIp` - This is the requester's IP address, for use with IP address conditions. If running behind Nginx like proxies, MinIO preserve's the source IP.
+- `aws:SourceIp` - This is the requester's IP address, for use with IP address conditions. If running behind Nginx like proxies, Silo preserve's the source IP.
 
 ```
 {
@@ -266,13 +266,13 @@ Following example shows LDAP users full programmatic access to a LDAP user-speci
 }
 ```
 
-- `aws:UserAgent` - This value is a string that contains information about the requester's client application. This string is generated by the client and can be unreliable. You can only use this context key from `mc` or other MinIO SDKs which standardize the User-Agent string.
-- `aws:username` - This is a string containing the friendly name of the current user, this value would point to STS temporary credential in `AssumeRole`ed requests, use `jwt:preferred_username` in case of OpenID connect and `ldap:username` in case of AD/LDAP. *aws:userid* is an alias to *aws:username* in MinIO.
+- `aws:UserAgent` - This value is a string that contains information about the requester's client application. This string is generated by the client and can be unreliable. You can only use this context key from `mc` or other compatible SDKs which standardize the User-Agent string.
+- `aws:username` - This is a string containing the friendly name of the current user, this value would point to STS temporary credential in `AssumeRole`ed requests, use `jwt:preferred_username` in case of OpenID connect and `ldap:username` in case of AD/LDAP. *aws:userid* is an alias to *aws:username* in Silo.
 - `aws:groups` - This is an array containing the group names, this value would point to group mappings for the user, use `jwt:groups` in case of OpenID connect and `ldap:groups` in case of AD/LDAP.
 
 ## Explore Further
 
-- [MinIO Client Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc.html)
-- [MinIO STS Quickstart Guide](https://docs.min.io/community/minio-object-store/developers/security-token-service.html)
-- [MinIO Admin Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Silo Client Complete Guide](https://silo.pgsty.com/reference/minio-mc/)
+- [Silo STS Quickstart Guide](https://silo.pgsty.com/developers/security-token-service/)
+- [Silo Admin Complete Guide](https://silo.pgsty.com/reference/minio-mc-admin/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)

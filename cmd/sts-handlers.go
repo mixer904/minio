@@ -41,8 +41,8 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v3/policy"
-	"github.com/minio/pkg/v3/wildcard"
+	"github.com/pgsty/silo-pkg/v3/policy"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
 )
 
 const (
@@ -624,6 +624,10 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 
 	claims[expClaim] = UTCNow().Add(duration).Unix()
 	claims[parentClaim] = user.AccessKey
+	if err := setIAMParentRevocationClaim(ctx, globalIAMSys.store, user.AccessKey, claims); err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+		return
+	}
 
 	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
 	if tokenRevokeType != "" {

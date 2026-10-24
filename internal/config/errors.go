@@ -21,8 +21,8 @@ package config
 var (
 	ErrInvalidXLValue = newErrFn(
 		"Invalid drive path",
-		"Please provide a fresh drive for single drive MinIO setup",
-		"MinIO only supports fresh drive paths",
+		"Please provide a fresh drive for a single-drive Silo setup",
+		"Silo only supports fresh drive paths",
 	)
 
 	ErrInvalidBrowserValue = newErrFn(
@@ -106,26 +106,26 @@ var (
 	ErrInvalidErasureEndpoints = newErrFn(
 		"Invalid endpoint(s) in erasure mode",
 		"Please provide correct combination of local/remote paths",
-		"For more information, please refer to https://docs.min.io/community/minio-object-store/operations/concepts/erasure-coding.html",
+		"For more information, please refer to https://silo.pgsty.com/operations/concepts/erasure-coding/",
 	)
 
 	ErrInvalidNumberOfErasureEndpoints = newErrFn(
 		"Invalid total number of endpoints for erasure mode",
 		"Please provide number of endpoints greater or equal to 2",
-		"For more information, please refer to https://docs.min.io/community/minio-object-store/operations/concepts/erasure-coding.html",
+		"For more information, please refer to https://silo.pgsty.com/operations/concepts/erasure-coding/",
 	)
 
 	ErrStorageClassValue = newErrFn(
 		"Invalid storage class value",
 		"Please check the value",
-		`MINIO_STORAGE_CLASS_STANDARD: Format "EC:<Default_Parity_Standard_Class>" (e.g. "EC:3"). This sets the number of parity drives for MinIO server in Standard mode. Objects are stored in Standard mode, if storage class is not defined in Put request
-MINIO_STORAGE_CLASS_RRS: Format "EC:<Default_Parity_Reduced_Redundancy_Class>" (e.g. "EC:3"). This sets the number of parity drives for MinIO server in Reduced Redundancy mode. Objects are stored in Reduced Redundancy mode, if Put request specifies RRS storage class
-Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storage-class for more information`,
+		`MINIO_STORAGE_CLASS_STANDARD: Format "EC:<Default_Parity_Standard_Class>" (e.g. "EC:3"). This sets the number of parity drives for Silo in Standard mode. Objects are stored in Standard mode if no storage class is defined in the Put request.
+MINIO_STORAGE_CLASS_RRS: Format "EC:<Default_Parity_Reduced_Redundancy_Class>" (e.g. "EC:3"). This sets the number of parity drives for Silo in Reduced Redundancy mode. Objects are stored in Reduced Redundancy mode if the Put request specifies the RRS storage class.
+See https://silo.pgsty.com/operations/concepts/erasure-coding/ for more information.`,
 	)
 
 	ErrUnexpectedBackendVersion = newErrFn(
 		"Backend version seems to be too recent",
-		"Please update to the latest MinIO version",
+		"Please update to the latest Silo version",
 		"",
 	)
 
@@ -143,8 +143,8 @@ Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storag
 		"Please check the endpoint",
 		`Single-Node modes requires absolute path without hostnames:
 Examples:
-   $ minio server /data/minio/ #Single Node Single Drive
-   $ minio server /data-{1...4}/minio # Single Node Multi Drive`,
+   $ silo server /data/silo/ # Single Node Single Drive
+   $ silo server /data-{1...4}/silo # Single Node Multi Drive`,
 	)
 
 	ErrUnsupportedBackend = newErrFn(
@@ -155,8 +155,8 @@ Examples:
 
 	ErrUnableToWriteInBackend = newErrFn(
 		"Unable to write to the backend",
-		"Please ensure MinIO binary has write permissions for the backend",
-		`Verify if MinIO binary is running as the same user who has write permissions for the backend`,
+		"Please ensure the Silo binary has write permissions for the backend",
+		`Verify that the Silo binary is running as the same user who has write permissions for the backend`,
 	)
 
 	ErrPortAlreadyInUse = newErrFn(
@@ -167,8 +167,8 @@ Examples:
 
 	ErrPortAccess = newErrFn(
 		"Unable to use specified port",
-		"Please ensure MinIO binary has 'cap_net_bind_service=+ep' permissions",
-		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
+		"Please ensure the Silo binary has 'cap_net_bind_service=+ep' permissions",
+		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/silo' to provide sufficient permissions`,
 	)
 
 	ErrTLSReadError = newErrFn(
@@ -192,7 +192,7 @@ Examples:
 	ErrNoCertsAndHTTPSEndpoints = newErrFn(
 		"HTTPS specified in endpoints, but no TLS certificate is found on the local machine",
 		"Please add TLS certificate or use HTTP endpoints only",
-		"Refer to https://docs.min.io/community/minio-object-store/operations/network-encryption.html for information about how to load a TLS certificate in your server",
+		"Refer to https://silo.pgsty.com/operations/network-encryption/ for information about how to load a TLS certificate in your server",
 	)
 
 	ErrCertsAndHTTPEndpoints = newErrFn(
@@ -209,7 +209,7 @@ Examples:
 
 	ErrUnexpectedError = newErrFn(
 		"Unexpected error",
-		"Please contact MinIO at https://slack.min.io",
+		"Please report this Silo error at https://github.com/pgsty/silo/issues",
 		"",
 	)
 

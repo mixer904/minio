@@ -1,0 +1,422 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published RELEASE.* tag to package as pgsty/silo"
+        required: true
+        type: string
+      recovery:
+        description: "Run the current main workflow against an already-published tag"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: docker-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Images are built from a published release rather than from the build
+      # that produced it, so an abandoned draft can never leave :latest
+      # pointing at something nobody shipped.
+      - name: Validate published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG}"
+          VERSION_HYPHEN="${TAG#RELEASE.}"
+          PKG_VERSION="$(echo "${VERSION_HYPHEN}" | sed -E 's/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1\2\3\4\5\6.0.0/')"
+          if [ "${PKG_VERSION}" = "${VERSION_HYPHEN}" ]; then
+            echo "Invalid release tag: ${TAG}"
+            exit 1
+          fi
+
+          IS_DRAFT="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+          IS_PRERELEASE="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isPrerelease --jq .isPrerelease)"
+          PUBLISHED_AT="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json publishedAt --jq .publishedAt)"
+          LATEST_TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+
+          if [ "${IS_DRAFT}" != false ] || [ "${IS_PRERELEASE}" != false ] || [ -z "${PUBLISHED_AT}" ]; then
+            echo "${TAG} must be a published, non-prerelease GitHub Release"
+            exit 1
+          fi
+          # This workflow moves :latest, so it must not run for an older tag.
+          if [ "${TAG}" != "${LATEST_TAG}" ]; then
+            echo "Refusing to replace Docker latest with non-latest release ${TAG} (latest is ${LATEST_TAG})"
+            exit 1
+          fi
+
+          {
+            echo "RELEASE_TAG=${TAG}"
+            echo "PKG_VERSION=${PKG_VERSION}"
+            echo "PUBLISHED_AT=${PUBLISHED_AT}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Validate Docker Hub credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "Missing Docker Hub credentials. Set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify workflow identity matches release source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RECOVERY: ${{ inputs.recovery }}
+        run: |
+          set -euo pipefail
+          CHECKED_OUT_REVISION="$(git rev-parse HEAD)"
+          if [ "${CHECKED_OUT_REVISION}" != "${GITHUB_SHA}" ]; then
+            if [ "${RECOVERY}" != "true" ] || [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+              echo "Checked out ${CHECKED_OUT_REVISION}, but workflow identity is ${GITHUB_SHA}. Dispatch from ${RELEASE_TAG}, or use recovery from ${DEFAULT_BRANCH}." >&2
+              exit 1
+            fi
+            echo "Recovery workflow ${GITHUB_SHA} is packaging published source ${CHECKED_OUT_REVISION}."
+          fi
+
+      - name: Prepare verified Docker contexts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets_dir="docker-release/assets"
+          mkdir -p "${assets_dir}"
+
+          amd64_archive="silo_${PKG_VERSION}_linux_amd64.tar.gz"
+          arm64_archive="silo_${PKG_VERSION}_linux_arm64.tar.gz"
+          checksums="silo_${PKG_VERSION}_checksums.txt"
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --dir "${assets_dir}" \
+            --pattern "${amd64_archive}" \
+            --pattern "${arm64_archive}" \
+            --pattern "${checksums}"
+
+          # The binaries going into the images are the published ones, checked
+          # against the published checksums, not a rebuild that merely ought to
+          # match them. awk matches the manifest filename column exactly: a
+          # substring grep would also pull in the archive's .sbom.json line,
+          # whose file is deliberately not downloaded in this lane.
+          cd "${assets_dir}"
+          awk -v name="${amd64_archive}" '$2 == name' "${checksums}" | sha256sum --check
+          awk -v name="${arm64_archive}" '$2 == name' "${checksums}" | sha256sum --check
+
+          # The checksum manifest and both archives must have provenance from
+          # this repository's release workflow at the exact checked-out tag.
+          for artifact in "${checksums}" "${amd64_archive}" "${arm64_archive}"; do
+            gh attestation verify "${artifact}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-digest "$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+              --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
+          done
+          cd "${GITHUB_WORKSPACE}"
+
+          # Dockerfile.goreleaser expects the binary at the context root and
+          # the entrypoint scripts under dockerscripts/, which is the layout
+          # GoReleaser used to assemble via extra_files.
+          for arch in amd64 arm64; do
+            context="docker-release/${arch}"
+            archive="${assets_dir}/silo_${PKG_VERSION}_linux_${arch}.tar.gz"
+            mkdir -p "${context}/dockerscripts"
+            tar -xzf "${archive}" -C "${context}" silo
+            cp Dockerfile.goreleaser Dockerfile.distroless LICENSE NOTICE CREDITS "${context}/"
+            cp dockerscripts/docker-entrypoint.sh dockerscripts/build-static-curl.sh \
+              "${context}/dockerscripts/"
+          done
+
+          # The classic image bundles mcli. Resolve its two archive digests
+          # from the immutable published release instead of trusting defaults
+          # copied into an older Server tag. This also gives a recovery run a
+          # narrow override when a tag selected the right mcli release but
+          # accidentally retained stale archive pins.
+          MC_REPO="$(awk -F= '/^ARG MC_REPO=/{print $2; exit}' Dockerfile.goreleaser)"
+          MC_VERSION="$(awk -F= '/^ARG MC_VERSION=/{print $2; exit}' Dockerfile.goreleaser)"
+          test -n "${MC_REPO}"
+          test -n "${MC_VERSION}"
+          MC_VERSION_HYPHEN="${MC_VERSION#RELEASE.}"
+          MC_PKG_VERSION="$(echo "${MC_VERSION_HYPHEN}" | sed -E 's/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1\2\3\4\5\6.0.0/')"
+          if [ "${MC_PKG_VERSION}" = "${MC_VERSION_HYPHEN}" ]; then
+            echo "Invalid bundled mcli tag: ${MC_VERSION}" >&2
+            exit 1
+          fi
+          if [ "$(gh release view "${MC_VERSION}" --repo "${MC_REPO}" --json isDraft --jq .isDraft)" != false ] || \
+             [ "$(gh release view "${MC_VERSION}" --repo "${MC_REPO}" --json isPrerelease --jq .isPrerelease)" != false ] || \
+             [ "$(gh release view "${MC_VERSION}" --repo "${MC_REPO}" --json isImmutable --jq .isImmutable)" != true ]; then
+            echo "Bundled mcli ${MC_REPO}@${MC_VERSION} must be a published immutable release" >&2
+            exit 1
+          fi
+
+          mc_checksums="mcli_${MC_PKG_VERSION}_checksums.txt"
+          gh release download "${MC_VERSION}" --repo "${MC_REPO}" \
+            --dir "${assets_dir}" --pattern "${mc_checksums}"
+          gh attestation verify "${assets_dir}/${mc_checksums}" \
+            --repo "${MC_REPO}" \
+            --signer-workflow "${MC_REPO}/.github/workflows/release.yml" \
+            --source-ref "refs/tags/${MC_VERSION}" >/dev/null
+
+          MC_AMD64_SHA256="$(awk -v name="mcli_${MC_PKG_VERSION}_linux_amd64.tar.gz" '$2 == name {print $1}' "${assets_dir}/${mc_checksums}")"
+          MC_ARM64_SHA256="$(awk -v name="mcli_${MC_PKG_VERSION}_linux_arm64.tar.gz" '$2 == name {print $1}' "${assets_dir}/${mc_checksums}")"
+          [[ "${MC_AMD64_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "${MC_ARM64_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+
+          {
+            echo "MC_AMD64_SHA256=${MC_AMD64_SHA256}"
+            echo "MC_ARM64_SHA256=${MC_ARM64_SHA256}"
+          } >> "${GITHUB_ENV}"
+
+          echo "RELEASE_REVISION=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+
+      - name: Build and push amd64 image
+        id: build-amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-release/amd64
+          file: docker-release/amd64/Dockerfile.goreleaser
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            MC_AMD64_SHA256=${{ env.MC_AMD64_SHA256 }}
+            MC_ARM64_SHA256=${{ env.MC_ARM64_SHA256 }}
+          tags: |
+            pgsty/silo:${{ env.RELEASE_TAG }}-amd64
+            pgsty/silo:latest-amd64
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.PUBLISHED_AT }}
+            org.opencontainers.image.revision=${{ env.RELEASE_REVISION }}
+
+      - name: Build and push arm64 image
+        id: build-arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-release/arm64
+          file: docker-release/arm64/Dockerfile.goreleaser
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            MC_AMD64_SHA256=${{ env.MC_AMD64_SHA256 }}
+            MC_ARM64_SHA256=${{ env.MC_ARM64_SHA256 }}
+          tags: |
+            pgsty/silo:${{ env.RELEASE_TAG }}-arm64
+            pgsty/silo:latest-arm64
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.PUBLISHED_AT }}
+            org.opencontainers.image.revision=${{ env.RELEASE_REVISION }}
+
+      # The distroless variant is a pilot published alongside the classic
+      # image; it ships the silo binary alone and relies on the native
+      # `silo healthcheck` subcommand for container health.
+      # Design: https://silo.pgsty.com/compatibility/feature/healthcheck/
+      - name: Build and push amd64 distroless image
+        id: build-amd64-distroless
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-release/amd64
+          file: docker-release/amd64/Dockerfile.distroless
+          platforms: linux/amd64
+          push: true
+          tags: |
+            pgsty/silo:${{ env.RELEASE_TAG }}-distroless-amd64
+            pgsty/silo:distroless-amd64
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.PUBLISHED_AT }}
+            org.opencontainers.image.revision=${{ env.RELEASE_REVISION }}
+
+      - name: Build and push arm64 distroless image
+        id: build-arm64-distroless
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-release/arm64
+          file: docker-release/arm64/Dockerfile.distroless
+          platforms: linux/arm64
+          push: true
+          tags: |
+            pgsty/silo:${{ env.RELEASE_TAG }}-distroless-arm64
+            pgsty/silo:distroless-arm64
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.PUBLISHED_AT }}
+            org.opencontainers.image.revision=${{ env.RELEASE_REVISION }}
+
+      - name: Verify HEALTHCHECK survived the distroless push
+        run: |
+          set -euo pipefail
+          # HEALTHCHECK is a Docker extension absent from the OCI image
+          # spec, and a publish path can drop it silently. Check the pushed
+          # architecture image now, before the versioned and rolling
+          # multi-arch manifests are created, so a broken health config
+          # stops their promotion. (The architecture-suffixed tags above
+          # are already public by this point - full staging-then-promote
+          # would be a workflow-wide redesign shared with the classic
+          # image lanes.)
+          docker pull "pgsty/silo:${RELEASE_TAG}-distroless-amd64" >/dev/null
+          test "$(docker inspect -f '{{json .Config.Healthcheck.Test}}' "pgsty/silo:${RELEASE_TAG}-distroless-amd64")" \
+            = '["CMD","/usr/bin/silo","healthcheck","ready"]'
+
+      - name: Publish multi-architecture manifests
+        run: |
+          set -euo pipefail
+          mkdir -p docker-release/metadata
+          docker buildx imagetools create \
+            --tag "pgsty/silo:${RELEASE_TAG}" \
+            --metadata-file docker-release/metadata/release.json \
+            "pgsty/silo:${RELEASE_TAG}-amd64" \
+            "pgsty/silo:${RELEASE_TAG}-arm64"
+          docker buildx imagetools create \
+            --tag "pgsty/silo:latest" \
+            --metadata-file docker-release/metadata/latest.json \
+            "pgsty/silo:latest-amd64" \
+            "pgsty/silo:latest-arm64"
+          docker buildx imagetools inspect "pgsty/silo:${RELEASE_TAG}"
+          docker buildx imagetools inspect "pgsty/silo:latest"
+
+          docker buildx imagetools create \
+            --tag "pgsty/silo:${RELEASE_TAG}-distroless" \
+            --metadata-file docker-release/metadata/release-distroless.json \
+            "pgsty/silo:${RELEASE_TAG}-distroless-amd64" \
+            "pgsty/silo:${RELEASE_TAG}-distroless-arm64"
+          docker buildx imagetools create \
+            --tag "pgsty/silo:distroless" \
+            --metadata-file docker-release/metadata/distroless.json \
+            "pgsty/silo:distroless-amd64" \
+            "pgsty/silo:distroless-arm64"
+          docker buildx imagetools inspect "pgsty/silo:${RELEASE_TAG}-distroless"
+          docker buildx imagetools inspect "pgsty/silo:distroless"
+
+          RELEASE_DIGEST="$(jq -r '."containerimage.descriptor".digest' docker-release/metadata/release.json)"
+          LATEST_DIGEST="$(jq -r '."containerimage.descriptor".digest' docker-release/metadata/latest.json)"
+          if ! [[ "${RELEASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid release manifest digest: ${RELEASE_DIGEST}" >&2
+            exit 1
+          fi
+          if [ "${RELEASE_DIGEST}" != "${LATEST_DIGEST}" ]; then
+            echo "Release and latest tags resolved to different manifests" >&2
+            exit 1
+          fi
+          echo "SILO_IMAGE_DIGEST=${RELEASE_DIGEST}" >> "${GITHUB_ENV}"
+
+          DISTROLESS_RELEASE_DIGEST="$(jq -r '."containerimage.descriptor".digest' docker-release/metadata/release-distroless.json)"
+          DISTROLESS_ROLLING_DIGEST="$(jq -r '."containerimage.descriptor".digest' docker-release/metadata/distroless.json)"
+          if ! [[ "${DISTROLESS_RELEASE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid distroless manifest digest: ${DISTROLESS_RELEASE_DIGEST}" >&2
+            exit 1
+          fi
+          if [ "${DISTROLESS_RELEASE_DIGEST}" != "${DISTROLESS_ROLLING_DIGEST}" ]; then
+            echo "Distroless release and rolling tags resolved to different manifests" >&2
+            exit 1
+          fi
+          echo "SILO_DISTROLESS_DIGEST=${DISTROLESS_RELEASE_DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Generate architecture image SBOMs
+        env:
+          AMD64_DIGEST: ${{ steps.build-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ steps.build-arm64.outputs.digest }}
+          DISTROLESS_AMD64_DIGEST: ${{ steps.build-amd64-distroless.outputs.digest }}
+          DISTROLESS_ARM64_DIGEST: ${{ steps.build-arm64-distroless.outputs.digest }}
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          mkdir -p docker-release/sbom
+          # Each per-architecture digest names an OCI index (image plus the
+          # provenance attestation buildx attaches), and Syft's platform
+          # default on an index follows the amd64 runner - an arm64-only
+          # index would fail outright. Select the platform explicitly.
+          syft "registry:index.docker.io/pgsty/silo@${AMD64_DIGEST}" \
+            --platform linux/amd64 \
+            --output "spdx-json=docker-release/sbom/linux-amd64.spdx.json"
+          syft "registry:index.docker.io/pgsty/silo@${ARM64_DIGEST}" \
+            --platform linux/arm64 \
+            --output "spdx-json=docker-release/sbom/linux-arm64.spdx.json"
+          syft "registry:index.docker.io/pgsty/silo@${DISTROLESS_AMD64_DIGEST}" \
+            --platform linux/amd64 \
+            --output "spdx-json=docker-release/sbom/linux-amd64-distroless.spdx.json"
+          syft "registry:index.docker.io/pgsty/silo@${DISTROLESS_ARM64_DIGEST}" \
+            --platform linux/arm64 \
+            --output "spdx-json=docker-release/sbom/linux-arm64-distroless.spdx.json"
+
+      - name: Attest amd64 image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ steps.build-amd64.outputs.digest }}
+          sbom-path: docker-release/sbom/linux-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest arm64 image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ steps.build-arm64.outputs.digest }}
+          sbom-path: docker-release/sbom/linux-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Attest amd64 distroless image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ steps.build-amd64-distroless.outputs.digest }}
+          sbom-path: docker-release/sbom/linux-amd64-distroless.spdx.json
+          push-to-registry: true
+
+      - name: Attest arm64 distroless image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ steps.build-arm64-distroless.outputs.digest }}
+          sbom-path: docker-release/sbom/linux-arm64-distroless.spdx.json
+          push-to-registry: true
+
+      - name: Attest multi-architecture image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ env.SILO_IMAGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest multi-architecture distroless image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: index.docker.io/pgsty/silo
+          subject-digest: ${{ env.SILO_DISTROLESS_DIGEST }}
+          push-to-registry: true

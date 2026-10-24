@@ -49,7 +49,7 @@ const probeObject = "probeobject"
 // checkWarmBackend checks if tier config credentials have sufficient privileges
 // to perform all operations defined in the WarmBackend interface.
 func checkWarmBackend(ctx context.Context, w WarmBackend) error {
-	remoteVersionID, err := w.Put(ctx, probeObject, strings.NewReader("MinIO"), 5)
+	remoteVersionID, err := w.Put(ctx, probeObject, strings.NewReader("Silo!"), 5)
 	if err != nil {
 		if _, ok := err.(BackendDown); ok {
 			return err

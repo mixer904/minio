@@ -1,8 +1,8 @@
-# MinIO STS Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+# Silo STS Quickstart Guide
 
-The MinIO Security Token Service (STS) is an endpoint service that enables clients to request temporary credentials for MinIO resources. Temporary credentials work almost identically to default admin credentials, with some differences:
+The Silo Security Token Service (STS) is an endpoint service that enables clients to request temporary credentials for Silo resources. Temporary credentials work almost identically to default admin credentials, with some differences:
 
-- Temporary credentials are short-term, as the name implies. They can be configured to last for anywhere from a few minutes to several hours. After the credentials expire, MinIO no longer recognizes them or allows any kind of access from API requests made with them.
+- Temporary credentials are short-term, as the name implies. They can be configured to last for anywhere from a few minutes to several hours. After the credentials expire, Silo no longer recognizes them or allows any kind of access from API requests made with them.
 - Temporary credentials do not need to be stored with the application but are generated dynamically and provided to the application when requested. When (or even before) the temporary credentials expire, the application can request new credentials.
 
 Following are advantages for using temporary credentials:
@@ -15,17 +15,17 @@ Following are advantages for using temporary credentials:
 
 | AuthN                                                                                  | Description                                                                                                                                   |
 | :----------------------                                                                | ------------------------------------------                                                                                                    |
-| [**WebIdentity**](https://github.com/pgsty/minio/blob/master/docs/sts/web-identity.md) | Let users request temporary credentials using any OpenID(OIDC) compatible web identity providers such as KeyCloak, Dex, Facebook, Google etc. |
-| [**AD/LDAP**](https://github.com/pgsty/minio/blob/master/docs/sts/ldap.md)             | Let AD/LDAP users request temporary credentials using AD/LDAP username and password.                                                          |
-| [**AssumeRole**](https://github.com/pgsty/minio/blob/master/docs/sts/assume-role.md)   | Let MinIO users request temporary credentials using user access and secret keys.                                                              |
+| [**WebIdentity**](https://github.com/pgsty/silo/blob/main/docs/sts/web-identity.md) | Let users request temporary credentials using any OpenID(OIDC) compatible web identity providers such as KeyCloak, Dex, Facebook, Google etc. |
+| [**AD/LDAP**](https://github.com/pgsty/silo/blob/main/docs/sts/ldap.md)             | Let AD/LDAP users request temporary credentials using AD/LDAP username and password.                                                          |
+| [**AssumeRole**](https://github.com/pgsty/silo/blob/main/docs/sts/assume-role.md)   | Let Silo users request temporary credentials using user access and secret keys.                                                              |
 
 ### Understanding JWT Claims
 
 > NOTE: JWT claims are only meant for WebIdentity and ClientGrants.
 > AssumeRole or LDAP users can skip the entire portion and directly visit one of the links below.
 >
-> - [**AssumeRole**](https://github.com/pgsty/minio/blob/master/docs/sts/assume-role.md)
-> - [**AD/LDAP**](https://github.com/pgsty/minio/blob/master/docs/sts/ldap.md)
+> - [**AssumeRole**](https://github.com/pgsty/silo/blob/main/docs/sts/assume-role.md)
+> - [**AD/LDAP**](https://github.com/pgsty/silo/blob/main/docs/sts/ldap.md)
 
 The id_token received is a signed JSON Web Token (JWT). Use a JWT decoder to decode the id_token to access the payload of the token that includes following JWT claims, `policy` claim is mandatory and should be present as part of your JWT claim. Without this claim the generated credentials will not have access to any resources on the server, using these credentials application would receive 'Access Denied' errors.
 
@@ -37,40 +37,40 @@ The id_token received is a signed JSON Web Token (JWT). Use a JWT decoder to dec
 
 In this document we will explain in detail on how to configure all the prerequisites.
 
-> NOTE: If you are interested in AssumeRole API only, skip to [here](https://github.com/pgsty/minio/blob/master/docs/sts/assume-role.md)
+> NOTE: If you are interested in AssumeRole API only, skip to [here](https://github.com/pgsty/silo/blob/main/docs/sts/assume-role.md)
 
 ### Prerequisites
 
-- [Configuring keycloak](https://github.com/pgsty/minio/blob/master/docs/sts/keycloak.md) or [Configuring Casdoor](https://github.com/pgsty/minio/blob/master/docs/sts/casdoor.md)
-- [Configuring etcd](https://github.com/pgsty/minio/blob/master/docs/sts/etcd.md)
+- [Configuring keycloak](https://github.com/pgsty/silo/blob/main/docs/sts/keycloak.md) or [Configuring Casdoor](https://github.com/pgsty/silo/blob/main/docs/sts/casdoor.md)
+- [Configuring etcd](https://github.com/pgsty/silo/blob/main/docs/sts/etcd.md)
 
-### Setup MinIO with Identity Provider
+### Setup Silo with Identity Provider
 
-Make sure we have followed the previous step and configured each software independently, once done we can now proceed to use MinIO STS API and MinIO server to use these credentials to perform object API operations.
+Make sure we have followed the previous step and configured each software independently, once done we can now proceed to use Silo STS API and Silo server to use these credentials to perform object API operations.
 
 #### KeyCloak
 
 ```
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
+export MINIO_ROOT_PASSWORD=silo123
 export MINIO_IDENTITY_OPENID_CONFIG_URL=http://localhost:8080/auth/realms/demo/.well-known/openid-configuration
 export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
-minio server /mnt/data
+silo server /mnt/data
 ```
 
 #### Casdoor
 
 ```
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
+export MINIO_ROOT_PASSWORD=silo123
 export MINIO_IDENTITY_OPENID_CONFIG_URL=http://CASDOOR_ENDPOINT/.well-known/openid-configuration
 export MINIO_IDENTITY_OPENID_CLIENT_ID="843351d4-1080-11ea-aa20-271ecba3924a"
-minio server /mnt/data
+silo server /mnt/data
 ```
 
 ### Using WebIdentiy API
 
-On another terminal run `web-identity.go` a sample client application which obtains JWT id_tokens from an identity provider, in our case its Keycloak. Uses the returned id_token response to get new temporary credentials from the MinIO server using the STS API call `AssumeRoleWithWebIdentity`.
+On another terminal run `web-identity.go` a sample client application which obtains JWT id_tokens from an identity provider, in our case its Keycloak. Uses the returned id_token response to get new temporary credentials from the Silo server using the STS API call `AssumeRoleWithWebIdentity`.
 
 ```
 $ go run docs/sts/web-identity.go -cid account -csec 072e7f00-4289-469c-9ab2-bbe843c7f5a8  -config-ep "http://localhost:8080/auth/realms/demo/.well-known/openid-configuration" -port 8888
@@ -95,16 +95,16 @@ This will open the login page of keycloak, upon successful login, STS credential
 
 > NOTE: You can use the `-cscopes` parameter to restrict the requested scopes, for example to `"openid,policy_role_attribute"`, being `policy_role_attribute` a client_scope / client_mapper that maps a role attribute called policy to a `policy` claim returned by Keycloak.
 
-These credentials can now be used to perform MinIO API operations.
+These credentials can now be used to perform Silo API operations.
 
-### Using MinIO Console
+### Using Silo Console
 
-- Open MinIO URL on the browser, lets say <http://localhost:9000/>
+- Open Silo URL on the browser, lets say <http://localhost:9000/>
 - Click on `Login with SSO`
-- User will be redirected to the Keycloak user login page, upon successful login the user will be redirected to MinIO page and logged in automatically,
+- User will be redirected to the Keycloak user login page, upon successful login the user will be redirected to Silo page and logged in automatically,
   the user should see now the buckets and objects they have access to.
 
 ## Explore Further
 
-- [MinIO Admin Complete Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin.html)
-- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [Silo Admin Complete Guide](https://silo.pgsty.com/reference/minio-mc-admin/)
+- [The Silo documentation website](https://silo.pgsty.com/docs/)

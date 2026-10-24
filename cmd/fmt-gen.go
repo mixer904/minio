@@ -34,7 +34,7 @@ var fmtGenFlags = []cli.Flag{
 	},
 	cli.StringFlag{
 		Name:  "deployment-id",
-		Usage: "deployment-id of the MinIO cluster for which format.json is needed",
+		Usage: "deployment-id of the Silo cluster for which format.json is needed",
 	},
 	cli.StringFlag{
 		Name:   "address",
@@ -69,7 +69,7 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 EXAMPLES:
-  1. Generate format.json.zip containing format.json files for all drives in a distributed MinIO server pool of 32 nodes with 32 drives each.
+  1. Generate format.json.zip containing format.json files for all drives in a distributed Silo server pool of 32 nodes with 32 drives each.
      {{.Prompt}} {{.HelpName}} http://node{1...32}.example.com/mnt/export{1...32}
 
 `,

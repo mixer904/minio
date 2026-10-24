@@ -55,9 +55,9 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
-	"github.com/minio/pkg/v3/certs"
-	"github.com/minio/pkg/v3/env"
-	xnet "github.com/minio/pkg/v3/net"
+	"github.com/pgsty/silo-pkg/v3/certs"
+	"github.com/pgsty/silo-pkg/v3/env"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // minio configuration related constants.
@@ -176,13 +176,13 @@ var (
 	// Global user opts context
 	globalServerCtxt serverCtxt
 
-	// Indicates if the running minio server is distributed setup.
+	// Indicates whether the running Silo server is a distributed setup.
 	globalIsDistErasure = false
 
-	// Indicates if the running minio server is an erasure-code backend.
+	// Indicates whether the running Silo server is an erasure-code backend.
 	globalIsErasure = false
 
-	// Indicates if the running minio server is in single drive XL mode.
+	// Indicates whether the running Silo server is in single-drive XL mode.
 	globalIsErasureSD = false
 
 	// Indicates if server code should go through testing path.
@@ -201,8 +201,8 @@ var (
 	// globalBrowserConfig Browser user configurable settings
 	globalBrowserConfig browser.Config
 
-	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
-	globalInplaceUpdateDisabled = false
+	// Silo permanently disables inherited in-place updates.
+	globalInplaceUpdateDisabled = true
 
 	// Captures site name and region
 	globalSite config.Site
@@ -319,6 +319,8 @@ var (
 
 	globalOperationTimeout       = newDynamicTimeout(10*time.Minute, 5*time.Minute) // default timeout for general ops
 	globalDeleteOperationTimeout = newDynamicTimeout(5*time.Minute, 1*time.Minute)  // default time for delete ops
+	// Listing recovery has its own failure history and a five-second caller budget.
+	globalListingOperationTimeout = newDynamicTimeout(5*time.Second, 5*time.Second)
 
 	globalBucketObjectLockSys *BucketObjectLockSys
 	globalBucketQuotaSys      *BucketQuotaSys
@@ -432,10 +434,6 @@ var (
 
 	// MinIO client
 	globalMinioClient *minio.Client
-
-	// Public key for subnet confidential information
-	subnetAdminPublicKey    = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEAyC+ol5v0FP+QcsR6d1KypR/063FInmNEFsFzbEwlHQyEQN3O7kNI\nwVDN1vqp1wDmJYmv4VZGRGzfFw1q+QV7K1TnysrEjrqpVxfxzDQCoUadAp8IxLLc\ns2fjyDNxnZjoC6fTID9C0khKnEa5fPZZc3Ihci9SiCGkPmyUyCGVSxWXIKqL2Lrj\nyDc0pGeEhWeEPqw6q8X2jvTC246tlzqpDeNsPbcv2KblXRcKniQNbBrizT37CKHQ\nM6hc9kugrZbFuo8U5/4RQvZPJnx/DVjLDyoKo2uzuVQs4s+iBrA5sSSLp8rPED/3\n6DgWw3e244Dxtrg972dIT1IOqgn7KUJzVQIDAQAB\n-----END PUBLIC KEY-----")
-	subnetAdminPublicKeyDev = []byte("-----BEGIN PUBLIC KEY-----\nMIIBCgKCAQEArhQYXQd6zI4uagtVfthAPOt6i4AYHnEWCoNeAovM4MNl42I9uQFh\n3VHkbWj9Gpx9ghf6PgRgK+8FcFvy+StmGcXpDCiFywXX24uNhcZjscX1C4Esk0BW\nidfI2eXYkOlymD4lcK70SVgJvC693Qa7Z3FE1KU8Nfv2bkxEE4bzOkojX9t6a3+J\nR8X6Z2U8EMlH1qxJPgiPogELhWP0qf2Lq7GwSAflo1Tj/ytxvD12WrnE0Rrj/8yP\nSnp7TbYm91KocKMExlmvx3l2XPLxeU8nf9U0U+KOmorejD3MDMEPF+tlk9LB3JWP\nZqYYe38rfALVTn4RVJriUcNOoEpEyC0WEwIDAQAB\n-----END PUBLIC KEY-----")
 
 	// dynamic sleeper to avoid thundering herd for trash folder expunge routine
 	deleteCleanupSleeper = newDynamicSleeper(5, 25*time.Millisecond, false)

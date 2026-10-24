@@ -1281,3 +1281,24 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 		}
 	}
 }
+
+func TestJoinErrs(t *testing.T) {
+	errA := errors.New("disk not found")
+	errB := errors.New("file corrupt")
+	testCases := []struct {
+		errs     []error
+		expected string
+	}{
+		{nil, ""},
+		{[]error{}, ""},
+		{[]error{nil}, "<nil>"},
+		{[]error{errA}, "disk not found"},
+		{[]error{nil, errA}, "<nil>,disk not found"},
+		{[]error{errA, nil, errB, nil}, "disk not found,<nil>,file corrupt,<nil>"},
+	}
+	for i, testCase := range testCases {
+		if got := joinErrs(testCase.errs); got != testCase.expected {
+			t.Errorf("Test %d: expected %q, got %q", i+1, testCase.expected, got)
+		}
+	}
+}

@@ -25,14 +25,14 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/pkg/v3/wildcard"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
 )
 
 var (
 	// StubCreatedAt is a constant timestamp for testing
 	StubCreatedAt = time.Date(2024, time.January, 1, 15, 0, 0, 0, time.UTC)
 	// StubCreatedBy is a constant created identity for testing
-	StubCreatedBy = "MinIO"
+	StubCreatedBy = "Silo"
 )
 
 // NewStub returns a stub of KMS for testing

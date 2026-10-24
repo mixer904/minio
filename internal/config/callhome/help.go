@@ -29,7 +29,7 @@ var (
 		config.HelpKV{
 			Key:         Enable,
 			Type:        "on|off",
-			Description: "set to enable callhome" + defaultHelpPostfix(Enable),
+			Description: "legacy callhome setting; retained for compatibility but unsupported by Silo" + defaultHelpPostfix(Enable),
 			Optional:    true,
 		},
 		config.HelpKV{

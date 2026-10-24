@@ -2,7 +2,7 @@
 
 echo "script failed" >resiliency-verify-failure.log # assume initial state
 
-ALIAS_NAME=myminio
+ALIAS_NAME=mysilo
 BUCKET="test-bucket"
 DEST_DIR="/tmp/dest"
 

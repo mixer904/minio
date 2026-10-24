@@ -48,7 +48,7 @@ import (
 	levent "github.com/minio/minio/internal/config/lambda/event"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
-	"github.com/minio/pkg/v3/policy"
+	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 // APIError structure
@@ -450,6 +450,9 @@ const (
 	ErrAdminNoSecretKey
 
 	ErrIAMNotInitialized
+	ErrMultipartListingLegacy // Reserved: legacy uploads no longer block listing.
+	ErrMultipartListingIdentity
+	ErrSlowDown
 
 	apiErrCodeEnd // This is used only for the testing code
 )
@@ -547,7 +550,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrBadDigest: {
 		Code:           "BadDigest",
-		Description:    "The Content-Md5 you specified did not match what we received.",
+		Description:    "The Content-MD5 you specified did not match what we received.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrEntityTooSmall: {
@@ -1154,7 +1157,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrUnsupportedNotification: {
 		Code:           "UnsupportedNotification",
-		Description:    "MinIO server does not support Topic or Cloud Function based notifications.",
+		Description:    "Silo does not support Topic or Cloud Function based notifications.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidCopyPartRange: {
@@ -1334,6 +1337,21 @@ var errorCodes = errorCodeMap{
 	ErrIAMNotInitialized: {
 		Code:           "XMinioIAMNotInitialized",
 		Description:    "IAM sub-system not initialized yet, please try again.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrMultipartListingLegacy: {
+		Code:           "MultipartListingNotReady",
+		Description:    "Legacy multipart uploads prevent a complete listing. Upgrade all writers, drain old uploads and run the multipart preflight check.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrMultipartListingIdentity: {
+		Code:           "MultipartListingMetadataInvalid",
+		Description:    "Multipart upload metadata is inconsistent. Run the multipart preflight check to locate the affected storage set.",
+		HTTPStatusCode: http.StatusServiceUnavailable,
+	},
+	ErrSlowDown: {
+		Code:           "SlowDown",
+		Description:    "Please reduce your request rate",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
 	ErrBucketMetadataNotInitialized: {
@@ -1523,10 +1541,14 @@ var errorCodes = errorCodeMap{
 		Description:    "Your Host header is malformed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	// The stored object cannot be served: a server-side data condition, not a
+	// successful partial read. Upstream maps it to http.StatusPartialContent
+	// (since ca6b4773e, 2017), which lets SDKs accept the XML error document
+	// as object content; SILO deliberately diverges and returns 500.
 	ErrObjectTampered: {
 		Code:           "XMinioObjectTampered",
 		Description:    errObjectTampered.Error(),
-		HTTPStatusCode: http.StatusPartialContent,
+		HTTPStatusCode: http.StatusInternalServerError,
 	},
 
 	ErrSiteReplicationInvalidRequest: {
@@ -2169,6 +2191,12 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	err = unwrapAll(err)
 
 	switch err {
+	case errMultipartListingIdentity:
+		apiErr = ErrMultipartListingIdentity
+	case errCompleteMultipartChecksumMismatch, errCompleteMultipartChecksumTypeMismatch:
+		apiErr = ErrBadDigest
+	case errMissingPartChecksum:
+		apiErr = ErrInvalidRequest
 	case errInvalidArgument:
 		apiErr = ErrAdminInvalidArgument
 	case errNoSuchPolicy:
@@ -2295,6 +2323,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	}
 
 	switch err.(type) {
+	case SlowDown:
+		apiErr = ErrSlowDown
 	case StorageFull:
 		apiErr = ErrStorageFull
 	case hash.BadDigest:
@@ -2465,6 +2495,22 @@ func toAPIError(ctx context.Context, err error) APIError {
 	}
 
 	apiErr := errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
+	switch {
+	case errors.Is(err, errCompleteMultipartChecksumMismatch):
+		apiErr.Description = strings.TrimPrefix(err.Error(), errCompleteMultipartChecksumMismatch.Error()+": ")
+	case errors.Is(err, errCompleteMultipartChecksumTypeMismatch):
+		apiErr.Description = strings.TrimPrefix(err.Error(), errCompleteMultipartChecksumTypeMismatch.Error()+": ")
+	case errors.Is(err, errMissingPartChecksum):
+		apiErr.Description = strings.TrimPrefix(err.Error(), errMissingPartChecksum.Error()+": ")
+	}
+	// PutObject/UploadPart checksum mismatches name the algorithm in the
+	// message, matching S3 (e.g. "The CRC32 you specified did not match the
+	// calculated checksum."). Falls through to the generic table description
+	// when the algorithm is unknown.
+	var checksumMismatch hash.ChecksumMismatch
+	if errors.As(err, &checksumMismatch) && checksumMismatch.Algorithm != "" {
+		apiErr.Description = fmt.Sprintf("The %s you specified did not match the calculated checksum.", checksumMismatch.Algorithm)
+	}
 	switch apiErr.Code {
 	case "NotImplemented":
 		apiErr = APIError{

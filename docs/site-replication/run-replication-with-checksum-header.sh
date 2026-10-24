@@ -4,18 +4,18 @@
 exit_1() {
 	cleanup
 
-	echo "minio1 ============"
-	cat /tmp/minio1_1.log
-	echo "minio2 ============"
-	cat /tmp/minio2_1.log
+	echo "silo1 ============"
+	cat /tmp/silo1_1.log
+	echo "silo2 ============"
+	cat /tmp/silo2_1.log
 
 	exit 1
 }
 
 cleanup() {
-	echo -n "Cleaning up instances of MinIO ..."
-	pkill -9 minio || sudo pkill -9 minio
-	rm -rf /tmp/minio{1,2}
+	echo -n "Cleaning up instances of Silo ..."
+	pkill -9 silo || sudo pkill -9 silo
+	rm -rf /tmp/silo{1,2}
 	echo "done"
 }
 
@@ -33,7 +33,7 @@ cleanup
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="minio123"
+export MINIO_ROOT_PASSWORD="silo12345"
 
 # Download AWS CLI
 echo -n "Download and install AWS CLI"
@@ -51,11 +51,11 @@ cat >~/.aws/credentials <<EOF
 [enterprise]
 region = us-east-1
 aws_access_key_id = minio
-aws_secret_access_key = minio123
+aws_secret_access_key = silo12345
 EOF
 
-# Create certificates for TLS enabled MinIO
-echo -n "Setup certs for MinIO instances ..."
+# Create certificates for TLS enabled Silo
+echo -n "Setup certs for Silo instances ..."
 wget -O certgen https://github.com/minio/certgen/releases/latest/download/certgen-linux-amd64 && chmod +x certgen
 ./certgen --host localhost
 mkdir -p /tmp/certs
@@ -63,24 +63,23 @@ mv public.crt /tmp/certs || sudo mv public.crt /tmp/certs
 mv private.key /tmp/certs || sudo mv private.key /tmp/certs
 echo "done"
 
-# Start MinIO instances
-echo -n "Starting MinIO instances ..."
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123 minio server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/minio1/{1...4}/disk{1...4} /tmp/minio1/{5...8}/disk{1...4} >/tmp/minio1_1.log 2>&1 &
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123 minio server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/minio2/{1...4}/disk{1...4} /tmp/minio2/{5...8}/disk{1...4} >/tmp/minio2_1.log 2>&1 &
+# Start Silo instances
+echo -n "Starting Silo instances ..."
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/silo1/{1...4}/disk{1...4} /tmp/silo1/{5...8}/disk{1...4} >/tmp/silo1_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/silo2/{1...4}/disk{1...4} /tmp/silo2/{5...8}/disk{1...4} >/tmp/silo2_1.log 2>&1 &
 echo "done"
 
 if [ ! -f ./mc ]; then
-	echo -n "Downloading MinIO client ..."
-	wget -O mc https://dl.min.io/client/mc/release/linux-amd64/mc &&
-		chmod +x mc
+	echo -n "Downloading Silo client ..."
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 	echo "done"
 fi
 
-export MC_HOST_minio1=https://minio:minio123@localhost:9001
-export MC_HOST_minio2=https://minio:minio123@localhost:9002
+export MC_HOST_silo1=https://minio:silo12345@localhost:9001
+export MC_HOST_silo2=https://minio:silo12345@localhost:9002
 
-./mc ready minio1 --insecure
-./mc ready minio2 --insecure
+./mc ready silo1 --insecure
+./mc ready silo2 --insecure
 
 # Prepare data for tests
 echo -n "Preparing test data ..."
@@ -91,16 +90,16 @@ shred -s 500M /tmp/data/mpartobj
 echo "done"
 
 # Add replication site
-./mc admin replicate add minio1 minio2 --insecure
+./mc admin replicate add silo1 silo2 --insecure
 # sleep for replication to complete
 sleep 30
 
 # Create bucket in source cluster
-echo "Create bucket in source MinIO instance"
-./mc mb minio1/test-bucket --insecure
+echo "Create bucket in source Silo instance"
+./mc mb silo1/test-bucket --insecure
 
 # Load objects to source site with checksum header
-echo "Loading objects to source MinIO instance"
+echo "Loading objects to source Silo instance"
 OBJ_CHKSUM=$(openssl dgst -sha256 -binary </tmp/data/obj | base64)
 aws s3api --endpoint-url=https://localhost:9001 put-object --checksum-algorithm SHA256 --checksum-sha256 "${OBJ_CHKSUM}" --bucket test-bucket --key obj --body /tmp/data/obj --no-verify-ssl --profile enterprise
 
@@ -128,20 +127,20 @@ sleep 120
 
 # List the objects from replicated site
 echo "Objects from replicated site"
-./mc ls minio2/test-bucket --insecure
-count1=$(./mc ls minio2/test-bucket/obj --insecure | wc -l)
+./mc ls silo2/test-bucket --insecure
+count1=$(./mc ls silo2/test-bucket/obj --insecure | wc -l)
 if [ "${count1}" -ne 1 ]; then
-	echo "BUG: object minio1/test-bucket/obj not replicated"
+	echo "BUG: object silo1/test-bucket/obj not replicated"
 	exit_1
 fi
-count2=$(./mc ls minio2/test-bucket/mpartobj --insecure | wc -l)
+count2=$(./mc ls silo2/test-bucket/mpartobj --insecure | wc -l)
 if [ "${count2}" -ne 1 ]; then
-	echo "BUG: object minio1/test-bucket/mpartobj not replicated"
+	echo "BUG: object silo1/test-bucket/mpartobj not replicated"
 	exit_1
 fi
 
 # Stat the objects from source site
-echo "Stat minio1/test-bucket/obj"
+echo "Stat silo1/test-bucket/obj"
 SRC_OUT_1=$(aws s3api --endpoint-url https://localhost:9001 head-object --bucket test-bucket --key obj --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 SRC_OUT_2=$(aws s3api --endpoint-url https://localhost:9001 head-object --bucket test-bucket --key mpartobj --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 SRC_OBJ_1_CHKSUM=$(echo "${SRC_OUT_1}" | jq '.ChecksumSHA256')
@@ -150,7 +149,7 @@ SRC_OBJ_1_ETAG=$(echo "${SRC_OUT_1}" | jq '.ETag')
 SRC_OBJ_2_ETAG=$(echo "${SRC_OUT_2}" | jq '.ETag')
 
 # Stat the objects from replicated site
-echo "Stat minio2/test-bucket/obj"
+echo "Stat silo2/test-bucket/obj"
 DEST_OUT_1=$(aws s3api --endpoint-url https://localhost:9002 head-object --bucket test-bucket --key obj --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 DEST_OUT_2=$(aws s3api --endpoint-url https://localhost:9002 head-object --bucket test-bucket --key mpartobj --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 DEST_OBJ_1_CHKSUM=$(echo "${DEST_OUT_1}" | jq '.ChecksumSHA256')
@@ -180,10 +179,10 @@ echo "Set default encryption on "
 
 # test if checksum header is replicated for encrypted objects
 # Enable SSE KMS for test-bucket bucket
-./mc encrypt set sse-kms minio-default-key minio1/test-bucket --insecure
+./mc encrypt set sse-kms minio-default-key silo1/test-bucket --insecure
 
 # Load objects to source site with checksum header
-echo "Loading objects to source MinIO instance"
+echo "Loading objects to source Silo instance"
 OBJ_CHKSUM=$(openssl dgst -sha256 -binary </tmp/data/obj | base64)
 aws s3api --endpoint-url=https://localhost:9001 put-object --checksum-algorithm SHA256 --checksum-sha256 "${OBJ_CHKSUM}" --bucket test-bucket --key obj2 --body /tmp/data/obj --no-verify-ssl --profile enterprise
 
@@ -211,20 +210,20 @@ sleep 120
 
 # List the objects from replicated site
 echo "Objects from replicated site"
-./mc ls minio2/test-bucket --insecure
-count1=$(./mc ls minio2/test-bucket/obj2 --insecure | wc -l)
+./mc ls silo2/test-bucket --insecure
+count1=$(./mc ls silo2/test-bucket/obj2 --insecure | wc -l)
 if [ "${count1}" -ne 1 ]; then
-	echo "BUG: object minio1/test-bucket/obj2 not replicated"
+	echo "BUG: object silo1/test-bucket/obj2 not replicated"
 	exit_1
 fi
-count2=$(./mc ls minio2/test-bucket/mpartobj2 --insecure | wc -l)
+count2=$(./mc ls silo2/test-bucket/mpartobj2 --insecure | wc -l)
 if [ "${count2}" -ne 1 ]; then
-	echo "BUG: object minio1/test-bucket/mpartobj2 not replicated"
+	echo "BUG: object silo1/test-bucket/mpartobj2 not replicated"
 	exit_1
 fi
 
 # Stat the objects from source site
-echo "Stat minio1/test-bucket/obj2"
+echo "Stat silo1/test-bucket/obj2"
 SRC_OUT_1=$(aws s3api --endpoint-url https://localhost:9001 head-object --bucket test-bucket --key obj2 --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 SRC_OUT_2=$(aws s3api --endpoint-url https://localhost:9001 head-object --bucket test-bucket --key mpartobj2 --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 SRC_OBJ_1_CHKSUM=$(echo "${SRC_OUT_1}" | jq '.ChecksumSHA256')
@@ -233,7 +232,7 @@ SRC_OBJ_1_ETAG=$(echo "${SRC_OUT_1}" | jq '.ETag')
 SRC_OBJ_2_ETAG=$(echo "${SRC_OUT_2}" | jq '.ETag')
 
 # Stat the objects from replicated site
-echo "Stat minio2/test-bucket/obj2"
+echo "Stat silo2/test-bucket/obj2"
 DEST_OUT_1=$(aws s3api --endpoint-url https://localhost:9002 head-object --bucket test-bucket --key obj2 --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 DEST_OUT_2=$(aws s3api --endpoint-url https://localhost:9002 head-object --bucket test-bucket --key mpartobj2 --checksum-mode ENABLED --no-verify-ssl --profile enterprise)
 DEST_OBJ_1_CHKSUM=$(echo "${DEST_OUT_1}" | jq '.ChecksumSHA256')

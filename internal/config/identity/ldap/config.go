@@ -22,15 +22,13 @@ import (
 	"crypto/x509"
 	"errors"
 	"net"
-	"net/netip"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/pkg/v3/ldap"
+	"github.com/pgsty/silo-pkg/v3/ldap"
 )
 
 const (
@@ -45,7 +43,7 @@ type Config struct {
 	LDAP ldap.Config
 
 	stsExpiryDuration time.Duration // contains converted value
-	stsTrustedProxies []netip.Prefix
+	stsTrustedProxies config.TrustedProxies
 }
 
 // Enabled returns if LDAP is enabled.
@@ -61,7 +59,7 @@ func (l *Config) Clone() Config {
 	cfg := Config{
 		LDAP:              l.LDAP.Clone(),
 		stsExpiryDuration: l.stsExpiryDuration,
-		stsTrustedProxies: append([]netip.Prefix(nil), l.stsTrustedProxies...),
+		stsTrustedProxies: append(config.TrustedProxies(nil), l.stsTrustedProxies...),
 	}
 	return cfg
 }
@@ -168,49 +166,9 @@ var (
 	}
 )
 
-func parseSTSTrustedProxies(value string) ([]netip.Prefix, error) {
-	fields := strings.FieldsFunc(value, func(r rune) bool {
-		switch r {
-		case ',', ';', ' ', '\n', '\r', '\t':
-			return true
-		default:
-			return false
-		}
-	})
-	if len(fields) == 0 {
-		return nil, nil
-	}
-
-	prefixes := make([]netip.Prefix, 0, len(fields))
-	for _, field := range fields {
-		if prefix, err := netip.ParsePrefix(field); err == nil {
-			masked := prefix.Masked()
-			// Reject catch-all ranges (0.0.0.0/0, ::/0): they would trust
-			// forwarded headers from every peer and defeat the allowlist.
-			if masked.Bits() == 0 {
-				return nil, config.Errorf("LDAP STS trusted proxy %q is too broad", field)
-			}
-			prefixes = append(prefixes, masked)
-			continue
-		}
-
-		addr, err := netip.ParseAddr(field)
-		if err != nil {
-			return nil, config.Errorf("invalid LDAP STS trusted proxy %q", field)
-		}
-		bits := 32
-		if addr.Is6() {
-			bits = 128
-		}
-		prefixes = append(prefixes, netip.PrefixFrom(addr, bits))
-	}
-
-	return prefixes, nil
-}
-
 // SetSTSTrustedProxies parses and stores the LDAP STS trusted proxy allowlist.
 func (l *Config) SetSTSTrustedProxies(value string) error {
-	prefixes, err := parseSTSTrustedProxies(value)
+	prefixes, err := config.ParseTrustedProxies(value, "LDAP STS trusted proxy")
 	if err != nil {
 		return err
 	}
@@ -219,23 +177,14 @@ func (l *Config) SetSTSTrustedProxies(value string) error {
 }
 
 // IsSTSTrustedProxy reports whether the peer IP is allowed to supply forwarded headers
-// for LDAP STS source bucketing.
+// for LDAP STS source bucketing. This allowlist covers STS login rate-limit
+// bucketing only; the allowlist governing aws:SourceIp and the audit client
+// address lives in internal/handlers.
 func (l *Config) IsSTSTrustedProxy(peerIP string) bool {
-	if l == nil || len(l.stsTrustedProxies) == 0 {
+	if l == nil {
 		return false
 	}
-
-	addr, err := netip.ParseAddr(peerIP)
-	if err != nil {
-		return false
-	}
-
-	for _, prefix := range l.stsTrustedProxies {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
+	return l.stsTrustedProxies.Contains(peerIP)
 }
 
 // Enabled returns if LDAP config is enabled.

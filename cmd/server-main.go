@@ -48,13 +48,14 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
+	"github.com/minio/minio/internal/config/notify"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/certs"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/certs"
+	"github.com/pgsty/silo-pkg/v3/env"
 	"gopkg.in/yaml.v2"
 )
 
@@ -114,7 +115,7 @@ var ServerFlags = []cli.Flag{
 	},
 	cli.StringFlag{
 		Name:   "interface",
-		Usage:  "bind to right VRF device for MinIO services",
+		Usage:  "bind to the VRF device used by Silo services",
 		Hidden: true,
 		EnvVar: "MINIO_INTERFACE",
 	},
@@ -220,20 +221,20 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
 EXAMPLES:
-  1. Start MinIO server on "/home/shared" directory.
+  1. Start Silo server on "/home/shared" directory.
      {{.Prompt}} {{.HelpName}} /home/shared
 
   2. Start single node server with 64 local drives "/mnt/data1" to "/mnt/data64".
      {{.Prompt}} {{.HelpName}} /mnt/data{1...64}
 
-  3. Start distributed MinIO server on an 32 node setup with 32 drives each, run following command on all the nodes
+  3. Start distributed Silo server on a 32-node setup with 32 drives each; run the following command on all nodes.
      {{.Prompt}} {{.HelpName}} http://node{1...32}.example.com/mnt/export{1...32}
 
-  4. Start distributed MinIO server in an expanded setup, run the following command on all the nodes
+  4. Start distributed Silo server in an expanded setup; run the following command on all nodes.
      {{.Prompt}} {{.HelpName}} http://node{1...16}.example.com/mnt/export{1...32} \
             http://node{17...64}.example.com/mnt/export{1...64}
 
-  5. Start distributed MinIO server, with FTP and SFTP servers on all interfaces via port 8021, 8022 respectively
+  5. Start distributed Silo server with FTP and SFTP on ports 8021 and 8022.
      {{.Prompt}} {{.HelpName}} http://node{1...4}.example.com/mnt/export{1...4} \
            --ftp="address=:8021" --ftp="passive-port-range=30000-40000" \
            --sftp="address=:8022" --sftp="ssh-private-key=${HOME}/.ssh/id_rsa"
@@ -535,6 +536,15 @@ func configRetriableErrors(err error) bool {
 		notInitialized
 }
 
+func fatalServerConfigError(err error) bool {
+	var configErr config.Err
+	if errors.As(err, &configErr) {
+		return true
+	}
+	var migrationErr *notify.LegacyDatabaseTargetError
+	return errors.As(err, &migrationErr)
+}
+
 func bootstrapTraceMsg(msg string) {
 	info := madmin.TraceInfo{
 		TraceType: madmin.TraceBootstrap,
@@ -597,7 +607,7 @@ func initServerConfig(ctx context.Context, newObject ObjectLayer) error {
 
 		// These messages only meant primarily for distributed setup, so only log during distributed setup.
 		if globalIsDistErasure {
-			logger.Info("Waiting for all MinIO sub-systems to be initialize...")
+			logger.Info("Waiting for all Silo subsystems to initialize...")
 		}
 
 		// Upon success migrating the config, initialize all sub-systems
@@ -607,13 +617,13 @@ func initServerConfig(ctx context.Context, newObject ObjectLayer) error {
 			// All successful return.
 			if globalIsDistErasure {
 				// These messages only meant primarily for distributed setup, so only log during distributed setup.
-				logger.Info("All MinIO sub-systems initialized successfully in %s", time.Since(t1))
+				logger.Info("All Silo subsystems initialized successfully in %s", time.Since(t1))
 			}
 			return nil
 		}
 
 		if configRetriableErrors(err) {
-			logger.Info("Waiting for all MinIO sub-systems to be initialized.. possible cause (%v)", err)
+			logger.Info("Waiting for all Silo subsystems to initialize; possible cause: %v", err)
 			time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
 			continue
 		}
@@ -632,7 +642,10 @@ func initConfigSubsystem(ctx context.Context, newObject ObjectLayer) error {
 
 	// Initialize config system.
 	if err := globalConfigSys.Init(newObject); err != nil {
-		if configRetriableErrors(err) {
+		var migrationErr *notify.LegacyDatabaseTargetError
+		// Do not use fatalServerConfigError here: existing config.Err values
+		// retain the historical log-and-continue behavior at this boundary.
+		if configRetriableErrors(err) || errors.As(err, &migrationErr) {
 			return fmt.Errorf("Unable to initialize config system: %w", err)
 		}
 
@@ -742,7 +755,7 @@ func initializeLogRotate(ctx *cli.Context) (io.WriteCloser, error) {
 	return output, nil
 }
 
-// serverMain handler called for 'minio server' command.
+// serverMain handles the 'silo server' command.
 func serverMain(ctx *cli.Context) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -851,16 +864,6 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	// Check for updates in non-blocking manner.
-	go func() {
-		if !globalServerCtxt.Quiet && !globalInplaceUpdateDisabled {
-			// Check for new updates from dl.min.io.
-			bootstrapTrace("checkUpdate", func() {
-				checkUpdate(getMinioMode())
-			})
-		}
-	}()
-
 	// Set system resources to maximum.
 	bootstrapTrace("setMaxResources", func() {
 		_ = setMaxResources(globalServerCtxt)
@@ -868,13 +871,13 @@ func serverMain(ctx *cli.Context) {
 
 	// Verify kernel release and version.
 	if oldLinux() {
-		warnings = append(warnings, color.YellowBold("Detected Linux kernel version older than 4.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x linux kernel version for best performance"))
+		warnings = append(warnings, color.YellowBold("Detected a Linux kernel older than 4.0; Silo recommends kernel 4.x or newer to avoid known performance problems"))
 	}
 
 	maxProcs := runtime.GOMAXPROCS(0)
 	cpuProcs := runtime.NumCPU()
 	if maxProcs < cpuProcs {
-		warnings = append(warnings, color.YellowBold("Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance",
+		warnings = append(warnings, color.YellowBold("Detected GOMAXPROCS(%d) < NumCPU(%d); provide all processors to Silo for optimal performance",
 			maxProcs, cpuProcs))
 	}
 
@@ -898,6 +901,8 @@ func serverMain(ctx *cli.Context) {
 		close(globalGridStart)
 		close(globalLockGridStart)
 
+		// The HTTP/1 listener preserves absolute header deadlines and renews the
+		// body read/write idle limits, so transfers may outlast IdleTimeout.
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
@@ -975,10 +980,9 @@ func serverMain(ctx *cli.Context) {
 	var err error
 	bootstrapTrace("initServerConfig", func() {
 		if err = initServerConfig(GlobalContext, newObject); err != nil {
-			var cerr config.Err
 			// For any config error, we don't need to drop into safe-mode
 			// instead its a user error and should be fixed by user.
-			if errors.As(err, &cerr) {
+			if fatalServerConfigError(err) {
 				logger.FatalIf(err, "Unable to initialize the server")
 			}
 
@@ -1161,7 +1165,7 @@ func serverMain(ctx *cli.Context) {
 			Transport: globalRemoteTargetTransport,
 			Region:    region,
 		})
-		logger.FatalIf(err, "Unable to initialize MinIO client")
+		logger.FatalIf(err, "Unable to initialize the internal S3 client")
 	})
 
 	go bootstrapTrace("startResourceMetricsCollection", func() {
@@ -1169,7 +1173,7 @@ func serverMain(ctx *cli.Context) {
 	})
 
 	// Add User-Agent to differentiate the requests.
-	globalMinioClient.SetAppInfo("minio-perf-test", ReleaseTag)
+	globalMinioClient.SetAppInfo("silo-perf-test", ReleaseTag)
 
 	if serverDebugLog {
 		fmt.Println("== DEBUG Mode enabled ==")

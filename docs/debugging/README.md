@@ -1,47 +1,47 @@
-# MinIO Server Debugging Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/)
+# Silo Server Debugging Guide [![Docker Pulls](https://img.shields.io/docker/pulls/pgsty/silo.svg?maxAge=604800)](https://hub.docker.com/r/pgsty/silo/)
 
 ## HTTP Trace
 
-HTTP tracing can be enabled by using [`mc admin trace`](https://docs.min.io/community/minio-object-store/reference/minio-mc-admin/mc-admin-trace.html) command.
+HTTP tracing can be enabled by using [`mc admin trace`](https://silo.pgsty.com/reference/minio-mc-admin/mc-admin-trace/) command.
 
 Example:
 
 ```sh
-minio server /data
+silo server /data
 ```
 
 Default trace is succinct only to indicate the API operations being called and the HTTP response status.
 
 ```sh
-mc admin trace myminio
+mc admin trace mysilo
 ```
 
 To trace entire HTTP request
 
 ```sh
-mc admin trace --verbose myminio
+mc admin trace --verbose mysilo
 ```
 
 To trace entire HTTP request and also internode communication
 
 ```sh
-mc admin trace --all --verbose myminio
+mc admin trace --all --verbose mysilo
 ```
 
 ## Subnet Health
 
-Subnet Health diagnostics help ensure that the underlying infrastructure that runs MinIO is configured correctly, and is functioning properly. This test is one-shot long running one, that is recommended to be run as soon as the cluster is first provisioned, and each time a failure scenario is encountered. Note that the test incurs majority of the available resources on the system. Care must be taken when using this to debug failure scenario, so as to prevent larger outages. Health tests can be triggered using `mc support diagnostics` command.
+Subnet Health diagnostics help ensure that the underlying infrastructure that runs Silo is configured correctly, and is functioning properly. This test is one-shot long running one, that is recommended to be run as soon as the cluster is first provisioned, and each time a failure scenario is encountered. Note that the test incurs majority of the available resources on the system. Care must be taken when using this to debug failure scenario, so as to prevent larger outages. Health tests can be triggered using `mc support diagnostics` command.
 
 Example:
 
 ```sh
-minio server /data{1...4}
+silo server /data{1...4}
 ```
 
 The command takes no flags
 
 ```sh
-mc support diagnostics myminio/
+mc support diagnostics mysilo/
 ```
 
 The output printed will be of the form
@@ -72,10 +72,11 @@ Metadata is stored in `xl.meta` files for erasure coded objects. Each disk in th
 
 ### Installing xl-meta
 
-To install, [Go](https://golang.org/dl/) must be installed. Once installed, execute this to install the binary:
+With Go installed, build the diagnostic tool from the same Silo source revision
+as the server:
 
 ```bash
-go install github.com/minio/minio/docs/debugging/xl-meta@latest
+go build -o "$(go env GOPATH)/bin/xl-meta" ./docs/debugging/xl-meta
 ```
 
 ### Using xl-meta
@@ -84,7 +85,7 @@ Executing `xl-meta` will look for an `xl.meta` in the current folder and decode 
 
 ### Remotely Inspecting backend data
 
-`mc support inspect` allows collecting files based on *path* from all backend drives. Matching files will be collected in a zip file with their respective host+drive+path. A MinIO host from October 2021 or later is required for full functionality. Syntax is `mc support inspect ALIAS/path/to/files`. This can for example be used to collect `xl.meta` from objects that are misbehaving. To collect `xl.meta` from a specific object, for example placed at `ALIAS/bucket/path/to/file.txt` append `/xl.meta`, for instance `mc support inspect ALIAS/bucket/path/to/file.txt/xl.meta`. All files can be collected, so this can also be used to retrieve `part.*` files, etc.
+`mc support inspect` allows collecting files based on *path* from all backend drives. Matching files will be collected in a zip file with their respective host+drive+path. A Silo host from October 2021 or later is required for full functionality. Syntax is `mc support inspect ALIAS/path/to/files`. This can for example be used to collect `xl.meta` from objects that are misbehaving. To collect `xl.meta` from a specific object, for example placed at `ALIAS/bucket/path/to/file.txt` append `/xl.meta`, for instance `mc support inspect ALIAS/bucket/path/to/file.txt/xl.meta`. All files can be collected, so this can also be used to retrieve `part.*` files, etc.
 
 Wildcards can be used, for example `mc support inspect ALIAS/bucket/path/**/xl.meta` will collect all `xl.meta` recursively. `mc support inspect ALIAS/bucket/path/to/file.txt/*/part.*` will collect parts for all versions for the object located at `bucket/path/to/file.txt`.
 
@@ -120,10 +121,10 @@ This file can be decrypted using the decryption tool below:
 
 To install, [Go](https://golang.org/dl/) must be installed.
 
-Once installed, execute this to install the binary:
+Build the decryption tool from the same Silo source revision:
 
 ```bash
-go install github.com/minio/minio/docs/debugging/inspect@latest
+go build -o "$(go env GOPATH)/bin/inspect" ./docs/debugging/inspect
 ```
 
 ### Usage

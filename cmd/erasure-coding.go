@@ -45,6 +45,17 @@ func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int
 		return e, reedsolomon.ErrInvShardNum
 	}
 
+	// blockSize reaches here from FileInfo.Erasure, i.e. from xl.meta, which a
+	// peer can write, and FileInfo.IsValid() does not check it. A coder with a
+	// non-positive block size cannot encode or decode anything, so refusing to
+	// build one loses nothing -- but building one leaves every division by
+	// e.blockSize downstream (ShardFileSize, ShardFileOffset, and the whole of
+	// erasure-decode.go) as an integer divide-by-zero. Reject at the single
+	// point where every Erasure value in the process is constructed.
+	if blockSize <= 0 {
+		return e, errInvalidArgument
+	}
+
 	if dataBlocks+parityBlocks > 256 {
 		return e, reedsolomon.ErrMaxShardNum
 	}
@@ -124,6 +135,13 @@ func (e *Erasure) ShardFileSize(totalLength int64) int64 {
 	}
 	if totalLength == -1 {
 		return -1
+	}
+	// NewErasure validates dataBlocks and parityBlocks but not blockSize, and
+	// the values reach it from FileInfo.Erasure - i.e. from xl.meta, which a
+	// peer can write. Mirrors the guard on ErasureInfo.ShardFileSize; without
+	// it a zero block size is an integer divide-by-zero here instead.
+	if e.blockSize <= 0 || e.dataBlocks <= 0 {
+		return 0
 	}
 	numShards := totalLength / e.blockSize
 	lastBlockSize := totalLength % e.blockSize

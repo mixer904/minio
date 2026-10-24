@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	// Minio endpoint (for STS API)
+	// Silo endpoint (for STS API)
 	stsEndpoint string
 
 	// User account credentials
@@ -58,8 +58,8 @@ var (
 
 func init() {
 	flag.StringVar(&stsEndpoint, "sts-ep", "http://localhost:9000", "STS endpoint")
-	flag.StringVar(&minioUsername, "u", "", "MinIO Username")
-	flag.StringVar(&minioPassword, "p", "", "MinIO Password")
+	flag.StringVar(&minioUsername, "u", "", "Silo username")
+	flag.StringVar(&minioPassword, "p", "", "Silo password")
 	flag.BoolVar(&displayCreds, "d", false, "Only show generated credentials")
 	flag.DurationVar(&expiryDuration, "e", 0, "Request a duration of validity for the generated credential")
 	flag.StringVar(&bucketToList, "b", "", "Bucket to list (defaults to username)")
@@ -132,7 +132,7 @@ func main() {
 	}
 
 	// API requests are secure (HTTPS) if secure=true and insecure (HTTP) otherwise.
-	// New returns an MinIO Admin client object.
+	// New returns a compatible Admin API client object.
 	madmClnt, err := madmin.NewWithOptions(stsEndpointURL.Host, mopts)
 	if err != nil {
 		log.Fatalln(err)
@@ -143,13 +143,13 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	// Use generated credentials to authenticate with MinIO server
+	// Use generated credentials to authenticate with Silo server
 	minioClient, err := minio.New(stsEndpointURL.Host, opts)
 	if err != nil {
 		log.Fatalf("Error initializing client: %v", err)
 	}
 
-	// Use minIO Client object normally like the regular client.
+	// Use the minio-go Client object like a regular client.
 	if bucketToList == "" {
 		bucketToList = minioUsername
 	}

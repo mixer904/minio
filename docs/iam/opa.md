@@ -1,8 +1,8 @@
 # OPA Quickstart Guide [![Slack](https://slack.minio.io/slack?type=svg)](https://slack.minio.io)
 
-OPA is a lightweight general-purpose policy engine that can be co-located with MinIO server, in this document we talk about how to use OPA HTTP API to authorize requests. It can be used with any type of credentials (STS based like OpenID or LDAP, regular IAM users or service accounts).
+OPA is a lightweight general-purpose policy engine that can be co-located with Silo server, in this document we talk about how to use OPA HTTP API to authorize requests. It can be used with any type of credentials (STS based like OpenID or LDAP, regular IAM users or service accounts).
 
-OPA is enabled through MinIO's Access Management Plugin feature.
+OPA is enabled through Silo's Access Management Plugin feature.
 
 ## Get started
 
@@ -51,27 +51,27 @@ curl -X PUT --data-binary @example.rego \
   localhost:8181/v1/policies/putobject
 ```
 
-### 4. Setup MinIO with OPA
+### 4. Setup Silo with OPA
 
-Set the `MINIO_POLICY_PLUGIN_URL` as the endpoint that MinIO should send authorization requests to. Then start the server.
+Set the `MINIO_POLICY_PLUGIN_URL` as the endpoint that Silo should send authorization requests to. Then start the server.
 
 ```sh
 export MINIO_POLICY_PLUGIN_URL=http://localhost:8181/v1/data/httpapi/authz/allow
 export MINIO_CI_CD=1
 export MINIO_ROOT_USER=minio
-export MINIO_ROOT_PASSWORD=minio123
-minio server /mnt/data
+export MINIO_ROOT_PASSWORD=silo123
+silo server /mnt/data
 ```
 
 ### 5. Test with a regular IAM user
 
-Ensure that `mc` is installed and the configured with the above server with the alias `myminio`.
+Ensure that `mc` is installed and the configured with the above server with the alias `mysilo`.
 
 ```sh
 # 1. Create a bucket and a user, and upload a file. These operations will succeed.
-mc mb myminio/test
-mc admin user add myminio foo foobar123
-mc cp /etc/issue myminio/test/
+mc mb mysilo/test
+mc admin user add mysilo foo foobar123
+mc cp /etc/issue mysilo/test/
 
 # 2. Now access the server as user `foo`. These operations will also succeed.
 export MC_HOST_foo=http://foo:foobar123@localhost:9000
@@ -79,5 +79,5 @@ mc ls foo/test
 mc cat foo/test/issue
 
 # 3. Attempt to upload an object as user `foo` - this will fail with a permissions error.
-mc cp /etc/issue myminio/test/issue2
+mc cp /etc/issue mysilo/test/issue2
 ```

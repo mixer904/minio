@@ -81,7 +81,7 @@ func bgFormatErasureCleanupTmp(diskPath string) {
 	//  |__ e870a2c1-d09c-450c-a69c-6eaa54a89b3e
 	//
 	// In this example, `33a58b40-aecc-4c9f-a22f-ff17bfa33b62` directory contains
-	// temporary objects from one of the previous runs of minio server.
+	// temporary objects from one of the previous runs of Silo.
 	tmpID := mustGetUUID()
 	tmpOld := pathJoin(diskPath, minioMetaTmpBucket+"-old", tmpID)
 	if err := renameAll(pathJoin(diskPath, minioMetaTmpBucket),
@@ -263,7 +263,7 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCou
 	defer func() {
 		if err == nil && format != nil {
 			// Assign globalDeploymentID() on first run for the
-			// minio server managing the first disk
+			// Silo server managing the first disk
 			globalDeploymentIDPtr.Store(&format.ID)
 
 			// Set the deployment ID here to avoid races.

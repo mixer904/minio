@@ -25,8 +25,8 @@ import (
 
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/pkg/v3/env"
-	xnet "github.com/minio/pkg/v3/net"
+	"github.com/pgsty/silo-pkg/v3/env"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/namespace"
 	"go.uber.org/zap"
@@ -166,7 +166,6 @@ func LookupConfig(kvs config.KVS, rootCAs *x509.CertPool) (Config, error) {
 			NextProtos:               []string{"http/1.1", "h2"},
 			ClientSessionCache:       tls.NewLRUClientSessionCache(64),
 			CipherSuites:             crypto.TLSCiphersBackwardCompatible(),
-			CurvePreferences:         crypto.TLSCurveIDs(),
 		}
 		// This is only to support client side certificate authentication
 		// https://coreos.com/etcd/docs/latest/op-guide/security.html

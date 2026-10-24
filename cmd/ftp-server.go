@@ -139,9 +139,9 @@ func startFTPServer(args []string) {
 		logger.Fatal(fmt.Errorf("invalid TLS arguments provided. force-tls, but missing private key --ftp=\"tls-private-key=path/to/private.key\""), "unable to start FTP server")
 	}
 
-	name := "MinIO FTP Server"
+	name := "Silo FTP Server"
 	if tls {
-		name = "MinIO FTP(Secure) Server"
+		name = "Silo FTP(Secure) Server"
 	}
 
 	ftpServer, err := ftp.NewServer(&ftp.Options{

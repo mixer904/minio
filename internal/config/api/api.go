@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/env"
 )
 
 // API sub-system constants
@@ -45,6 +45,7 @@ const (
 	apiTransitionWorkers           = "transition_workers"
 	apiStaleUploadsCleanupInterval = "stale_uploads_cleanup_interval"
 	apiStaleUploadsExpiry          = "stale_uploads_expiry"
+	apiMultipartListing            = "multipart_listing"
 	apiDeleteCleanupInterval       = "delete_cleanup_interval"
 	apiDisableODirect              = "disable_odirect"
 	apiODirect                     = "odirect"
@@ -67,6 +68,7 @@ const (
 
 	EnvAPIStaleUploadsCleanupInterval = "MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL"
 	EnvAPIStaleUploadsExpiry          = "MINIO_API_STALE_UPLOADS_EXPIRY"
+	EnvAPIMultipartListing            = "MINIO_API_MULTIPART_LISTING" // Retired; used only for a startup warning.
 	EnvAPIDeleteCleanupInterval       = "MINIO_API_DELETE_CLEANUP_INTERVAL"
 	EnvDeleteCleanupInterval          = "MINIO_DELETE_CLEANUP_INTERVAL"
 	EnvAPIODirect                     = "MINIO_API_ODIRECT"
@@ -206,6 +208,7 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		apiReplicationWorkers,
 		apiReplicationFailedWorkers,
 		"expiry_workers",
+		apiMultipartListing, // Tolerate the retired key without changing other API settings.
 	}
 
 	disableODirect := env.Get(EnvAPIDisableODirect, kvs.Get(apiDisableODirect)) == config.EnableOn

@@ -15,8 +15,8 @@ exit_1() {
 }
 
 cleanup() {
-	echo -n "Cleaning up instances of MinIO ..."
-	pkill -9 minio || sudo pkill -9 minio
+	echo -n "Cleaning up instances of Silo ..."
+	pkill -9 silo || sudo pkill -9 silo
 	rm -rf /tmp/sitea
 	rm -rf /tmp/siteb
 	echo "done"
@@ -29,23 +29,22 @@ export MINIO_BROWSER=off
 
 make install-race
 
-# Start MinIO instances
-echo -n "Starting MinIO instances ..."
-minio server --address 127.0.0.1:9001 --console-address ":10000" "http://127.0.0.1:9001/tmp/sitea/data/disterasure/xl{1...4}" \
+# Start Silo instances
+echo -n "Starting Silo instances ..."
+silo server --address 127.0.0.1:9001 --console-address ":10000" "http://127.0.0.1:9001/tmp/sitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/sitea/data/disterasure/xl{5...8}" >/tmp/sitea_1.log 2>&1 &
-minio server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/sitea/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/sitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/sitea/data/disterasure/xl{5...8}" >/tmp/sitea_2.log 2>&1 &
 
-minio server --address 127.0.0.1:9003 --console-address ":10001" "http://127.0.0.1:9003/tmp/siteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9003 --console-address ":10001" "http://127.0.0.1:9003/tmp/siteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/siteb/data/disterasure/xl{5...8}" >/tmp/siteb_1.log 2>&1 &
-minio server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/siteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/siteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/siteb/data/disterasure/xl{5...8}" >/tmp/siteb_2.log 2>&1 &
 
 echo "done"
 
 if [ ! -f ./mc ]; then
-	wget --quiet -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
-		chmod +x mc
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 fi
 
 export MC_HOST_sitea=http://minioadmin:minioadmin@127.0.0.1:9001

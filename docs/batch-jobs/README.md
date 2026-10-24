@@ -1,12 +1,12 @@
-# MinIO Batch Job
-MinIO Batch jobs is an MinIO object management feature that lets you manage objects at scale. Jobs currently supported by MinIO
+# Silo Batch Job
+Silo Batch jobs is an Silo object management feature that lets you manage objects at scale. Jobs currently supported by Silo
 
 - Replicate objects between buckets on multiple sites
 
 Upcoming Jobs
 
-- Copy objects from NAS to MinIO
-- Copy objects from HDFS to MinIO
+- Copy objects from NAS to Silo
+- Copy objects from HDFS to Silo
 
 ## Replication Job
 To perform replication via batch jobs, you create a job. The job consists of a job description YAML that describes
@@ -15,7 +15,7 @@ To perform replication via batch jobs, you create a job. The job consists of a j
 - Target location from where the objects must be copied to
 - Fine grained filtering is available to pick relevant objects from source to copy from
 
-MinIO batch jobs framework also provides
+Silo batch jobs framework also provides
 
 - Retrying a failed job automatically driven by user input
 - Monitoring job progress in real-time
@@ -64,7 +64,7 @@ replicate:
 	  #   - key: "name"
 	  #     value: "pick*" # match objects with tag 'name', with all values starting with 'pick'
 
-	  ## NOTE: metadata filter not supported when "source" is non MinIO.
+	  ## NOTE: metadata filter not supported when "source" is non Silo.
 	  # metadata:
 	  #   - key: "content-type"
 	  #     value: "image/*" # match objects with 'content-type', with all values starting with 'image/'
@@ -83,13 +83,14 @@ You can create and run multiple 'replication' jobs at a time there are no predef
 ## Batch Jobs Terminology
 
 ### Job
-A job is the basic unit of work for MinIO Batch Job. A job is a self describing YAML, once this YAML is submitted and evaluated - MinIO performs the requested actions on each of the objects obtained under the described criteria in job YAML file.
+A job is the basic unit of work for Silo Batch Job. A job is a self describing YAML, once this YAML is submitted and evaluated - Silo performs the requested actions on each of the objects obtained under the described criteria in job YAML file.
 
 ### Type
-Type describes the job type, such as replicating objects between MinIO sites. Each job performs a single type of operation across all objects that match the job description criteria.
+Type describes the job type, such as replicating objects between Silo sites. Each job performs a single type of operation across all objects that match the job description criteria.
 
 ## Batch Jobs via Commandline
-[mc](http://github.com/minio/mc) provides 'mc batch' command to create, start and manage submitted jobs.
+The compatible [`mc`](https://github.com/pgsty/mc) client provides the
+`mc batch` command to create, start, and manage submitted jobs.
 
 ```
 NAME:
@@ -102,7 +103,7 @@ COMMANDS:
   generate  generate a new batch job definition
   start     start a new batch job
   list, ls  list all current batch jobs
-  status    summarize job events on MinIO server in real-time
+  status    summarize job events on Silo server in real-time
   describe  describe job definition for a job
 ```
 
@@ -133,7 +134,7 @@ E24HH4nNMcgY5taynaPfxu  replicate       minioadmin      1 minute ago
 
 ### Real-time 'status' for a batch job
 ```
-mc batch status myminio/ E24HH4nNMcgY5taynaPfxu
+mc batch status mysilo/ E24HH4nNMcgY5taynaPfxu
 ●∙∙
 Objects:        28766
 Versions:       28766
@@ -145,7 +146,7 @@ CurrObjName:    share/doc/xml-core/examples/foo.xmlcatalogs
 
 ### 'describe' the batch job yaml.
 ```
-mc batch describe myminio/ E24HH4nNMcgY5taynaPfxu
+mc batch describe mysilo/ E24HH4nNMcgY5taynaPfxu
 replicate:
   apiVersion: v1
 ...

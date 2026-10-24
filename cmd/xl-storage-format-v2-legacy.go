@@ -40,6 +40,10 @@ func (x *xlMetaV2VersionHeader) unmarshalV(v uint8, bts []byte) (o []byte, err e
 
 // unmarshalV1 decodes version 1, never released.
 func (x *xlMetaV2VersionHeader) unmarshalV1(bts []byte) (o []byte, err error) {
+	// Fields absent from the V1 wire format must be reset since the
+	// header may be reused across decodes.
+	x.Signature = [4]byte{}
+	x.EcN, x.EcM = 0, 0
 	var zb0001 uint32
 	zb0001, bts, err = msgp.ReadArrayHeaderBytes(bts)
 	if err != nil {
@@ -50,7 +54,7 @@ func (x *xlMetaV2VersionHeader) unmarshalV1(bts []byte) (o []byte, err error) {
 		err = msgp.ArrayError{Wanted: 4, Got: zb0001}
 		return o, err
 	}
-	bts, err = msgp.ReadExactBytes(bts, (x.VersionID)[:])
+	bts, err = msgp.ReadExactBytes(bts, x.VersionID[:])
 	if err != nil {
 		err = msgp.WrapError(err, "VersionID")
 		return o, err
@@ -134,7 +138,7 @@ type xlMetaV2VersionHeaderV2 struct {
 
 // UnmarshalMsg implements msgp.Unmarshaler
 func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte) (o []byte, err error) {
-	z.EcN, z.EcN = 0, 0
+	z.EcN, z.EcM = 0, 0
 	var zb0001 uint32
 	zb0001, bts, err = msgp.ReadArrayHeaderBytes(bts)
 	if err != nil {
@@ -145,7 +149,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte) (o []byte, err error)
 		err = msgp.ArrayError{Wanted: 5, Got: zb0001}
 		return o, err
 	}
-	bts, err = msgp.ReadExactBytes(bts, (z.VersionID)[:])
+	bts, err = msgp.ReadExactBytes(bts, z.VersionID[:])
 	if err != nil {
 		err = msgp.WrapError(err, "VersionID")
 		return o, err
@@ -155,7 +159,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte) (o []byte, err error)
 		err = msgp.WrapError(err, "ModTime")
 		return o, err
 	}
-	bts, err = msgp.ReadExactBytes(bts, (z.Signature)[:])
+	bts, err = msgp.ReadExactBytes(bts, z.Signature[:])
 	if err != nil {
 		err = msgp.WrapError(err, "Signature")
 		return o, err
@@ -184,7 +188,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte) (o []byte, err error)
 
 // DecodeMsg implements msgp.Decodable
 func (z *xlMetaV2VersionHeaderV2) DecodeMsg(dc *msgp.Reader) (err error) {
-	z.EcN, z.EcN = 0, 0
+	z.EcN, z.EcM = 0, 0
 	var zb0001 uint32
 	zb0001, err = dc.ReadArrayHeader()
 	if err != nil {
@@ -195,7 +199,7 @@ func (z *xlMetaV2VersionHeaderV2) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.ArrayError{Wanted: 5, Got: zb0001}
 		return err
 	}
-	err = dc.ReadExactBytes((z.VersionID)[:])
+	err = dc.ReadExactBytes(z.VersionID[:])
 	if err != nil {
 		err = msgp.WrapError(err, "VersionID")
 		return err
@@ -205,7 +209,7 @@ func (z *xlMetaV2VersionHeaderV2) DecodeMsg(dc *msgp.Reader) (err error) {
 		err = msgp.WrapError(err, "ModTime")
 		return err
 	}
-	err = dc.ReadExactBytes((z.Signature)[:])
+	err = dc.ReadExactBytes(z.Signature[:])
 	if err != nil {
 		err = msgp.WrapError(err, "Signature")
 		return err

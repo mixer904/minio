@@ -38,7 +38,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 	"github.com/pkg/errors"
 )
 
@@ -331,7 +331,7 @@ func (target *ElasticsearchTarget) checkAndInitClient(ctx context.Context) error
 		return errors.New("unable to determine support status of ES (should not happen)")
 
 	case ESSDeprecated:
-		return errors.New("there is no currently deprecated version of ES in MinIO")
+		return errors.New("there is no currently deprecated version of ES in Silo")
 
 	case ESSSupported:
 		target.client = clientV7

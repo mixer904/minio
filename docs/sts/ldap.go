@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	// LDAP integrated Minio endpoint
+	// LDAP-integrated Silo endpoint
 	stsEndpoint string
 
 	// LDAP credentials
@@ -121,13 +121,13 @@ func main() {
 		return
 	}
 
-	// Use generated credentials to authenticate with MinIO server
+	// Use generated credentials to authenticate with Silo server
 	minioClient, err := minio.New(stsEndpointURL.Host, opts)
 	if err != nil {
 		log.Fatalf("Error initializing client: %v", err)
 	}
 
-	// Use minIO Client object normally like the regular client.
+	// Use the minio-go Client object like a regular client.
 	if bucketToList == "" {
 		bucketToList = ldapUsername
 	}

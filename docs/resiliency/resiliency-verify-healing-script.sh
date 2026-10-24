@@ -8,7 +8,7 @@ DIR=$(echo $1 | jq -r '.args.dir')
 DEEP=$(echo $1 | jq -r '.args.deep')
 WANT=$(echo $1 | jq 'del(.args)') # ... and remove args from wanted result
 
-ALIAS_NAME=myminio
+ALIAS_NAME=mysilo
 BUCKET="test-bucket"
 JQUERY='select(.name=="'"${BUCKET}"'/'"${DIR}"'/'"${FILE}"'") | {"before":{"color": .before.color, "missing": .before.missing, "corrupted": .before.corrupted},"after":{"color": .after.color, "missing": .after.missing, "corrupted": .after.corrupted}}'
 if [ "$DEEP" = "true" ]; then

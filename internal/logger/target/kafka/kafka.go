@@ -38,7 +38,7 @@ import (
 	types "github.com/minio/minio/internal/logger/target/loggertypes"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // the suffix for the configured queue dir where the logs will be persisted.
@@ -238,6 +238,8 @@ func (h *Target) init() error {
 	}
 
 	sconfig := sarama.NewConfig()
+	// Preserve SILO's default broker protocol when no version is configured.
+	sconfig.Version = sarama.V2_1_0_0
 	if h.kconfig.Version != "" {
 		kafkaVersion, err := sarama.ParseKafkaVersion(h.kconfig.Version)
 		if err != nil {

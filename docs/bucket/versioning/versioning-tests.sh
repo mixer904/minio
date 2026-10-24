@@ -16,9 +16,9 @@ catch() {
 		cat "/tmp/sitea_2.log"
 	fi
 
-	echo "Cleaning up instances of MinIO"
-	pkill minio
-	pkill -9 minio
+	echo "Cleaning up instances of Silo"
+	pkill silo
+	pkill -9 silo
 	rm -rf /tmp/multisitea
 	if [ $# -ne 0 ]; then
 		exit $#
@@ -39,14 +39,13 @@ unset MINIO_KMS_KES_ENDPOINT
 unset MINIO_KMS_KES_KEY_NAME
 
 if [ ! -f ./mc ]; then
-	wget -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
-		chmod +x mc
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 fi
 
-minio server -S /tmp/no-certs --address ":9001" "http://localhost:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server -S /tmp/no-certs --address ":9001" "http://localhost:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://localhost:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_1.log 2>&1 &
 
-minio server -S /tmp/no-certs --address ":9002" "http://localhost:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server -S /tmp/no-certs --address ":9002" "http://localhost:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://localhost:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_2.log 2>&1 &
 
 export MC_HOST_sitea=http://minioadmin:minioadmin@localhost:9002

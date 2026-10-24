@@ -52,7 +52,7 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/env"
 )
 
 func initHelp() {
@@ -92,13 +92,13 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.SubnetSubSys,
 			Type:        "string",
-			Description: "register Enterprise license for the cluster",
+			Description: "legacy MinIO SUBNET settings retained for compatibility; external integration is disabled in Silo",
 			Optional:    true,
 		},
 		config.HelpKV{
 			Key:         config.CallhomeSubSys,
 			Type:        "string",
-			Description: "enable callhome to MinIO SUBNET",
+			Description: "legacy callhome settings retained for compatibility; diagnostic uploads are disabled in Silo",
 			Optional:    true,
 		},
 		config.HelpKV{
@@ -383,13 +383,8 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 			return err
 		}
 	case config.CallhomeSubSys:
-		cfg, err := callhome.LookupConfig(s[config.CallhomeSubSys][config.Default])
-		if err != nil {
+		if _, err := callhome.LookupConfig(s[config.CallhomeSubSys][config.Default]); err != nil {
 			return err
-		}
-		// callhome cannot be enabled if license is not registered yet, throw an error.
-		if cfg.Enabled() && !globalSubnetConfig.Registered() {
-			return errors.New("Deployment is not registered with SUBNET. Please register the deployment via 'mc license register ALIAS'")
 		}
 	case config.DriveSubSys:
 		if _, err := drive.LookupConfig(s[config.DriveSubSys][config.Default]); err != nil {
@@ -676,11 +671,11 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		if err != nil {
 			configLogIf(ctx, fmt.Errorf("Unable to load callhome config: %w", err))
 		} else {
-			enable := callhomeCfg.Enable && !globalCallhomeConfig.Enabled()
-			globalCallhomeConfig.Update(callhomeCfg)
-			if enable {
-				initCallhome(ctx, objAPI)
+			if callhomeCfg.Enable {
+				configLogIf(ctx, errors.New("callhome is configured but ignored: Silo does not upload diagnostics to MinIO SUBNET"))
 			}
+			callhomeCfg.Enable = false
+			globalCallhomeConfig.Update(callhomeCfg)
 		}
 	case config.DriveSubSys:
 		driveConfig, err := drive.LookupConfig(s[config.DriveSubSys][config.Default])

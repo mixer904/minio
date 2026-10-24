@@ -25,17 +25,15 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/minio/cli"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/console"
-	"github.com/minio/pkg/v3/env"
-	"github.com/minio/pkg/v3/trie"
-	"github.com/minio/pkg/v3/words"
+	"github.com/pgsty/silo-pkg/v3/console"
+	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/trie"
+	"github.com/pgsty/silo-pkg/v3/words"
 )
 
 // GlobalFlags - global flags for minio.
@@ -140,6 +138,7 @@ func newApp(name string) *cli.App {
 	// Register all commands.
 	registerCommand(serverCmd)
 	registerCommand(fmtGenCmd)
+	registerCommand(healthcheckCmd)
 
 	// Set up app.
 	cli.HelpFlag = cli.BoolFlag{
@@ -150,16 +149,16 @@ func newApp(name string) *cli.App {
 
 	app := cli.NewApp()
 	app.Name = name
-	app.Author = "MinIO, Inc."
+	app.Author = "Silo contributors"
 	app.Version = ReleaseTag
-	app.Usage = "High Performance Object Storage"
-	app.Description = `Build high performance data infrastructure for machine learning, analytics and application data workloads with MinIO`
+	app.Usage = "S3-compatible object storage"
+	app.Description = `Run independently maintained, S3-compatible object storage with Silo`
 	app.Flags = GlobalFlags
-	app.HideHelpCommand = true // Hide `help, h` command, we already have `minio --help`.
+	app.HideHelpCommand = true // Hide `help, h`; the top-level `silo --help` already covers it.
 	app.Commands = commands
 	app.CustomAppHelpTemplate = minioHelpTemplate
 	app.CommandNotFound = func(ctx *cli.Context, command string) {
-		console.Printf("‘%s’ is not a minio sub-command. See ‘minio --help’.\n", command)
+		console.Printf("‘%s’ is not a %s sub-command. See ‘%s --help’.\n", command, ctx.App.Name, ctx.App.Name)
 		closestCommands := findClosestCommands(command)
 		if len(closestCommands) > 0 {
 			console.Println()
@@ -176,8 +175,8 @@ func newApp(name string) *cli.App {
 }
 
 func startupBanner(banner io.Writer) {
-	CopyrightYear = strconv.Itoa(time.Now().Year())
-	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", upstreamCopyrightEndYear))
+	fmt.Fprintln(banner, color.Blue("Modifications:")+color.Bold(" Copyright %s-%s PGSTY", forkCopyrightStartYear, copyrightEndYear()))
 	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" "+MinioLicense))
 	fmt.Fprintln(banner, color.Blue("Version:")+color.Bold(" %s (%s %s/%s)", ReleaseTag, runtime.Version(), runtime.GOOS, runtime.GOARCH))
 }
@@ -187,7 +186,9 @@ func versionBanner(c *cli.Context) io.Reader {
 	fmt.Fprintln(banner, color.Bold("%s version %s (commit-id=%s)", c.App.Name, c.App.Version, CommitID))
 	fmt.Fprintln(banner, color.Blue("Runtime:")+color.Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
 	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html"))
-	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", upstreamCopyrightEndYear))
+	fmt.Fprintln(banner, color.Blue("Modifications:")+color.Bold(" Copyright %s-%s PGSTY", forkCopyrightStartYear, copyrightEndYear()))
+	fmt.Fprintln(banner, color.Blue("Source compatibility:")+color.Bold(" based on MinIO technology"))
 	return strings.NewReader(banner.String())
 }
 
@@ -197,7 +198,7 @@ func printMinIOVersion(c *cli.Context) {
 
 var debugNoExit = env.Get("_MINIO_DEBUG_NO_EXIT", "") != ""
 
-// Main main for minio server.
+// Main is the Silo server entry point.
 func Main(args []string) {
 	// Set the minio app name.
 	appName := filepath.Base(args[0])

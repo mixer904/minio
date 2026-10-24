@@ -60,8 +60,8 @@ import (
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	xnet "github.com/minio/pkg/v3/net"
-	"github.com/minio/pkg/v3/policy"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
+	"github.com/pgsty/silo-pkg/v3/policy"
 	"github.com/secure-io/sio-go"
 	"github.com/zeebo/xxh3"
 )
@@ -84,7 +84,7 @@ const (
 
 // ServerUpdateV2Handler - POST /minio/admin/v3/update?updateURL={updateURL}&type=2
 // ----------
-// updates all minio servers and restarts them gracefully.
+// Retained for Admin API compatibility. Silo always returns MethodNotAllowed.
 func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -320,7 +320,7 @@ func (a adminAPIHandlers) ServerUpdateV2Handler(w http.ResponseWriter, r *http.R
 
 // ServerUpdateHandler - POST /minio/admin/v3/update?updateURL={updateURL}
 // ----------
-// updates all minio servers and restarts them gracefully.
+// Retained for Admin API compatibility. Silo always returns MethodNotAllowed.
 func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -330,7 +330,7 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	if globalInplaceUpdateDisabled || currentReleaseTime.IsZero() {
-		// if MINIO_UPDATE=off - inplace update is disabled, mostly in containers.
+		// MINIO_UPDATE is retained, but Silo permanently disables in-place updates.
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 		return
 	}
@@ -2708,10 +2708,10 @@ func fetchHealthInfo(healthCtx context.Context, objectAPI ObjectLayer, query *ur
 		}
 
 		// Server start command regex groups:
-		// 1 - minio server
-		// 2 - flags e.g. `--address :9000 --certs-dir /etc/minio/certs`
+		// 1 - silo server (or the legacy minio command)
+		// 2 - flags e.g. `--address :9000 --certs-dir /etc/silo/certs`
 		// 3 - pool args e.g. `https://node{01...16}.domain/data/disk{001...204} https://node{17...32}.domain/data/disk{001...204}`
-		re := regexp.MustCompile(`^(.*minio\s+server\s+)(--[^\s]+\s+[^\s]+\s+)*(.*)`)
+		re := regexp.MustCompile(`^(.*silo\s+server\s+|.*minio\s+server\s+)(--[^\s]+\s+[^\s]+\s+)*(.*)`)
 
 		// stays unchanged in the anonymized version
 		cmdLineWithoutPools := re.ReplaceAllString(cmdLine, `$1$2`)
@@ -3282,28 +3282,7 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		stream := estream.NewWriter(w)
 		defer stream.Close()
 
-		clusterKey, err := bytesToPublicKey(getSubnetAdminPublicKey())
-		if err != nil {
-			bugLogIf(ctx, stream.AddError(err.Error()))
-			return
-		}
-		err = stream.AddKeyEncrypted(clusterKey)
-		if err != nil {
-			bugLogIf(ctx, stream.AddError(err.Error()))
-			return
-		}
-		if b := getClusterMetaInfo(ctx); len(b) > 0 {
-			w, err := stream.AddEncryptedStream("cluster.info", nil)
-			if err != nil {
-				bugLogIf(ctx, err)
-				return
-			}
-			w.Write(b)
-			w.Close()
-		}
-
-		// Add new key for inspect data.
-		if err := stream.AddKeyEncrypted(publicKey); err != nil {
+		if err := addInspectDataKey(stream, publicKey, getClusterMetaInfo(ctx)); err != nil {
 			bugLogIf(ctx, stream.AddError(err.Error()))
 			return
 		}
@@ -3432,7 +3411,7 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		scheme = "http"
 	}
 
-	// save MinIO start script to inspect command
+	// Save a Silo start script to inspect command.
 	var scrb bytes.Buffer
 	fmt.Fprintf(&scrb, `#!/usr/bin/env bash
 
@@ -3443,30 +3422,43 @@ function main() {
 	done
 
 	# Read content of inspect-input.txt
-	MINIO_OPTS=$(grep "Server command line args" <./inspect-input.txt | sed "s/Server command line args: //g" | sed -r "s#%s:\/\/#\.\/#g")
+	SILO_OPTS=$(grep "Server command line args" <./inspect-input.txt | sed "s/Server command line args: //g" | sed -r "s#%s:\/\/#\.\/#g")
 
-	# Start MinIO instance using the options
-	START_CMD="CI=on _MINIO_AUTO_DRIVE_HEALING=off minio server ${MINIO_OPTS} &"
+	# Start Silo using the options
+	START_CMD="CI=on _MINIO_AUTO_DRIVE_HEALING=off silo server ${SILO_OPTS} &"
 	echo
-	echo "Starting MinIO instance: ${START_CMD}"
+	echo "Starting Silo: ${START_CMD}"
 	echo
 	eval "$START_CMD"
-	MINIO_SRVR_PID="$!"
-	echo "MinIO Server PID: ${MINIO_SRVR_PID}"
+	SILO_SRVR_PID="$!"
+	echo "Silo Server PID: ${SILO_SRVR_PID}"
 	echo
-	echo "Waiting for MinIO instance to get ready!"
+	echo "Waiting for Silo to get ready!"
 	sleep 10
 }
 
 main "$@"`, scheme)
-	adminLogIf(ctx, embedFileInZip(inspectZipW, "start-minio.sh", scrb.Bytes(), 0o755))
+	adminLogIf(ctx, embedFileInZip(inspectZipW, "start-silo.sh", scrb.Bytes(), 0o755))
 }
 
-func getSubnetAdminPublicKey() []byte {
-	if globalIsCICD {
-		return subnetAdminPublicKeyDev
+// addInspectDataKey makes the requester the only recipient of encrypted
+// diagnostic data. Silo has no built-in vendor or support-service recipient.
+func addInspectDataKey(stream *estream.Writer, publicKey *rsa.PublicKey, clusterInfo []byte) error {
+	if err := stream.AddKeyEncrypted(publicKey); err != nil {
+		return err
 	}
-	return subnetAdminPublicKey
+	if len(clusterInfo) == 0 {
+		return nil
+	}
+	w, err := stream.AddEncryptedStream("cluster.info", nil)
+	if err != nil {
+		return err
+	}
+	if _, err = w.Write(clusterInfo); err != nil {
+		_ = w.Close()
+		return err
+	}
+	return w.Close()
 }
 
 func createHostAnonymizerForFSMode() map[string]string {

@@ -31,7 +31,7 @@ import (
 )
 
 func defaultFilenameFunc() string {
-	return fmt.Sprintf("minio-%s.log", fmt.Sprintf("%X", time.Now().UTC().UnixNano()))
+	return fmt.Sprintf("silo-%s.log", fmt.Sprintf("%X", time.Now().UTC().UnixNano()))
 }
 
 // Options define configuration options for Writer

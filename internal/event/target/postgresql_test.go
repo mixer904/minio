@@ -50,3 +50,25 @@ func TestPsqlTableNameValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestQuoteConnParam(t *testing.T) {
+	testCases := []struct {
+		value    string
+		expected string
+	}{
+		{"localhost", "'localhost'"},
+		{"5432", "'5432'"},
+		// The reason this function exists: parameters are whitespace
+		// separated, so an unquoted space starts a new keyword.
+		{"pass word", "'pass word'"},
+		{"it's", `'it\'s'`},
+		{`back\slash`, `'back\\slash'`},
+		{`'; host=evil.example.com; x='`, `'\'; host=evil.example.com; x=\''`},
+		{"", "''"},
+	}
+	for _, testCase := range testCases {
+		if got := quoteConnParam(testCase.value); got != testCase.expected {
+			t.Errorf("quoteConnParam(%q) = %s, expected %s", testCase.value, got, testCase.expected)
+		}
+	}
+}

@@ -64,7 +64,7 @@ func prepareAdminErasureTestBed(ctx context.Context) (*adminErasureTestBed, erro
 		return nil, xlErr
 	}
 
-	// Initialize minio server config.
+	// Initialize Silo server config.
 	if err := newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		cancel()
 		return nil, err

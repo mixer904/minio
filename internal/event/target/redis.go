@@ -33,7 +33,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // Redis constants
@@ -352,7 +352,7 @@ func NewRedisTarget(id string, args RedisArgs, loggerOnce logger.LogOnce) (*Redi
 			}
 
 			// Must be done after AUTH
-			if _, err = conn.Do("CLIENT", "SETNAME", "MinIO"); err != nil {
+			if _, err = conn.Do("CLIENT", "SETNAME", "Silo"); err != nil {
 				conn.Close()
 				return nil, err
 			}

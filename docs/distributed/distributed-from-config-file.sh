@@ -3,9 +3,9 @@
 set -e
 
 cleanup() {
-	echo "Cleaning up instances of MinIO"
-	pkill minio || true
-	pkill -9 minio || true
+	echo "Cleaning up instances of Silo"
+	pkill silo || true
+	pkill -9 silo || true
 	rm -rf /tmp/xl/ || true
 	rm -rf /tmp/minio.configfile.{1,2,3,4} || true
 }
@@ -28,8 +28,7 @@ if [ ! -f ./mc ]; then
 		;;
 	esac
 
-	wget -O mc https://dl.minio.io/client/mc/release/${os,,}-${arch,,}/mc &&
-		chmod +x mc
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 fi
 
 for i in $(seq 1 4); do
@@ -55,29 +54,29 @@ pools: # Specify the nodes and drives with pools
 EOF
 done
 
-minio server --config /tmp/minio.configfile.1 >/tmp/minio1_1.log 2>&1 &
+silo server --config /tmp/minio.configfile.1 >/tmp/silo1_1.log 2>&1 &
 site1_pid=$!
-minio server --config /tmp/minio.configfile.2 >/tmp/minio2_1.log 2>&1 &
+silo server --config /tmp/minio.configfile.2 >/tmp/silo2_1.log 2>&1 &
 site2_pid=$!
-minio server --config /tmp/minio.configfile.3 >/tmp/minio3_1.log 2>&1 &
+silo server --config /tmp/minio.configfile.3 >/tmp/silo3_1.log 2>&1 &
 site3_pid=$!
-minio server --config /tmp/minio.configfile.4 >/tmp/minio4_1.log 2>&1 &
+silo server --config /tmp/minio.configfile.4 >/tmp/silo4_1.log 2>&1 &
 site4_pid=$!
 
-export MC_HOST_minio1=http://minr0otUS2r:pBU94AGAY85e@localhost:9001
-export MC_HOST_minio3=http://minr0otUS2r:pBU94AGAY85e@localhost:9003
+export MC_HOST_silo1=http://minr0otUS2r:pBU94AGAY85e@localhost:9001
+export MC_HOST_silo3=http://minr0otUS2r:pBU94AGAY85e@localhost:9003
 
-./mc ready minio1
-./mc ready minio3
+./mc ready silo1
+./mc ready silo3
 
-./mc mb minio1/testbucket
-# copy large upload to newbucket on minio1
+./mc mb silo1/testbucket
+# copy large upload to newbucket on silo1
 truncate -s 17M lrgfile
 expected_checksum=$(cat ./lrgfile | md5sum)
 
-./mc cp ./lrgfile minio1/testbucket
+./mc cp ./lrgfile silo1/testbucket
 
-actual_checksum=$(./mc cat minio3/testbucket/lrgfile | md5sum)
+actual_checksum=$(./mc cat silo3/testbucket/lrgfile | md5sum)
 
 if [ "${expected_checksum}" != "${actual_checksum}" ]; then
 	echo "unexpected object checksum, expected: ${expected_checksum} got: ${actual_checksum}"
@@ -85,7 +84,7 @@ if [ "${expected_checksum}" != "${actual_checksum}" ]; then
 fi
 
 # Compare the difference of the list of disks and their location, with the below expected output
-diff <(./mc admin info minio1 --json | jq -r '.info.servers[].drives[] | "\(.pool_index),\(.set_index),\(.disk_index) \(.endpoint)"' | sort) <(
+diff <(./mc admin info silo1 --json | jq -r '.info.servers[].drives[] | "\(.pool_index),\(.set_index),\(.disk_index) \(.endpoint)"' | sort) <(
 	cat <<EOF
 0,0,0 http://localhost:9001/tmp/xl/node9001/mnt/disk1
 0,0,1 http://localhost:9002/tmp/xl/node9002/mnt/disk1

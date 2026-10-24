@@ -28,8 +28,8 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/mux"
-	xldap "github.com/minio/pkg/v3/ldap"
-	"github.com/minio/pkg/v3/policy"
+	xldap "github.com/pgsty/silo-pkg/v3/ldap"
+	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 // ListLDAPPolicyMappingEntities lists users/groups mapped to given/all policies.
@@ -249,8 +249,10 @@ func (a adminAPIHandlers) AddServiceAccountLDAP(w http.ResponseWriter, r *http.R
 
 		// In case of LDAP/OIDC we need to set `opts.claims` to ensure
 		// it is associated with the LDAP/OIDC user properly.
+		// The new credential's policy comes from the request, not the caller.
 		for k, v := range cred.Claims {
-			if k == expClaim {
+			switch k {
+			case expClaim, policy.SessionPolicyName, sessionPolicyNameExtracted, iamPolicyClaimNameSA():
 				continue
 			}
 			opts.claims[k] = v

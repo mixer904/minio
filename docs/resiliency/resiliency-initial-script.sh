@@ -4,11 +4,11 @@
 
 echo "script failed" >resiliency-initial.log # assume initial state
 
-echo "sleep to wait for MinIO Server to be ready prior mc commands"
+echo "sleep to wait for Silo Server to be ready prior mc commands"
 # https://github.com/minio/mc/issues/3599
 
 MINIO_SERVER_URL="http://127.0.0.1:9000"
-ALIAS_NAME=myminio
+ALIAS_NAME=mysilo
 BUCKET="test-bucket"
 SRC_DIR="/tmp/data"
 INLINED_DIR="/tmp/inlined"

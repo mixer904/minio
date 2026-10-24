@@ -28,20 +28,17 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/minio/minio/internal/auth"
-	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v3/policy"
+	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 // Verify if request has JWT.
@@ -343,15 +340,24 @@ func checkRequestAuthType(ctx context.Context, r *http.Request, action policy.Ac
 	return s3Err
 }
 
-// checkRequestAuthTypeWithVID is similar to checkRequestAuthType
-// passes versionID additionally.
-func checkRequestAuthTypeWithVID(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName, versionID string) (s3Err APIErrorCode) {
+func checkRequestAuthTypeWithExistingTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName, existingTags string) (s3Err APIErrorCode) {
 	logger.GetReqInfo(ctx).BucketName = bucketName
 	logger.GetReqInfo(ctx).ObjectName = objectName
-	logger.GetReqInfo(ctx).VersionID = versionID
 
-	_, _, s3Err = checkRequestAuthTypeCredential(ctx, r, action)
-	return s3Err
+	if s3Err = authenticateRequest(ctx, r, action); s3Err != ErrNone {
+		return s3Err
+	}
+	return authorizeRequestWithExistingTags(ctx, r, action, existingTags)
+}
+
+func checkRequestAuthTypeWithRequestTags(ctx context.Context, r *http.Request, action policy.Action, bucketName, objectName string, requestTags *string) (s3Err APIErrorCode) {
+	logger.GetReqInfo(ctx).BucketName = bucketName
+	logger.GetReqInfo(ctx).ObjectName = objectName
+
+	if s3Err = authenticateRequest(ctx, r, action); s3Err != ErrNone {
+		return s3Err
+	}
+	return authorizeRequestWithTags(ctx, r, action, "", requestTags)
 }
 
 func authenticateRequest(ctx context.Context, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
@@ -416,6 +422,31 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 }
 
 func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
+	return authorizeRequestWithExistingTags(ctx, r, action, "")
+}
+
+func deleteObjectAction(versionID string) policy.Action {
+	if versionID != "" {
+		return policy.DeleteObjectVersionAction
+	}
+	return policy.DeleteObjectAction
+}
+
+func actionUsesObjectVersion(action policy.Action) bool {
+	switch action {
+	case policy.DeleteObjectAction, policy.DeleteObjectVersionAction,
+		policy.ReplicateDeleteAction, policy.BypassGovernanceRetentionAction:
+		return true
+	default:
+		return false
+	}
+}
+
+func authorizeRequestWithExistingTags(ctx context.Context, r *http.Request, action policy.Action, existingTags string) (s3Err APIErrorCode) {
+	return authorizeRequestWithTags(ctx, r, action, existingTags, nil)
+}
+
+func authorizeRequestWithTags(ctx context.Context, r *http.Request, action policy.Action, existingTags string, requestTags *string) (s3Err APIErrorCode) {
 	reqInfo := logger.GetReqInfo(ctx)
 	if reqInfo == nil {
 		return ErrAccessDenied
@@ -427,6 +458,19 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 	bucket := reqInfo.BucketName
 	object := reqInfo.ObjectName
 	versionID := reqInfo.VersionID
+	conditionValuesForAuth := func(locationConstraint string, credentials auth.Credentials) map[string][]string {
+		values := getConditionValuesWithTags(r, locationConstraint, credentials, existingTags, requestTags)
+		if actionUsesObjectVersion(action) {
+			// DeleteObjects carries the effective version ID in each XML object,
+			// not in the request query. Keep authorization scoped to that entry.
+			if versionID == "" {
+				delete(values, "versionid")
+			} else {
+				values["versionid"] = []string{versionID}
+			}
+		}
+		return values
+	}
 
 	if action != policy.ListAllMyBucketsAction && cred.AccessKey == "" {
 		// Anonymous checks are not meant for ListAllBuckets action
@@ -435,7 +479,7 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 			Groups:          cred.Groups,
 			Action:          action,
 			BucketName:      bucket,
-			ConditionValues: getConditionValues(r, region, auth.AnonymousCredentials),
+			ConditionValues: conditionValuesForAuth(region, auth.AnonymousCredentials),
 			IsOwner:         false,
 			ObjectName:      object,
 		}) {
@@ -451,7 +495,7 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 				Groups:          cred.Groups,
 				Action:          policy.ListBucketAction,
 				BucketName:      bucket,
-				ConditionValues: getConditionValues(r, region, auth.AnonymousCredentials),
+				ConditionValues: conditionValuesForAuth(region, auth.AnonymousCredentials),
 				IsOwner:         false,
 				ObjectName:      object,
 			}) {
@@ -462,27 +506,12 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 
 		return ErrAccessDenied
 	}
-	if action == policy.DeleteObjectAction && versionID != "" {
-		if !globalIAMSys.IsAllowed(policy.Args{
-			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
-			Action:          policy.Action(policy.DeleteObjectVersionAction),
-			BucketName:      bucket,
-			ConditionValues: getConditionValues(r, "", cred),
-			ObjectName:      object,
-			IsOwner:         owner,
-			Claims:          cred.Claims,
-			DenyOnly:        true,
-		}) { // Request is not allowed if Deny action on DeleteObjectVersionAction
-			return ErrAccessDenied
-		}
-	}
 	if globalIAMSys.IsAllowed(policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          action,
 		BucketName:      bucket,
-		ConditionValues: getConditionValues(r, "", cred),
+		ConditionValues: conditionValuesForAuth("", cred),
 		ObjectName:      object,
 		IsOwner:         owner,
 		Claims:          cred.Claims,
@@ -499,7 +528,7 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 			Groups:          cred.Groups,
 			Action:          policy.ListBucketAction,
 			BucketName:      bucket,
-			ConditionValues: getConditionValues(r, "", cred),
+			ConditionValues: conditionValuesForAuth("", cred),
 			ObjectName:      object,
 			IsOwner:         owner,
 			Claims:          cred.Claims,
@@ -510,6 +539,40 @@ func authorizeRequest(ctx context.Context, r *http.Request, action policy.Action
 	}
 
 	return ErrAccessDenied
+}
+
+// authorizeReplicationDelete preserves the established target-credential
+// contract for trusted replication: DeleteObject and ReplicateDelete must be
+// allowed, while an explicit DeleteObjectVersion deny still blocks a named
+// version. Ordinary S3 requests never use this compatibility path.
+func authorizeReplicationDelete(ctx context.Context, r *http.Request) APIErrorCode {
+	if s3Err := authorizeRequest(ctx, r, policy.DeleteObjectAction); s3Err != ErrNone {
+		return s3Err
+	}
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	if reqInfo.VersionID == "" {
+		return ErrNone
+	}
+	cred := reqInfo.Cred
+	values := getConditionValuesWithTags(r, "", cred, "", nil)
+	values["versionid"] = []string{reqInfo.VersionID}
+	if !globalIAMSys.IsAllowed(policy.Args{
+		AccountName:     cred.AccessKey,
+		Groups:          cred.Groups,
+		Action:          policy.DeleteObjectVersionAction,
+		BucketName:      reqInfo.BucketName,
+		ConditionValues: values,
+		ObjectName:      reqInfo.ObjectName,
+		IsOwner:         reqInfo.Owner,
+		Claims:          cred.Claims,
+		DenyOnly:        true,
+	}) {
+		return ErrAccessDenied
+	}
+	return ErrNone
 }
 
 // Check request auth type verifies the incoming http request
@@ -566,18 +629,11 @@ func isReqAuthenticated(ctx context.Context, r *http.Request, region string, sty
 		return ErrInvalidDigest
 	}
 
-	// Extract either 'X-Amz-Content-Sha256' header or 'X-Amz-Content-Sha256' query parameter (if V4 presigned)
-	// Do not verify 'X-Amz-Content-Sha256' if skipSHA256.
+	// Honor the selected header/query checksum, including the header fallback
+	// for a presigned request. STS separately hashes its body for its signature.
 	var contentSHA256 []byte
-	if skipSHA256 := skipContentSha256Cksum(r); !skipSHA256 && isRequestPresignedSignatureV4(r) {
-		if sha256Sum, ok := r.Form[xhttp.AmzContentSha256]; ok && len(sha256Sum) > 0 {
-			contentSHA256, err = hex.DecodeString(sha256Sum[0])
-			if err != nil {
-				return ErrContentSHA256Mismatch
-			}
-		}
-	} else if _, ok := r.Header[xhttp.AmzContentSha256]; !skipSHA256 && ok {
-		contentSHA256, err = hex.DecodeString(r.Header.Get(xhttp.AmzContentSha256))
+	if !skipContentSha256Cksum(r) {
+		contentSHA256, err = hex.DecodeString(getContentSha256Cksum(r, serviceS3))
 		if err != nil || len(contentSHA256) == 0 {
 			return ErrContentSHA256Mismatch
 		}
@@ -674,52 +730,14 @@ func setAuthMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-func isPutRetentionAllowed(bucketName, objectName string, retDays int, retDate time.Time, retMode objectlock.RetMode, byPassSet bool, r *http.Request, cred auth.Credentials, owner bool) (s3Err APIErrorCode) {
-	var retSet bool
-	if cred.AccessKey == "" {
-		return ErrAccessDenied
-	}
-
-	conditions := getConditionValues(r, "", cred)
-	conditions["object-lock-mode"] = []string{string(retMode)}
-	conditions["object-lock-retain-until-date"] = []string{retDate.UTC().Format(time.RFC3339)}
-	if retDays > 0 {
-		conditions["object-lock-remaining-retention-days"] = []string{strconv.Itoa(retDays)}
-	}
-	if retMode == objectlock.RetGovernance && byPassSet {
-		byPassSet = globalIAMSys.IsAllowed(policy.Args{
-			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
-			Action:          policy.BypassGovernanceRetentionAction,
-			BucketName:      bucketName,
-			ObjectName:      objectName,
-			ConditionValues: conditions,
-			IsOwner:         owner,
-			Claims:          cred.Claims,
-		})
-	}
-	if globalIAMSys.IsAllowed(policy.Args{
-		AccountName:     cred.AccessKey,
-		Groups:          cred.Groups,
-		Action:          policy.PutObjectRetentionAction,
-		BucketName:      bucketName,
-		ConditionValues: conditions,
-		ObjectName:      objectName,
-		IsOwner:         owner,
-		Claims:          cred.Claims,
-	}) {
-		retSet = true
-	}
-	if byPassSet || retSet {
-		return ErrNone
-	}
-	return ErrAccessDenied
-}
-
 // isPutActionAllowed - check if PUT operation is allowed on the resource, this
 // call verifies bucket policies and IAM policies, supports multi user
 // checks etc.
 func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectName string, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
+	return isPutActionAllowedWithRequestTags(ctx, atype, bucketName, objectName, r, action, nil)
+}
+
+func isPutActionAllowedWithRequestTags(ctx context.Context, atype authType, bucketName, objectName string, r *http.Request, action policy.Action, requestTags *string) (s3Err APIErrorCode) {
 	var cred auth.Credentials
 	var owner bool
 	region := globalSite.Region()
@@ -741,10 +759,20 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 		return s3Err
 	}
 
-	logger.GetReqInfo(ctx).Cred = cred
-	logger.GetReqInfo(ctx).Owner = owner
-	logger.GetReqInfo(ctx).Region = region
+	reqInfo := logger.GetReqInfo(ctx)
+	if reqInfo == nil {
+		return ErrAccessDenied
+	}
+	reqInfo.Lock()
+	reqInfo.Cred = cred
+	reqInfo.Owner = owner
+	reqInfo.Region = region
+	reqInfo.Unlock()
 
+	return isPutActionAllowedWithCred(bucketName, objectName, r, action, requestTags, cred, owner)
+}
+
+func isPutActionAllowedWithCred(bucketName, objectName string, r *http.Request, action policy.Action, requestTags *string, cred auth.Credentials, owner bool) APIErrorCode {
 	// Do not check for PutObjectRetentionAction permission,
 	// if mode and retain until date are not set.
 	// Can happen when bucket has default lock config set
@@ -760,7 +788,7 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 			Groups:          cred.Groups,
 			Action:          action,
 			BucketName:      bucketName,
-			ConditionValues: getConditionValues(r, "", auth.AnonymousCredentials),
+			ConditionValues: getConditionValuesWithTags(r, "", auth.AnonymousCredentials, "", requestTags),
 			IsOwner:         false,
 			ObjectName:      objectName,
 		}) {
@@ -774,7 +802,7 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 		Groups:          cred.Groups,
 		Action:          action,
 		BucketName:      bucketName,
-		ConditionValues: getConditionValues(r, "", cred),
+		ConditionValues: getConditionValuesWithTags(r, "", cred, "", requestTags),
 		ObjectName:      objectName,
 		IsOwner:         owner,
 		Claims:          cred.Claims,

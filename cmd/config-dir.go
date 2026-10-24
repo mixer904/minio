@@ -20,13 +20,16 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"sync"
 
 	homedir "github.com/mitchellh/go-homedir"
 )
 
 const (
-	// Default minio configuration directory where below configuration files/directories are stored.
-	defaultMinioConfigDir = ".minio"
+	// New installations use the Silo-branded directory. The legacy directory is
+	// still selected when it is the only existing choice.
+	defaultSiloConfigDir = ".silo"
+	legacyMinioConfigDir = ".minio"
 
 	// Directory contains below files/directories for HTTPS configuration.
 	certsDir = "certs"
@@ -41,33 +44,56 @@ const (
 	privateKeyFile = "private.key"
 )
 
+type defaultConfigDirState uint8
+
+const (
+	defaultConfigDirNew defaultConfigDirState = iota
+	defaultConfigDirLegacy
+	defaultConfigDirAmbiguous
+)
+
 // ConfigDir - points to a user set directory.
 type ConfigDir struct {
 	path string
 }
 
-func getDefaultConfigDir() string {
+func selectDefaultConfigDir(homeDir string) (string, defaultConfigDirState) {
+	siloDir := filepath.Join(homeDir, defaultSiloConfigDir)
+	minioDir := filepath.Join(homeDir, legacyMinioConfigDir)
+	_, siloErr := os.Stat(siloDir)
+	_, minioErr := os.Stat(minioDir)
+
+	siloExists := siloErr == nil || !os.IsNotExist(siloErr)
+	minioExists := minioErr == nil || !os.IsNotExist(minioErr)
+	switch {
+	case siloExists && minioExists:
+		return siloDir, defaultConfigDirAmbiguous
+	case siloExists:
+		return siloDir, defaultConfigDirNew
+	case minioExists:
+		return minioDir, defaultConfigDirLegacy
+	default:
+		return siloDir, defaultConfigDirNew
+	}
+}
+
+func getDefaultConfigDir() (string, defaultConfigDirState) {
 	homeDir, err := homedir.Dir()
 	if err != nil {
-		return ""
+		return "", defaultConfigDirNew
 	}
 
-	return filepath.Join(homeDir, defaultMinioConfigDir)
-}
-
-func getDefaultCertsDir() string {
-	return filepath.Join(getDefaultConfigDir(), certsDir)
-}
-
-func getDefaultCertsCADir() string {
-	return filepath.Join(getDefaultCertsDir(), certsCADir)
+	return selectDefaultConfigDir(homeDir)
 }
 
 var (
+	defaultConfigDirPath, defaultConfigDirSelection = getDefaultConfigDir()
+	defaultConfigDirWarningOnce                     sync.Once
+
 	// Default config, certs and CA directories.
-	defaultConfigDir  = &ConfigDir{path: getDefaultConfigDir()}
-	defaultCertsDir   = &ConfigDir{path: getDefaultCertsDir()}
-	defaultCertsCADir = &ConfigDir{path: getDefaultCertsCADir()}
+	defaultConfigDir  = &ConfigDir{path: defaultConfigDirPath}
+	defaultCertsDir   = &ConfigDir{path: filepath.Join(defaultConfigDirPath, certsDir)}
+	defaultCertsCADir = &ConfigDir{path: filepath.Join(defaultConfigDirPath, certsDir, certsCADir)}
 
 	// Points to current configuration directory -- deprecated, to be removed in future.
 	globalConfigDir = defaultConfigDir

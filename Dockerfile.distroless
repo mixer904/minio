@@ -1,0 +1,50 @@
+# The distroless variant ships exactly one program: the silo binary.
+# No shell, no mc, no curl, no entrypoint script; health checking is
+# provided by the binary itself (`silo healthcheck`).
+# Design note: https://silo.pgsty.com/compatibility/feature/healthcheck/
+
+# A distroless final stage cannot RUN anything, so /data is prepared in a
+# throwaway stage. It ships world-writable (see pgsty/silo#55): Docker
+# seeds fresh volumes from the image-layer mountpoint, no entrypoint
+# exists to repair ownership at runtime, and 0777 is what keeps every
+# privilege mode working, --user included.
+FROM busybox:1.37.0 AS prep
+RUN mkdir -p /prep/data && chmod 0777 /prep/data
+
+FROM gcr.io/distroless/static-debian12:latest
+
+LABEL org.opencontainers.image.title="Silo" \
+      org.opencontainers.image.description="S3-Interface Libre Object Storage (distroless)" \
+      org.opencontainers.image.url="https://silo.pgsty.com" \
+      org.opencontainers.image.source="https://github.com/pgsty/silo" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      maintainer="PGSTY <https://silo.pgsty.com>"
+
+ENV MINIO_ACCESS_KEY_FILE=access_key \
+    MINIO_SECRET_KEY_FILE=secret_key \
+    MINIO_ROOT_USER_FILE=access_key \
+    MINIO_ROOT_PASSWORD_FILE=secret_key \
+    MINIO_KMS_SECRET_KEY_FILE=kms_master_key \
+    MINIO_CONFIG_ENV_FILE=config.env \
+    HOME=/tmp
+
+COPY --chmod=0755 silo /usr/bin/silo
+# COPY of a directory copies its contents, not the directory entry, so an
+# empty /prep/data would arrive as a default root:0755 /data and non-root
+# runs would fail storage init. Copying the parent makes data/ itself a
+# copied entry, which --chmod then actually applies to.
+COPY --from=prep --chmod=0777 /prep/ /
+COPY LICENSE NOTICE CREDITS /licenses/
+
+EXPOSE 9000
+VOLUME ["/data"]
+
+# Exec form is mandatory: there is no /bin/sh in this image. `ready`
+# rather than `live` because Docker health feeds start-order gating
+# (readiness semantics); the two are identical unless KMS/etcd are used.
+# The outer timeout stays above the probe's own 5s deadline so the
+# probe can report its diagnostic line instead of being SIGKILLed.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=2m --start-interval=2s --retries=3 \
+  CMD ["/usr/bin/silo", "healthcheck", "ready"]
+
+ENTRYPOINT ["/usr/bin/silo"]

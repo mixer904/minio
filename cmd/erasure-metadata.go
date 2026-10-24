@@ -31,7 +31,7 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/pkg/v3/sync/errgroup"
+	"github.com/pgsty/silo-pkg/v3/sync/errgroup"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
@@ -58,6 +58,14 @@ func (e ErasureInfo) ShardFileSize(totalLength int64) int64 {
 	if totalLength == -1 {
 		return -1
 	}
+	// ErasureInfo can arrive zero-valued from an untrusted internode payload:
+	// CheckParts and VerifyFile hand a wire-supplied FileInfo straight here.
+	// A zero BlockSize would panic with an integer divide-by-zero, and
+	// CheckParts evaluates this inside xioutil.WithDeadline - a bare goroutine
+	// whose panic no recover() can reach, taking the whole process down.
+	if e.BlockSize <= 0 || e.DataBlocks <= 0 {
+		return 0
+	}
 	numShards := totalLength / e.BlockSize
 	lastBlockSize := totalLength % e.BlockSize
 	lastShardSize := ceilFrac(lastBlockSize, int64(e.DataBlocks))
@@ -67,6 +75,26 @@ func (e ErasureInfo) ShardFileSize(totalLength int64) int64 {
 // ShardSize - returns actual shared size from erasure blockSize.
 func (e ErasureInfo) ShardSize() int64 {
 	return ceilFrac(e.BlockSize, int64(e.DataBlocks))
+}
+
+// HasNegativePartSize reports whether any part claims a negative size.
+//
+// Such metadata is never legitimate, and it is not merely cosmetic: a negative
+// length floors both terms of ShardFileSize to zero, and checkPart's only
+// integrity test is "st.Size() < expectedSize". A zero expectation is therefore
+// satisfied by every file that exists, including a truncated shard, so the part
+// is reported intact and a heal driven by the result skips the repair it should
+// have performed.
+//
+// Note this holds even when the erasure parameters are entirely valid, so
+// FileInfo.IsValid() - the check healing itself trusts - does not catch it.
+func (fi FileInfo) HasNegativePartSize() bool {
+	for _, p := range fi.Parts {
+		if p.Size < 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // IsValid - tells if erasure info fields are valid.

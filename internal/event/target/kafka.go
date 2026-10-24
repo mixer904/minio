@@ -35,7 +35,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 
 	"github.com/IBM/sarama"
 	saramatls "github.com/IBM/sarama/tools/tls"
@@ -341,6 +341,8 @@ func (target *KafkaTarget) initKafka() error {
 	args := target.args
 
 	config := sarama.NewConfig()
+	// Preserve SILO's default broker protocol when no version is configured.
+	config.Version = sarama.V2_1_0_0
 	if args.Version != "" {
 		kafkaVersion, err := sarama.ParseKafkaVersion(args.Version)
 		if err != nil {

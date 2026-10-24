@@ -36,12 +36,16 @@ import (
 	"testing"
 	"time"
 
+	goldap "github.com/go-ldap/ldap/v3"
 	"github.com/klauspost/compress/zip"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	cr "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v3/ldap"
+	"github.com/minio/minio-go/v7/pkg/tags"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/pgsty/silo-pkg/v3/ldap"
+	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 func runAllIAMSTSTests(suite *TestSuiteIAM, c *check) {
@@ -419,6 +423,15 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
     },
     {
       "Effect":     "Allow",
+      "Action":     "s3:PutObjectTagging",
+      "Resource":    "arn:aws:s3:::%s/*",
+      "Condition": { "StringEquals": {
+        "s3:ExistingObjectTag/virus": "true",
+        "s3:RequestObjectTag/security": "public"
+      } }
+    },
+    {
+      "Effect":     "Allow",
       "Action":     "s3:DeleteObject",
       "Resource":    "arn:aws:s3:::%s/*"
     },
@@ -431,6 +444,9 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
         "arn:aws:s3:::%s/*"
       ],
       "Condition": {
+        "StringEquals": {
+          "s3:RequestObjectTag/security": "public"
+        },
         "ForAllValues:StringLike": {
           "s3:RequestObjectTagKeys": [
             "security",
@@ -440,7 +456,7 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
       }
     }
   ]
-}`, bucket, bucket, bucket, bucket)
+}`, bucket, bucket, bucket, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -462,8 +478,108 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
 
 	// confirm that the user is able to access the bucket
 	uClient := s.getUserClient(c, accessKey, secretKey, "")
+	queryObject := object + "-query-tags"
+	queryTags := "security=public&virus=true"
+	// Query storage-class values were historically accepted without the strict
+	// header validation. Pin that compatibility while proving they are consumed.
+	presignedPut, err := uClient.Presign(ctx, http.MethodPut, bucket, queryObject, time.Minute, url.Values{
+		"x-amz-storage-class": {"CUSTOM_COMPAT"},
+		"x-amz-tagging":       {queryTags},
+	})
+	if err != nil {
+		c.Fatalf("unable to presign query-tagged upload: %v", err)
+	}
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedPut.String(), bytes.NewReader([]byte("stuff")))
+	if err != nil {
+		c.Fatalf("unable to build query-tagged upload: %v", err)
+	}
+	putResp, err := s.TestSuiteCommon.client.Do(putReq)
+	if err != nil {
+		c.Fatalf("query-tagged upload failed: %v", err)
+	}
+	putBody, readErr := io.ReadAll(putResp.Body)
+	putResp.Body.Close()
+	if readErr != nil {
+		c.Fatalf("unable to read query-tagged upload response: %v", readErr)
+	}
+	if putResp.StatusCode != http.StatusOK {
+		c.Fatalf("query-tagged upload returned %s: %s", putResp.Status, putBody)
+	}
+	storedTags, err := s.client.GetObjectTagging(ctx, bucket, queryObject, minio.GetObjectTaggingOptions{})
+	if err != nil {
+		c.Fatalf("unable to read persisted query tags: %v", err)
+	}
+	if got := storedTags.ToMap(); got["security"] != "public" || got["virus"] != "true" {
+		c.Fatalf("query tags were not persisted: %v", got)
+	}
+	queryObjectInfo, err := s.testServer.Obj.GetObjectInfo(ctx, bucket, queryObject, ObjectOptions{})
+	if err != nil {
+		c.Fatalf("unable to inspect query-tagged object: %v", err)
+	}
+	if queryObjectInfo.StorageClass != "CUSTOM_COMPAT" {
+		c.Fatalf("query storage class was not persisted: %q", queryObjectInfo.StorageClass)
+	}
+	c.mustGetObject(ctx, uClient, bucket, queryObject)
+
+	multipartObject := object + "-multipart-query-tags"
+	presignedMultipart, err := uClient.Presign(ctx, http.MethodPost, bucket, multipartObject, time.Minute, url.Values{
+		"uploads":       {""},
+		"x-amz-tagging": {queryTags},
+	})
+	if err != nil {
+		c.Fatalf("unable to presign query-tagged multipart upload: %v", err)
+	}
+	multipartReq, err := http.NewRequestWithContext(ctx, http.MethodPost, presignedMultipart.String(), nil)
+	if err != nil {
+		c.Fatalf("unable to build query-tagged multipart upload: %v", err)
+	}
+	multipartResp, err := s.TestSuiteCommon.client.Do(multipartReq)
+	if err != nil {
+		c.Fatalf("query-tagged multipart upload failed: %v", err)
+	}
+	multipartBody, readErr := io.ReadAll(multipartResp.Body)
+	multipartResp.Body.Close()
+	if readErr != nil {
+		c.Fatalf("unable to read query-tagged multipart response: %v", readErr)
+	}
+	if multipartResp.StatusCode != http.StatusOK {
+		c.Fatalf("query-tagged multipart upload returned %s: %s", multipartResp.Status, multipartBody)
+	}
+	var multipartResult InitiateMultipartUploadResponse
+	if err = xml.Unmarshal(multipartBody, &multipartResult); err != nil || multipartResult.UploadID == "" {
+		c.Fatalf("invalid query-tagged multipart response: uploadID=%q err=%v", multipartResult.UploadID, err)
+	}
+	if err = (minio.Core{Client: s.client}).AbortMultipartUpload(ctx, bucket, multipartObject, multipartResult.UploadID); err != nil {
+		c.Fatalf("unable to clean up query-tagged multipart upload: %v", err)
+	}
+
 	c.mustPutObjectWithTags(ctx, uClient, bucket, object)
 	c.mustGetObject(ctx, uClient, bucket, object)
+	objectInfo, err := s.client.StatObject(ctx, bucket, object, minio.StatObjectOptions{})
+	if err != nil {
+		c.Fatalf("unable to stat object for conditional GET: %v", err)
+	}
+	presignedGet, err := uClient.PresignedGetObject(ctx, bucket, object, time.Minute, nil)
+	if err != nil {
+		c.Fatalf("unable to presign conditional GET: %v", err)
+	}
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, presignedGet.String(), nil)
+	if err != nil {
+		c.Fatalf("unable to build conditional GET: %v", err)
+	}
+	getReq.Header.Set(xhttp.IfNoneMatch, `"`+objectInfo.ETag+`"`)
+	getResp := httptest.NewRecorder()
+	s.testServer.Server.Config.Handler.ServeHTTP(getResp, getReq)
+	if getResp.Code != http.StatusNotModified || getResp.Body.Len() != 0 {
+		c.Fatalf("conditional GET returned status %d with body %q", getResp.Code, getResp.Body.String())
+	}
+	replacementTags, err := tags.NewTags(map[string]string{"security": "public", "reviewed": "yes"}, true)
+	if err != nil {
+		c.Fatalf("unable to build replacement tags: %v", err)
+	}
+	if err = uClient.PutObjectTagging(ctx, bucket, object, replacementTags, minio.PutObjectTaggingOptions{}); err != nil {
+		c.Fatalf("user is unable to replace object tags: %v", err)
+	}
 
 	assumeRole := cr.STSAssumeRole{
 		Client:      s.TestSuiteCommon.client,
@@ -501,6 +617,9 @@ func (s *TestSuiteIAM) TestSTSWithTags(c *check) {
 
 	if err = minioClient.RemoveObject(ctx, bucket, object, minio.RemoveObjectOptions{}); err != nil {
 		c.Fatalf("user is unable to delete the object: %v", err)
+	}
+	if err = minioClient.RemoveObject(ctx, bucket, queryObject, minio.RemoveObjectOptions{}); err != nil {
+		c.Fatalf("user is unable to delete the query-tagged object: %v", err)
 	}
 }
 
@@ -977,6 +1096,7 @@ func TestIAMWithLDAPServerSuite(t *testing.T) {
 				suite.TestLDAPSTSServiceAccountsWithGroups(c)
 				suite.TestLDAPAttributesLookup(c)
 				suite.TestLDAPCyrillicUser(c)
+				suite.TestLDAPLongNonASCIIDN(c)
 				suite.TestLDAPSlashDN(c)
 				suite.TearDownSuite(c)
 			},
@@ -1948,9 +2068,7 @@ func TestSTSLDAPLoginRateLimiterCleanup(t *testing.T) {
 }
 
 func TestWriteSTSThrottledResponse(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "http://minio.test", strings.NewReader(""))
 	rr := httptest.NewRecorder()
-	req = req.WithContext(newContext(req, rr, "test-throttle"))
 
 	writeSTSThrottledResponse(rr)
 
@@ -2269,8 +2387,10 @@ func (s *TestSuiteIAM) TestIAMImport(c *check, exportedContent []byte, caseNum i
 	if err != nil {
 		c.Fatalf("import %d: Unable to list policies: %v", caseNum, err)
 	}
-	defaultCannedPolicies := set.CreateStringSet("consoleAdmin", "readwrite", "readonly",
-		"diagnostics", "writeonly")
+	defaultCannedPolicies := set.CreateStringSet()
+	for _, p := range policy.DefaultPolicies {
+		defaultCannedPolicies.Add(p.Name)
+	}
 	for policy, policyBytes := range policyContentMap {
 		if defaultCannedPolicies.Contains(policy) {
 			continue
@@ -2876,6 +2996,21 @@ func (s *TestSuiteIAM) TestLDAPSTSServiceAccounts(c *check) {
 	// 6. Check that service account cannot be created for some other user.
 	c.mustNotCreateSvcAccount(ctx, globalActiveCred.AccessKey, userAdmClient)
 
+	// An empty policy must not contaminate an expiring LDAP child credential.
+	emptyPolicyCred, err := userAdmClient.AddServiceAccountLDAP(ctx, madmin.AddServiceAccountReq{Policy: []byte("null")})
+	if err != nil {
+		c.Fatalf("Unable to create empty-policy LDAP service account: %v", err)
+	}
+	emptyPolicyAdmin := s.getAdminClient(c, emptyPolicyCred.AccessKey, emptyPolicyCred.SecretKey, "")
+	expires := UTCNow().Add(time.Hour)
+	for _, childPolicy := range [][]byte{nil, []byte("null")} {
+		child, err := emptyPolicyAdmin.AddServiceAccountLDAP(ctx, madmin.AddServiceAccountReq{Expiration: &expires, Policy: childPolicy})
+		if err != nil {
+			c.Fatalf("Unable to create expiring LDAP child: %v", err)
+		}
+		c.assertSvcAccS3Access(ctx, s, child, bucket)
+	}
+
 	// Detach the policy from the user
 	if _, err = s.adm.DetachPolicyLDAP(ctx, userReq); err != nil {
 		c.Fatalf("Unable to detach user policy: %v", err)
@@ -3155,6 +3290,112 @@ func (s *TestSuiteIAM) TestLDAPCyrillicUser(c *check) {
 
 	if _, err = s.adm.DetachPolicyLDAP(ctx, userReq); err != nil {
 		c.Fatalf("Unable to detach user policy: %v", err)
+	}
+}
+
+// Normalized DNs hex-escape every non-ASCII byte, so a user in nested Cyrillic
+// OUs has a DN longer than NAME_MAX: 160 bytes of UTF-8 become 384 characters.
+// Records named after such a DN can never be stored by the object backend.
+// The user is entitled only through a group, as is typical for AD deployments.
+func (s *TestSuiteIAM) TestLDAPLongNonASCIIDN(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const (
+		username = "Сотрудник"
+		parentOU = "ou=Дирекция информационных технологий,ou=people,ou=swengg,dc=min,dc=io"
+		childOU  = "ou=Отдел разработки," + parentOU
+		userDN   = "uid=" + username + "," + childOU
+		groupDN  = "cn=long-dn-staff,ou=groups,ou=swengg,dc=min,dc=io"
+	)
+	normDN, err := ldap.NormalizeDN(userDN)
+	if err != nil {
+		c.Fatal(err)
+	}
+	if len(normDN) <= 255 {
+		c.Fatalf("normalized test DN must exceed 255 characters, got %d", len(normDN))
+	}
+
+	conn, err := globalIAMSys.LDAPConfig.LDAP.Connect()
+	if err != nil {
+		c.Fatalf("LDAP connect failed: %v", err)
+	}
+	defer conn.Close()
+	if err = conn.Bind("cn=admin,dc=min,dc=io", "admin"); err != nil {
+		c.Fatalf("LDAP admin bind failed: %v", err)
+	}
+	newEntry := func(dn string, attrs map[string]string) *goldap.AddRequest {
+		req := goldap.NewAddRequest(dn, nil)
+		for name, value := range attrs {
+			req.Attribute(name, []string{value})
+		}
+		return req
+	}
+	entries := []*goldap.AddRequest{
+		newEntry(parentOU, map[string]string{"objectClass": "organizationalUnit", "ou": "Дирекция информационных технологий"}),
+		newEntry(childOU, map[string]string{"objectClass": "organizationalUnit", "ou": "Отдел разработки"}),
+		newEntry(userDN, map[string]string{"objectClass": "inetOrgPerson", "uid": username, "cn": username, "sn": username, "userPassword": "example"}),
+		newEntry(groupDN, map[string]string{"objectClass": "groupOfNames", "cn": "long-dn-staff", "member": userDN}),
+	}
+	removeEntries := func() {
+		for i := len(entries) - 1; i >= 0; i-- {
+			err := conn.Del(goldap.NewDelRequest(entries[i].DN, nil))
+			if err != nil && !goldap.IsErrorWithCode(err, goldap.LDAPResultNoSuchObject) {
+				c.Errorf("Unable to remove LDAP entry %s: %v", entries[i].DN, err)
+			}
+		}
+	}
+	removeEntries() // left over from an interrupted run
+	defer removeEntries()
+	for _, entry := range entries {
+		if err = conn.Add(entry); err != nil {
+			c.Fatalf("Unable to add LDAP entry %s: %v", entry.DN, err)
+		}
+	}
+
+	groupReq := madmin.PolicyAssociationReq{
+		Policies: []string{"readwrite"},
+		Group:    groupDN,
+	}
+	if _, err = s.adm.AttachPolicyLDAP(ctx, groupReq); err != nil {
+		c.Fatalf("Unable to attach group policy: %v", err)
+	}
+	defer func() {
+		if _, err := s.adm.DetachPolicyLDAP(ctx, groupReq); err != nil {
+			c.Errorf("Unable to detach group policy: %v", err)
+		}
+	}()
+
+	bucket := getRandomBucketName()
+	if err = s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+		c.Fatalf("bucket create error: %v", err)
+	}
+
+	ldapID := cr.LDAPIdentity{
+		Client:       s.TestSuiteCommon.client,
+		STSEndpoint:  s.endPoint,
+		LDAPUsername: username,
+		LDAPPassword: "example",
+	}
+	value, err := ldapID.Retrieve()
+	if err != nil {
+		c.Fatalf("Expected to generate STS creds, got err: %#v", err)
+	}
+	u, ok := globalIAMSys.GetUser(ctx, value.AccessKeyID)
+	if !ok {
+		c.Fatalf("Expected to find user %s", value.AccessKeyID)
+	}
+	if u.Credentials.ParentUser != normDN {
+		c.Fatalf("unexpected parent user: %s", u.Credentials.ParentUser)
+	}
+	c.mustListObjects(ctx, s.getUserClient(c, value.AccessKeyID, value.SecretAccessKey, value.SessionToken), bucket)
+
+	// An access key created by this user inherits the same parent.
+	userAdmClient := s.getAdminClient(c, value.AccessKeyID, value.SecretAccessKey, value.SessionToken)
+	svc := c.mustCreateSvcAccount(ctx, value.AccessKeyID, userAdmClient)
+	c.assertSvcAccS3Access(ctx, s, svc, bucket)
+	if err = s.adm.DeleteServiceAccount(ctx, svc.AccessKey); err != nil {
+		c.Fatalf("Unable to delete service account: %v", err)
 	}
 }
 

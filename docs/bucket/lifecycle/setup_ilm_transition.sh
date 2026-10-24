@@ -16,9 +16,9 @@ catch() {
 		done
 	fi
 
-	echo "Cleaning up instances of MinIO"
-	pkill minio
-	pkill -9 minio
+	echo "Cleaning up instances of Silo"
+	pkill silo
+	pkill -9 silo
 	rm -rf /tmp/multisitea
 	rm -rf /tmp/multisiteb
 	if [ $# -ne 0 ]; then
@@ -39,21 +39,20 @@ unset MINIO_KMS_KES_ENDPOINT
 unset MINIO_KMS_KES_KEY_NAME
 
 if [ ! -f ./mc ]; then
-	wget --quiet -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
-		chmod +x mc
+	"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" ./mc
 fi
 
-minio server --address 127.0.0.1:9001 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9001 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_1.log 2>&1 &
-minio server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9002 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_2.log 2>&1 &
 
-minio server --address 127.0.0.1:9003 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9003 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/multisiteb/data/disterasure/xl{5...8}" >/tmp/siteb_1.log 2>&1 &
-minio server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
+silo server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/multisiteb/data/disterasure/xl{5...8}" >/tmp/siteb_2.log 2>&1 &
 
-# Wait to make sure all MinIO instances are up
+# Wait to make sure all Silo instances are up
 
 export MC_HOST_sitea=http://minioadmin:minioadmin@127.0.0.1:9001
 export MC_HOST_siteb=http://minioadmin:minioadmin@127.0.0.1:9004

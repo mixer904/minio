@@ -1,0 +1,111 @@
+name: silo
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: none
+release: ${NFPM_RELEASE}
+section: utils
+priority: optional
+maintainer: "Ruohang Feng (@Vonng) <rh@vonng.com>"
+description: S3-Interface Libre Object Storage, a community-maintained S3-compatible server.
+vendor: PGSTY
+homepage: https://silo.pgsty.com
+license: AGPL-3.0-or-later
+
+contents:
+  - src: ${NFPM_SOURCE}
+    dst: /usr/bin/silo
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ${NFPM_UNIT}
+    dst: /usr/lib/systemd/system/silo.service
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_DEFAULTS}
+    dst: /etc/default/silo
+    type: config|noreplace
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_SYSUSERS}
+    dst: /usr/lib/sysusers.d/silo.conf
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  # The license materials are declared once per packager: nfpm only honors
+  # type: license on rpm and silently drops such entries from deb and apk, so
+  # the rpm keeps its %license flag while deb and apk carry plain files at the
+  # same path.
+  - src: ${NFPM_LICENSE}
+    dst: /usr/share/doc/silo/LICENSE
+    type: license
+    packager: rpm
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_NOTICE}
+    dst: /usr/share/doc/silo/NOTICE
+    type: license
+    packager: rpm
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_LICENSE}
+    dst: /usr/share/doc/silo/LICENSE
+    packager: deb
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_NOTICE}
+    dst: /usr/share/doc/silo/NOTICE
+    packager: deb
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_LICENSE}
+    dst: /usr/share/doc/silo/LICENSE
+    packager: apk
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${NFPM_NOTICE}
+    dst: /usr/share/doc/silo/NOTICE
+    packager: apk
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+scripts:
+  postinstall: buildscripts/package/postinstall.sh
+  preremove: buildscripts/package/preremove.sh
+
+rpm:
+  group: Applications/File
+  compression: gzip:9
+
+deb:
+  compression: gzip
+  fields:
+    License: AGPL-3.0-or-later

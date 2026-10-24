@@ -21,7 +21,7 @@
       }
     ]
   },
-  "description": "MinIO Grafana Dashboard - https://min.io/",
+  "description": "Silo Grafana Dashboard - https://silo.pgsty.com/",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "gnetId": 13502,
@@ -2352,7 +2352,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Total number of bytes received and sent on MinIO cluster",
+      "description": "Total number of bytes received and sent on Silo cluster",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2596,7 +2596,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Number of online drives per MinIO Server",
+      "description": "Number of online drives per Silo Server",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3861,7 +3861,7 @@
     ]
   },
   "timezone": "",
-  "title": "MinIO Dashboard",
+  "title": "Silo Dashboard",
   "uid": "TgmJnqnnk",
   "version": 1,
   "weekStart": ""

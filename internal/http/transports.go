@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/minio/pkg/v3/certs"
+	"github.com/pgsty/silo-pkg/v3/certs"
 )
 
 // tlsClientSessionCacheSize is the cache size for client sessions.
@@ -46,9 +46,8 @@ type ConnSettings struct {
 	DialTimeout time.Duration
 
 	// TLS Settings
-	RootCAs          *x509.CertPool
-	CipherSuites     []uint16
-	CurvePreferences []tls.CurveID
+	RootCAs      *x509.CertPool
+	CipherSuites []uint16
 
 	// HTTP2
 	EnableHTTP2 bool
@@ -70,7 +69,6 @@ func (s ConnSettings) getDefaultTransport(maxIdleConnsPerHost int) *http.Transpo
 	tlsClientConfig := tls.Config{
 		RootCAs:            s.RootCAs,
 		CipherSuites:       s.CipherSuites,
-		CurvePreferences:   s.CurvePreferences,
 		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}
 

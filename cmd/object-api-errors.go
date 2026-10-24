@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // Converts underlying storage error. Convenience function written to
@@ -161,7 +162,7 @@ func toObjectErr(oerr error, params ...string) error {
 			apiErr.Type = v.Type
 		}
 		return apiErr
-	case errErasureWriteQuorum.Error():
+	case errErasureWriteQuorum.Error(), errCommitMetaMissing.Error():
 		apiErr := InsufficientWriteQuorum{}
 		if len(params) >= 1 {
 			apiErr.Bucket = params[0]
@@ -653,6 +654,41 @@ func (e InvalidPart) Error() string {
 		e.PartNumber, e.ExpETag, e.GotETag)
 }
 
+var (
+	errCompleteMultipartChecksumMismatch     = errors.New("complete multipart checksum mismatch")
+	errCompleteMultipartChecksumTypeMismatch = errors.New("complete multipart checksum type mismatch")
+	errMissingPartChecksum                   = errors.New("missing multipart part checksum")
+)
+
+// completeMultipartChecksumMismatch reports an object checksum mismatch
+// detected while completing a multipart upload. It is distinct from
+// hash.ChecksumMismatch because AWS maps completion failures to BadDigest,
+// while streaming PutObject and UploadPart failures keep using
+// XAmzContentChecksumMismatch.
+func completeMultipartChecksumMismatch(algorithm string) error {
+	description := "The checksum you specified did not match the calculated checksum."
+	if algorithm != "" {
+		description = fmt.Sprintf("The %s you specified did not match the calculated checksum.", algorithm)
+	}
+	return fmt.Errorf("%w: %s", errCompleteMultipartChecksumMismatch, description)
+}
+
+// completeMultipartChecksumTypeMismatch reports an explicit checksum type that
+// differs from the type selected when the multipart upload was initiated.
+func completeMultipartChecksumTypeMismatch(providedType, expectedType string) error {
+	description := fmt.Sprintf("The checksum type %s does not match the multipart upload checksum type %s.",
+		providedType, expectedType)
+	return fmt.Errorf("%w: %s", errCompleteMultipartChecksumTypeMismatch, description)
+}
+
+// missingPartChecksum reports a part whose checksum is absent from a
+// composite CompleteMultipartUpload request.
+func missingPartChecksum(algorithm string, partNumber int) error {
+	description := fmt.Sprintf("The upload was created using a %s checksum. The complete request must include the checksum for each part. It was missing for part %d in the request.",
+		strings.ToLower(algorithm), partNumber)
+	return fmt.Errorf("%w: %s", errMissingPartChecksum, description)
+}
+
 // PartTooSmall - error if part size is less than 5MB.
 type PartTooSmall struct {
 	PartSize   int64
@@ -798,10 +834,21 @@ func (de DataMovementOverwriteErr) Error() string {
 	if de.VersionID != "" {
 		objInfoStr = fmt.Sprintf("%s version-id=%s", objInfoStr, de.VersionID)
 	}
+	if de.Err == errDataMovementSuperseded {
+		return fmt.Sprintf("data movement skipped, another pool holds a newer copy of %s", objInfoStr)
+	}
 	return fmt.Sprintf("invalid data movement operation, source and destination pool are the same for %s", objInfoStr)
 }
 
 func isDataMovementOverWriteErr(err error) bool {
 	var de DataMovementOverwriteErr
 	return errors.As(err, &de)
+}
+
+// isDataMovementSuperseded reports a version that was not moved because
+// another pool already holds a newer copy, which reads return. The source copy
+// is a stale duplicate: the move is complete, and the source may be removed.
+func isDataMovementSuperseded(err error) bool {
+	var de DataMovementOverwriteErr
+	return errors.As(err, &de) && de.Err == errDataMovementSuperseded
 }

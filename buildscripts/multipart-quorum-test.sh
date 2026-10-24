@@ -5,16 +5,16 @@ if [ -n "$TEST_DEBUG" ]; then
 fi
 
 WORK_DIR="$PWD/.verify-$RANDOM"
-MINIO_CONFIG_DIR="$WORK_DIR/.minio"
-MINIO=("$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" server)
+SILO_CONFIG_DIR="$WORK_DIR/.silo"
+SILO=("$PWD/silo" --config-dir "$SILO_CONFIG_DIR" server)
 
-if [ ! -x "$PWD/minio" ]; then
-	echo "minio executable binary not found in current directory"
+if [ ! -x "$PWD/silo" ]; then
+	echo "Silo executable binary not found in current directory"
 	exit 1
 fi
 
-if [ ! -x "$PWD/minio" ]; then
-	echo "minio executable binary not found in current directory"
+if [ ! -x "$PWD/silo" ]; then
+	echo "Silo executable binary not found in current directory"
 	exit 1
 fi
 
@@ -30,9 +30,9 @@ catch() {
 		echo "error on line $1"
 	fi
 
-	echo "Cleaning up instances of MinIO"
-	pkill minio || true
-	pkill -9 minio || true
+	echo "Cleaning up instances of Silo"
+	pkill silo || true
+	pkill -9 silo || true
 	purge "$WORK_DIR"
 	if [ $# -ne 0 ]; then
 		exit $#
@@ -41,32 +41,21 @@ catch() {
 
 catch
 
-function start_minio_10drive() {
+function start_silo_10drive() {
 	start_port=$1
 
-	export MINIO_ROOT_USER=minio
-	export MINIO_ROOT_PASSWORD=minio123
-	export MC_HOST_minio="http://minio:minio123@127.0.0.1:${start_port}/"
+	export MINIO_ROOT_USER=silo
+	export MINIO_ROOT_PASSWORD=silo1234
+	export MC_HOST_silo="http://silo:silo1234@127.0.0.1:${start_port}/"
 	unset MINIO_KMS_AUTO_ENCRYPTION # do not auto-encrypt objects
 	export MINIO_CI_CD=1
 
 	mkdir ${WORK_DIR}
-	C_PWD=${PWD}
 	if [ ! -x "$PWD/mc" ]; then
-		MC_BUILD_DIR="mc-$RANDOM"
-		if ! git clone --quiet https://github.com/minio/mc "$MC_BUILD_DIR"; then
-			echo "failed to download https://github.com/minio/mc"
-			purge "${MC_BUILD_DIR}"
-			exit 1
-		fi
-
-		(cd "${MC_BUILD_DIR}" && go build -o "$C_PWD/mc")
-
-		# remove mc source.
-		purge "${MC_BUILD_DIR}"
+		"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" "$PWD/mc"
 	fi
 
-	"${MINIO[@]}" --address ":$start_port" "${WORK_DIR}/disk{1...10}" >"${WORK_DIR}/server1.log" 2>&1 &
+	"${SILO[@]}" --address ":$start_port" "${WORK_DIR}/disk{1...10}" >"${WORK_DIR}/server1.log" 2>&1 &
 	pid=$!
 	disown $pid
 	sleep 5
@@ -79,10 +68,10 @@ function start_minio_10drive() {
 		exit 1
 	fi
 
-	"${PWD}/mc" mb --with-versioning minio/bucket
+	"${PWD}/mc" mb --with-versioning silo/bucket
 
-	export AWS_ACCESS_KEY_ID=minio
-	export AWS_SECRET_ACCESS_KEY=minio123
+	export AWS_ACCESS_KEY_ID=silo
+	export AWS_SECRET_ACCESS_KEY=silo1234
 	aws --endpoint-url http://localhost:"$start_port" s3api create-multipart-upload --bucket bucket --key obj-1 >upload-id.json
 	uploadId=$(jq -r '.UploadId' upload-id.json)
 
@@ -120,7 +109,7 @@ EOF
 
 function main() {
 	start_port=$(shuf -i 10000-65000 -n 1)
-	start_minio_10drive ${start_port}
+	start_silo_10drive ${start_port}
 }
 
 main "$@"

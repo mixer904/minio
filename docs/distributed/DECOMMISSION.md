@@ -1,6 +1,6 @@
 # Decommissioning
 
-Decommissiong is a mechanism in MinIO to drain older pools (usually with old hardware) and migrate the content from such pools to a newer pools (usually better hardware). Decommissioning spreads the data across all pools - for example, if you decommission `pool1`, all the data from `pool1` spreads across `pool2` and `pool3`.
+Decommissiong is a mechanism in Silo to drain older pools (usually with old hardware) and migrate the content from such pools to a newer pools (usually better hardware). Decommissioning spreads the data across all pools - for example, if you decommission `pool1`, all the data from `pool1` spreads across `pool2` and `pool3`.
 
 ## Features
 
@@ -92,7 +92,7 @@ If the decommission process fails for any reason, the status indicates failed.
 
 ## When decommission is 'Complete'
 
-Once decommission is complete, it will be indicated with *Complete* status.  *Complete* means that now you can now safely remove the first pool argument from the MinIO command line.
+Once decommission is complete, it will be indicated with *Complete* status.  *Complete* means that now you can now safely remove the first pool argument from the Silo command line.
 
 ```
 λ mc admin decommission status alias/
@@ -103,11 +103,11 @@ Once decommission is complete, it will be indicated with *Complete* status.  *Co
 └─────┴─────────────────────────────────┴──────────────────────────────────┴──────────┘
 ```
 
-- On baremetal setups, if you have `MINIO_VOLUMES="http://minio{1...2}/data{1...4} http://minio{3...4}/data{1...4}"`, you can remove the first argument `http://minio{1...2}/data{1...4}` to update your `MINIO_VOLUMES` setting, then restart all the servers in the setup in parallel using `systemctl restart minio`.
+- On baremetal setups, if you have `MINIO_VOLUMES="http://minio{1...2}/data{1...4} http://minio{3...4}/data{1...4}"`, you can remove the first argument `http://minio{1...2}/data{1...4}` to update your `MINIO_VOLUMES` setting, then restart all the servers in the setup in parallel using `systemctl restart silo`.
 
-- On Kubernetes setups, the statefulset specification needs to be modified by changing the command line input for the MinIO container. Once the relevant changes are done, proceed to execute `kubectl apply -f statefulset.yaml`.
+- On Kubernetes setups, the statefulset specification needs to be modified by changing the command line input for the Silo container. Once the relevant changes are done, proceed to execute `kubectl apply -f statefulset.yaml`.
 
-- On Operator based MinIO deployments, you need to modify the `tenant.yaml` specification and modify the `pools:` section from two entries to a single entry. After making relevant changes, proceed to execute `kubectl apply -f tenant.yaml`.
+- On Silo deployments managed by the MinIO Operator, you need to modify the `tenant.yaml` specification and change the `pools:` section from two entries to a single entry. After making the relevant changes, proceed to execute `kubectl apply -f tenant.yaml`.
 
 > Without a 'Complete' status any 'Active' or 'Draining' pool(s) are not allowed to be removed once configured.
 

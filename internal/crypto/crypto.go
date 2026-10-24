@@ -25,7 +25,7 @@ import (
 
 // DARECiphers returns a list of supported cipher suites
 // for the DARE object encryption.
-func DARECiphers() []byte { return []byte{sio.AES_256_GCM, sio.CHACHA20_POLY1305} }
+func DARECiphers() []byte { return []byte{sio.AES_GCM, sio.CHACHA20_POLY1305} }
 
 // TLSCiphers returns a list of supported TLS transport
 // cipher suite IDs.
@@ -69,10 +69,4 @@ func TLSCiphersBackwardCompatible() []uint16 {
 		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
 		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 	}
-}
-
-// TLSCurveIDs returns a list of supported elliptic curve IDs
-// in preference order.
-func TLSCurveIDs() []tls.CurveID {
-	return []tls.CurveID{tls.X25519MLKEM768, tls.CurveP256, tls.X25519, tls.CurveP384, tls.CurveP521}
 }

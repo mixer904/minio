@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# This script is used to test the migration of IAM content from old minio
-# instance to new minio instance.
+# This script tests IAM migration from an old MinIO compatibility fixture into
+# the current Silo server.
 #
 # To run it locally, start the LDAP server in github.com/minio/minio-iam-testing
 # repo (e.g. make podman-run), and then run this script.
@@ -15,6 +15,7 @@
 
 OLD_VERSION=RELEASE.2024-03-26T22-10-45Z
 OLD_BINARY_LINK=https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${OLD_VERSION}
+OLD_BINARY_SHA256=2050199d89e3057571620a1d453118fed5bd2de9d4f3b266b11365fdf984d676
 
 __init__() {
 	if which curl &>/dev/null; then
@@ -27,17 +28,16 @@ __init__() {
 	export GOPATH=/tmp/gopath
 	export PATH="${PATH}":"${GOPATH}"/bin
 
-	if which mc &>/dev/null; then
-		echo "mc is already installed"
-	else
-		echo "Installing mc:"
-		go install github.com/minio/mc@latest
+	if [ ! -x "${GOPATH}/bin/mc" ]; then
+		echo "Installing verified compatible client fixture"
+		mkdir -p "${GOPATH}/bin"
+		"$(git rev-parse --show-toplevel)/buildscripts/install-mcli.sh" "${GOPATH}/bin/mc"
 	fi
 
 	if [ ! -x ./minio.${OLD_VERSION} ]; then
-		echo "Downloading minio.${OLD_VERSION} binary"
-		curl -o minio.${OLD_VERSION} ${OLD_BINARY_LINK}
-		chmod +x minio.${OLD_VERSION}
+		echo "Installing verified upstream compatibility fixture minio.${OLD_VERSION}"
+		"$(git rev-parse --show-toplevel)/buildscripts/install-verified-fixture.sh" \
+			"${OLD_BINARY_LINK}" "${OLD_BINARY_SHA256}" "minio.${OLD_VERSION}"
 	fi
 
 	if [ -z "$_MINIO_LDAP_TEST_SERVER" ]; then
@@ -49,7 +49,7 @@ __init__() {
 }
 
 create_iam_content_in_old_minio() {
-	echo "Creating IAM content in old minio instance."
+	echo "Creating IAM content in the old MinIO compatibility fixture."
 
 	MINIO_CI_CD=1 ./minio.${OLD_VERSION} server /tmp/data/{1...4} &
 	sleep 5
@@ -80,9 +80,9 @@ create_iam_content_in_old_minio() {
 }
 
 import_iam_content_in_new_minio() {
-	echo "Importing IAM content in new minio instance."
-	# Assume current minio binary exists.
-	MINIO_CI_CD=1 ./minio server /tmp/data/{1...4} &
+	echo "Importing IAM content into the current Silo instance."
+	# Assume the current Silo binary exists.
+	MINIO_CI_CD=1 ./silo server /tmp/data/{1...4} &
 	sleep 5
 
 	set -x

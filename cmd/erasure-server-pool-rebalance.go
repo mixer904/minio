@@ -39,8 +39,8 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/env"
-	"github.com/minio/pkg/v3/workers"
+	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/workers"
 )
 
 //go:generate msgp -file $GOFILE -unexported
@@ -69,7 +69,11 @@ func (rs *rebalanceStats) update(bucket string, fi FileInfo) {
 
 	rs.NumVersions++
 	onDiskSz := int64(0)
-	if !fi.Deleted {
+	// DataBlocks comes from xl.meta and only fi.Deleted is checked above, so a
+	// zero here is an integer divide-by-zero rather than a bad statistic. This
+	// path does not build an Erasure, so NewErasure's validation does not cover
+	// it; leave the size at zero for metadata that cannot describe a layout.
+	if !fi.Deleted && fi.Erasure.DataBlocks > 0 {
 		onDiskSz = fi.Size * int64(fi.Erasure.DataBlocks+fi.Erasure.ParityBlocks) / int64(fi.Erasure.DataBlocks)
 	}
 	rs.Bytes += uint64(onDiskSz)
@@ -619,7 +623,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var rebalanced, expired int
+			var rebalanced int
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
@@ -631,21 +635,11 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bucket, version.Name, version) {
-					expired++
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
-				// any object with only single DEL marker we don't need
-				// to rebalance, just skip it, this also includes
-				// any other versions that have already expired.
-				remainingVersions := len(fivs.Versions) - expired
-				if version.Deleted && remainingVersions == 1 {
-					rebalanced++
-					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
-					continue
-				}
-
+				// Preserve every marker: older versions may live in another pool.
 				versionID := version.VersionID
 				if versionID == "" {
 					versionID = nullVersionID
@@ -667,6 +661,9 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 							SkipRebalancing:   true, // make sure we skip the decommissioned pool
 							NoAuditLog:        true,
 						})
+					if isDataMovementSuperseded(err) {
+						err = nil
+					}
 					// This can happen when rebalance stop races with ongoing rebalance workers.
 					// These rebalance failures can be ignored.
 					if err != nil {
@@ -715,7 +712,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 						continue
 					}
 
-					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil {
+					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil && !isDataMovementSuperseded(err) {
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
@@ -746,15 +743,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// if all versions were rebalanced, we can delete the object versions.
 			if rebalanced == len(fivs.Versions) {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceRemoveObject, poolIdx, bucket, entry.name)
-				_, err := set.DeleteObject(ctx,
-					bucket,
-					encodeDirObject(entry.name),
-					ObjectOptions{
-						DeletePrefix:       true, // use prefix delete to delete all versions at once.
-						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-						NoAuditLog:         true,
-					},
-				)
+				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions)
 				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {
@@ -859,9 +848,15 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 	}
 
 	if oi.isMultipart() {
+		// Completion repeats this check under the object write lock.
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(oi.Name), ObjectOptions{
+			VersionID: oi.VersionID, MTime: oi.ModTime, SrcPoolIdx: poolIdx,
+		}); err != nil {
+			return err
+		}
 		res, err := z.NewMultipartUpload(ctx, bucket, oi.Name, ObjectOptions{
 			VersionID:    oi.VersionID,
-			UserDefined:  oi.UserDefined,
+			UserDefined:  migrationObjectMetadata(oi),
 			NoAuditLog:   true,
 			DataMovement: true,
 			SrcPoolIdx:   poolIdx,
@@ -896,6 +891,8 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, oi.Name, res.UploadID, parts, ObjectOptions{
+			VersionID:    oi.VersionID,
+			SrcPoolIdx:   poolIdx,
 			DataMovement: true,
 			MTime:        oi.ModTime,
 			NoAuditLog:   true,
@@ -920,7 +917,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 			DataMovement: true,
 			VersionID:    oi.VersionID,
 			MTime:        oi.ModTime,
-			UserDefined:  oi.UserDefined,
+			UserDefined:  migrationObjectMetadata(oi),
 			PreserveETag: oi.ETag, // Preserve original ETag to ensure same metadata.
 			IndexCB: func() []byte {
 				return oi.Parts[0].Index // Preserve part Index to ensure decompression works.
@@ -1006,7 +1003,10 @@ const (
 	rebalanceMetricSaveMetadata
 )
 
-var errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+var (
+	errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+	errDataMovementSuperseded     = errors.New("another pool holds a newer copy")
+)
 
 func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string, sz int64) madmin.TraceInfo {
 	var errStr string

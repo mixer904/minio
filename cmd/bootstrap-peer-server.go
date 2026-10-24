@@ -34,7 +34,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/env"
 )
 
 // To abstract a node over network.
@@ -53,7 +53,7 @@ type ServerSystemConfig struct {
 // Diff - returns error on first difference found in two configs.
 func (s1 *ServerSystemConfig) Diff(s2 *ServerSystemConfig) error {
 	if s1.Checksum != s2.Checksum {
-		return fmt.Errorf("Expected MinIO binary checksum: %s, seen: %s", s1.Checksum, s2.Checksum)
+		return fmt.Errorf("Expected Silo binary checksum: %s, seen: %s", s1.Checksum, s2.Checksum)
 	}
 
 	ns1 := s1.NEndpoints

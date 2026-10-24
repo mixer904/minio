@@ -38,8 +38,12 @@ func genLDFlags(version string) string {
 	ldflagsStr += " -X github.com/minio/minio/cmd.ReleaseTag=" + releaseTag
 	ldflagsStr += " -X github.com/minio/minio/cmd.CommitID=" + commitID()
 	ldflagsStr += " -X github.com/minio/minio/cmd.ShortCommitID=" + commitID()[:12]
-	ldflagsStr += " -X github.com/minio/minio/cmd.GOPATH=" + os.Getenv("GOPATH")
-	ldflagsStr += " -X github.com/minio/minio/cmd.GOROOT=" + os.Getenv("GOROOT")
+	// GOPATH/GOROOT are deliberately not stamped in. They only seed the logger's
+	// source-path trim list, which -trimpath already makes moot (paths are
+	// relative in the binary, so there is no build-machine prefix left to trim),
+	// and stamping them baked the builder's absolute paths into the released
+	// binary - defeating -trimpath and reproducible builds. cmd.GOPATH/GOROOT
+	// keep their empty defaults, exactly as a plain `go build` leaves them.
 	return ldflagsStr
 }
 

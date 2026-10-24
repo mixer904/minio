@@ -33,9 +33,9 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v3/net"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/stan.go"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // NATS related constants
@@ -43,6 +43,7 @@ const (
 	NATSAddress           = "address"
 	NATSSubject           = "subject"
 	NATSUsername          = "username"
+	NATSUserCredentials   = "user_credentials"
 	NATSPassword          = "password"
 	NATSToken             = "token"
 	NATSNKeySeed          = "nkey_seed"
@@ -69,7 +70,7 @@ const (
 	EnvNATSAddress           = "MINIO_NOTIFY_NATS_ADDRESS"
 	EnvNATSSubject           = "MINIO_NOTIFY_NATS_SUBJECT"
 	EnvNATSUsername          = "MINIO_NOTIFY_NATS_USERNAME"
-	NATSUserCredentials      = "MINIO_NOTIFY_NATS_USER_CREDENTIALS"
+	EnvNATSUserCredentials   = "MINIO_NOTIFY_NATS_USER_CREDENTIALS"
 	EnvNATSPassword          = "MINIO_NOTIFY_NATS_PASSWORD"
 	EnvNATSToken             = "MINIO_NOTIFY_NATS_TOKEN"
 	EnvNATSNKeySeed          = "MINIO_NOTIFY_NATS_NKEY_SEED"
@@ -171,7 +172,7 @@ func (n NATSArgs) Validate() error {
 
 // To obtain a nats connection from args.
 func (n NATSArgs) connectNats() (*nats.Conn, error) {
-	connOpts := []nats.Option{nats.Name("Minio Notification"), nats.MaxReconnects(-1)}
+	connOpts := []nats.Option{nats.Name("Silo Notification"), nats.MaxReconnects(-1)}
 	if n.Username != "" && n.Password != "" {
 		connOpts = append(connOpts, nats.UserInfo(n.Username, n.Password))
 	}

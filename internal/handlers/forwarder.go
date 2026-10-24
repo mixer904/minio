@@ -181,6 +181,17 @@ func ipv6fix(clientIP string) string {
 }
 
 func (rw *headerRewriter) Rewrite(req *http.Request) {
+	// Forwarding this request attaches the node's own identity to it, so anything
+	// the peer was not entitled to claim has to go first. X-Forwarded-For needs no
+	// such handling: the reverse proxy appends the peer we actually saw, and the
+	// receiving node reaches that entry before any the client injected to its
+	// left. X-Real-IP and RFC 7239 Forwarded carry no chain, so a client's copy
+	// would otherwise arrive at the next node vouched for by this one.
+	if !TrustsForwardedHeaders(req) {
+		req.Header.Del(xRealIP)
+		req.Header.Del(forwarded)
+	}
+
 	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		clientIP = ipv6fix(clientIP)
 		if req.Header.Get(xRealIP) == "" {

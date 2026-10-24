@@ -31,7 +31,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
-	"github.com/minio/pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/env"
 )
 
 // ErrorConfig holds the config error types
@@ -624,6 +624,19 @@ func LookupSite(siteKV KVS, regionKV KVS) (s Site, err error) {
 	return s, err
 }
 
+// invalidKeyNames returns a comma separated list of the key names in kvs.
+//
+// Only names are returned, never values: this list is embedded in errors that
+// are written to the server log and printed by `mc`, and a rejected key may
+// well be carrying a credential.
+func invalidKeyNames(kvs KVS) string {
+	names := make([]string, 0, len(kvs))
+	for _, kv := range kvs {
+		names = append(names, kv.Key)
+	}
+	return strings.Join(names, ", ")
+}
+
 // CheckValidKeys - checks if inputs KVS has the necessary keys,
 // returns error if it find extra or superfluous keys.
 func CheckValidKeys(subSys string, kv KVS, validKVS KVS, deprecatedKeys ...string) error {
@@ -648,7 +661,7 @@ func CheckValidKeys(subSys string, kv KVS, validKVS KVS, deprecatedKeys ...strin
 	}
 	if len(nkv) > 0 {
 		return Errorf(
-			"found invalid keys (%s) for '%s' sub-system, use 'mc admin config reset myminio %s' to fix invalid keys", nkv.String(), subSys, subSys)
+			"found invalid keys (%s) for '%s' sub-system, use 'mc admin config reset myminio %s' to fix invalid keys", invalidKeyNames(nkv), subSys, subSys)
 	}
 	return nil
 }
@@ -1093,7 +1106,7 @@ func (c Config) CheckValidKeys(subSys string, deprecatedKeys []string) error {
 		if len(invalidKV) > 0 {
 			return Errorf(
 				"found invalid keys (%s) for '%s:%s' sub-system, use 'mc admin config reset myminio %s:%s' to fix invalid keys",
-				invalidKV.String(), subSys, tgt, subSys, tgt)
+				invalidKeyNames(invalidKV), subSys, tgt, subSys, tgt)
 		}
 	}
 	return nil

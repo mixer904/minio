@@ -48,10 +48,10 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/pkg/v3/console"
-	"github.com/minio/pkg/v3/env"
-	"github.com/minio/pkg/v3/policy"
-	"github.com/minio/pkg/v3/workers"
+	"github.com/pgsty/silo-pkg/v3/console"
+	"github.com/pgsty/silo-pkg/v3/env"
+	"github.com/pgsty/silo-pkg/v3/policy"
+	"github.com/pgsty/silo-pkg/v3/workers"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -391,7 +391,7 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 		return err
 	}
 
-	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
+	c.SetAppInfo("silo-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 	core := &minio.Core{Client: c}
 
 	workerSize, err := strconv.Atoi(env.Get("_MINIO_BATCH_REPLICATION_WORKERS", strconv.Itoa(runtime.GOMAXPROCS(0)/2)))
@@ -583,7 +583,11 @@ func toObjectInfo(bucket, object string, objInfo minio.ObjectInfo) ObjectInfo {
 func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo, prefix string) error {
 	input := make(chan minio.SnowballObject, 1)
 	opts := minio.SnowballOptions{
-		Opts:     minio.PutObjectOptions{},
+		Opts: minio.PutObjectOptions{
+			Internal: minio.AdvancedPutOptions{
+				ReplicationRequest: true,
+			},
+		},
 		InMemory: *r.Source.Snowball.InMemory,
 		Compress: *r.Source.Snowball.Compress,
 		SkipErrs: *r.Source.Snowball.SkipErrs,
@@ -1155,7 +1159,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 		return err
 	}
 
-	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
+	c.SetAppInfo("silo-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 
 	retry := false
 	for attempts := 1; attempts <= retryAttempts; attempts++ {
@@ -1477,7 +1481,7 @@ func (r *BatchJobReplicateV1) Validate(ctx context.Context, job BatchJobRequest,
 	if err != nil {
 		return err
 	}
-	c.SetAppInfo("minio-"+batchJobPrefix, r.APIVersion+" "+job.ID)
+	c.SetAppInfo("silo-"+batchJobPrefix, r.APIVersion+" "+job.ID)
 
 	vcfg, err := c.GetBucketVersioning(ctx, remoteBkt)
 	if err != nil {

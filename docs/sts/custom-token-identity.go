@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	// LDAP integrated Minio endpoint
+	// Identity-provider-integrated Silo endpoint
 	stsEndpoint string
 
 	// token to use with AssumeRoleWithCustomToken
@@ -95,7 +95,7 @@ func main() {
 		return
 	}
 
-	// Use generated credentials to authenticate with MinIO server
+	// Use generated credentials to authenticate with Silo server
 	stsEndpointURL, err := url.Parse(stsEndpoint)
 	if err != nil {
 		log.Fatalf("Error parsing sts endpoint: %v", err)
@@ -109,7 +109,7 @@ func main() {
 		log.Fatalf("Error initializing client: ", err)
 	}
 
-	// Use minIO Client object normally like the regular client.
+	// Use the minio-go Client object like a regular client.
 	fmt.Printf("Calling list objects on bucket named `%s` with temp creds:\n===\n", bucketToList)
 	objCh := minioClient.ListObjects(context.Background(), bucketToList, minio.ListObjectsOptions{})
 	for obj := range objCh {

@@ -37,8 +37,8 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mountinfo"
-	"github.com/minio/pkg/v3/env"
-	xnet "github.com/minio/pkg/v3/net"
+	"github.com/pgsty/silo-pkg/v3/env"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // EndpointType - enum for endpoint type.
@@ -207,7 +207,7 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 		// On windows having a preceding SlashSeparator will cause problems, if the
 		// command line already has C:/<export-folder/ in it. Final resulting
 		// path on windows might become C:/C:/ this will cause problems
-		// of starting minio server properly in distributed mode on windows.
+		// of starting Silo properly in distributed mode on Windows.
 		// As a special case make sure to trim the separator.
 
 		// NOTE: It is also perfectly fine for windows users to have a path
@@ -226,7 +226,7 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 	} else {
 		// Only check if the arg is an ip address and ask for scheme since its absent.
 		// localhost, example.com, any FQDN cannot be disambiguated from a regular file path such as
-		// /mnt/export1. So we go ahead and start the minio server in FS modes in these cases.
+		// /mnt/export1. So we go ahead and start Silo in FS mode in these cases.
 		if isHostIP(arg) {
 			return ep, fmt.Errorf("invalid URL endpoint format: missing scheme http or https")
 		}

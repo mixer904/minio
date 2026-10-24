@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/grid"
-	xnet "github.com/minio/pkg/v3/net"
+	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
 // Storage REST server, storageRESTReceiver and StorageRESTClient are
@@ -108,6 +108,15 @@ func testStorageAPIListDir(t *testing.T, storage StorageAPI) {
 				t.Fatalf("case %v: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)
 			}
 		}
+	}
+	for _, name := range []string{"one", "two", "three"} {
+		if err := storage.AppendFile(t.Context(), "foo", "bounded/"+name, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := storage.ListDir(t.Context(), "", "foo", "bounded", 2)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("ListDir count was lost in storage/RPC path: %v %v", entries, err)
 	}
 }
 
