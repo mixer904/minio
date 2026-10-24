@@ -542,6 +542,7 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 	deleted := make([]DeletedObject, len(objects))
 	errs := make([]error, len(objects))
 	primary := make([]int, len(objects))
+	tiered := make([]bool, len(objects))
 	lookup := errgroup.WithNErrs(len(objects)).WithConcurrency(32)
 	for i, obj := range objects {
 		// Preserve the full request identity even if lookup or cleanup fails.
@@ -556,6 +557,9 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 			copies, err := z.objectPoolInfos(ctx, bucket, obj.ObjectName, ObjectOptions{VersionID: obj.VersionID, NoAuditLog: true})
 			if err == nil {
 				primary[i] = copies[0].Index
+				for _, copy := range copies {
+					tiered[i] = tiered[i] || copy.ObjInfo.TransitionedObject.Status == lifecycle.TransitionComplete
+				}
 			} else if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 				if isErrReadQuorum(err) {
 					err = InsufficientWriteQuorum{Bucket: bucket, Object: decodeDirObject(obj.ObjectName)}
@@ -576,7 +580,7 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 	for phase := 0; phase < 2; phase++ {
 		batches := make([]poolBatch, len(z.serverPools))
 		for i, obj := range objects {
-			if errs[i] != nil {
+			if errs[i] != nil || tiered[i] {
 				continue
 			}
 			for p := range z.serverPools {
@@ -612,6 +616,27 @@ func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket
 					deleted[i] = batch.deleted[j]
 				}
 			}
+		}
+	}
+	// Tiered copies can share one remote object, including restored copies.
+	// Reuse the existing reconciliation which suppresses premature tier GC.
+	// Serializing this uncommon path also keeps duplicate key/version entries
+	// in one request from racing their metadata updates under the shared lock.
+	for i, obj := range objects {
+		if !tiered[i] || errs[i] != nil {
+			continue
+		}
+		deleteOpts := opts
+		deleteOpts.VersionID, deleteOpts.NoLock = obj.VersionID, true
+		deleteOpts.DeleteReplication = obj.ReplicationState()
+		if opts.PrefixEnabledFn != nil {
+			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
+		}
+		_, err := z.deleteObjectReconciled(ctx, bucket, obj.ObjectName, deleteOpts)
+		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			errs[i] = err
+		} else {
+			deleted[i].found = true
 		}
 	}
 	return deleted, errs

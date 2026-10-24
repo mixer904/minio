@@ -1071,6 +1071,8 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 		restored          bool
 		unconditional     bool
 		skipFreeVersion   bool
+		bulk              bool
+		unversioned       bool
 	}{
 		{name: "metadata-copy"},
 		{name: "restored-metadata-copy", restored: true},
@@ -1081,6 +1083,14 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 		{name: "ordinary-failed-primary-delete", deleting: true, unconditional: true, failPrimaryDelete: true},
 		{name: "ordinary-successful-delete", deleting: true, unconditional: true},
 		{name: "ordinary-skip-free-version", deleting: true, unconditional: true, skipFreeVersion: true},
+		{name: "bulk-failed-primary-delete", deleting: true, bulk: true, failPrimaryDelete: true},
+		{name: "bulk-restored-failed-primary-delete", deleting: true, bulk: true, restored: true, failPrimaryDelete: true},
+		{name: "bulk-successful-delete", deleting: true, bulk: true},
+		{name: "bulk-distinct-reference", deleting: true, bulk: true, differentRemote: true},
+		{name: "bulk-skip-free-version", deleting: true, bulk: true, skipFreeVersion: true},
+		{name: "unversioned-failed-primary-delete", deleting: true, unconditional: true, unversioned: true, failPrimaryDelete: true},
+		{name: "unversioned-successful-delete", deleting: true, unconditional: true, unversioned: true},
+		{name: "bulk-unversioned-failed-primary-delete", deleting: true, bulk: true, unversioned: true, failPrimaryDelete: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			z, bucket := consistencyPools(t)
@@ -1094,13 +1104,13 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			if test.restored {
 				metadata[xhttp.AmzRestore] = completedRestoreObj(time.Now().Add(time.Hour)).String()
 			}
-			oi := putConsistencyObject(t, z, bucket, object, 0, "data", ObjectOptions{Versioned: true, UserDefined: metadata})
+			oi := putConsistencyObject(t, z, bucket, object, 0, "data", ObjectOptions{Versioned: !test.unversioned, UserDefined: metadata})
 			secondaryMetadata := maps.Clone(metadata)
 			if test.differentRemote {
 				secondaryMetadata[ReservedMetadataPrefixLower+TransitionedObjectName] = "other-remote-object"
 			}
 			putConsistencyObject(t, z, bucket, object, 1, "data", ObjectOptions{
-				Versioned: true, VersionID: oi.VersionID, MTime: oi.ModTime, UserDefined: secondaryMetadata,
+				Versioned: !test.unversioned, VersionID: oi.VersionID, MTime: oi.ModTime, UserDefined: secondaryMetadata,
 			})
 			current, err := z.GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: oi.VersionID})
 			if err != nil || current.TransitionedObject.Status != "complete" || current.IsRemote() == test.restored {
@@ -1113,7 +1123,11 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 				set := z.serverPools[0].getHashedSet(object)
 				getDisks := set.getDisks
 				faulty := append([]StorageAPI(nil), getDisks()...)
+				var failed, attempted atomic.Int32
 				for i := range faulty {
+					if test.bulk {
+						faulty[i] = bulkDeleteFaultDisk{StorageAPI: faulty[i], bucket: bucket, object: object, mode: "eio", fail: true, failed: &failed, attempted: &attempted}
+					}
 					faulty[i] = consistencyDeleteFaultDisk{StorageAPI: faulty[i], bucket: bucket, object: object, version: oi.VersionID}
 				}
 				set.getDisks = func() []StorageAPI { return faulty }
@@ -1121,13 +1135,20 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			}
 			if test.deleting {
 				opts := ObjectOptions{
-					Versioned: true, VersionID: oi.VersionID, SkipFreeVersion: test.skipFreeVersion,
+					Versioned: !test.unversioned, VersionID: oi.VersionID, SkipFreeVersion: test.skipFreeVersion,
 					CheckPrecondFn: func(info ObjectInfo) bool { return info.ETag != current.ETag },
 				}
 				if test.unconditional {
 					opts.CheckPrecondFn = nil
 				}
-				_, err := z.DeleteObject(t.Context(), bucket, object, opts)
+				var err error
+				if test.bulk {
+					opts.CheckPrecondFn = nil
+					_, errs := z.DeleteObjects(t.Context(), bucket, []ObjectToDelete{{ObjectV: ObjectV{ObjectName: object, VersionID: oi.VersionID}}}, opts)
+					err = errs[0]
+				} else {
+					_, err = z.DeleteObject(t.Context(), bucket, object, opts)
+				}
 				if (err != nil) != test.failPrimaryDelete {
 					t.Fatalf("unexpected authoritative delete result: %v", err)
 				}
@@ -1145,7 +1166,7 @@ func TestPoolsRetiringCopyPreservesSharedTierObject(t *testing.T) {
 			_, err = z.serverPools[0].GetObjectInfo(t.Context(), bucket, object, ObjectOptions{VersionID: oi.VersionID})
 			primaryDeleted := test.deleting && !test.failPrimaryDelete
 			if primaryDeleted {
-				if !isErrVersionNotFound(err) {
+				if !isErrVersionNotFound(err) && (!test.unversioned || !isErrObjectNotFound(err)) {
 					t.Fatalf("authoritative copy survived successful delete: %v", err)
 				}
 			} else if err != nil {

@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -1357,6 +1358,11 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 
 	// Retire older copies before the newest copy for unversioned objects.
 	if len(noReadQuorumPools) > 0 && !opts.Versioned && !opts.VersionSuspended {
+		if pinfo.ObjInfo.TransitionedObject.Status == lifecycle.TransitionComplete {
+			// Restored and remote copies can share a tier object. Reuse the
+			// reconciliation which keeps that reference out of premature GC.
+			return z.deleteObjectReconciled(ctx, bucket, object, opts)
+		}
 		return z.deleteObjectFromAllPools(ctx, bucket, object, opts, noReadQuorumPools)
 	}
 
