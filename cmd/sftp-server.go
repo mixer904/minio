@@ -22,18 +22,19 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"github.com/minio/madmin-go/v3/logger/audit"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/minio/madmin-go/v3/logger/audit"
+
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
-	xldap "github.com/minio/pkg/v3/ldap"
 	xsftp "github.com/mixer904/minio-pkg/sftp"
+	xldap "github.com/pgsty/silo-pkg/v3/ldap"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
