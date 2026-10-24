@@ -108,7 +108,10 @@ func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item any, objPat
 	return nil
 }
 
-func decryptData(data []byte, objPath string) ([]byte, error) {
+func decryptData(ctx context.Context, data []byte, objPath string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if utf8.Valid(data) {
 		return data, nil
 	}
@@ -118,13 +121,17 @@ func decryptData(data []byte, objPath string) ([]byte, error) {
 		return pdata, nil
 	}
 	if GlobalKMS != nil {
-		pdata, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
+		pdata, err = config.DecryptBytes(ctx, GlobalKMS, data, kms.Context{
 			minioMetaBucket: path.Join(minioMetaBucket, objPath),
 		})
 		if err == nil {
 			return pdata, nil
 		}
-		pdata, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
+		// Cancellation must not trigger the legacy associated-data fallback.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pdata, err = config.DecryptBytes(ctx, GlobalKMS, data, kms.Context{
 			minioMetaBucket: objPath,
 		})
 		if err == nil {
@@ -164,7 +171,7 @@ func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context,
 		}
 		return nil, meta, err
 	}
-	data, err = decryptData(data, objPath)
+	data, err = decryptData(ctx, data, objPath)
 	if err != nil {
 		return nil, meta, err
 	}
@@ -276,12 +283,15 @@ func (iamOS *IAMObjectStore) loadPolicyDocs(ctx context.Context, m map[string]Po
 			return item.Err
 		}
 
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		policyName := path.Dir(item.Item)
 		if err := iamOS.loadPolicyDoc(ctx, policyName, m); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (iamOS *IAMObjectStore) loadSecretKey(ctx context.Context, user string, userType IAMUserType) (string, error) {

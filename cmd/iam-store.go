@@ -1581,8 +1581,20 @@ func (store *IAMStoreSys) ListPolicies(ctx context.Context, bucketName string) (
 	defer store.unlock()
 
 	m := map[string]PolicyDoc{}
-	err := store.loadPolicyDocs(ctx, m)
+	// Keep cache writers serialized, but let authentication use the committed
+	// cache while the replacement is loaded into this private map.
+	err := func() error {
+		store.IAMStorageAPI.unlock()
+		defer store.IAMStorageAPI.lock()
+		if err := store.loadPolicyDocs(ctx, m); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1609,8 +1621,18 @@ func (store *IAMStoreSys) ListPolicyDocs(ctx context.Context, bucketName string)
 	defer store.unlock()
 
 	m := map[string]PolicyDoc{}
-	err := store.loadPolicyDocs(ctx, m)
+	err := func() error {
+		store.IAMStorageAPI.unlock()
+		defer store.IAMStorageAPI.lock()
+		if err := store.loadPolicyDocs(ctx, m); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
