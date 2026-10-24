@@ -70,6 +70,9 @@ require (
 	github.com/minio/madmin-go/v3 v3.0.110
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/minio/mux v1.10.1
+	// Legacy minio/colorjson and minio/dperf code still imports pkg/console.
+	// SILO source imports github.com/pgsty/silo-pkg/v3 directly instead.
+	github.com/minio/pkg/v3 v3.11.0
 	github.com/minio/selfupdate v0.6.0
 	github.com/minio/simdjson-go v0.4.5
 	github.com/minio/sio v0.5.1
@@ -241,9 +244,6 @@ require (
 	github.com/minio/filepath v1.0.0 // indirect
 	github.com/minio/mc v0.0.0-20251106162529-77f82e18b540 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	// Legacy minio/colorjson and minio/dperf code still imports pkg/console.
-	// SILO source imports github.com/pgsty/silo-pkg/v3 directly instead.
-	github.com/minio/pkg/v3 v3.11.0 // indirect
 	github.com/minio/websocket v1.6.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
