@@ -88,7 +88,7 @@ RUN dnf -y install ca-certificates && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:b59ac4f291d86027c2681f7a7b1cbf7448972fc55a6cb8e25cab5aa5eef5ce5f
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:dbd325b96bcd432dd42816d31412bdf1dc0fb973b79ed310344bc23c76c068db
 
 LABEL org.opencontainers.image.title="Silo" \
       org.opencontainers.image.description="S3-Interface Libre Object Storage" \
