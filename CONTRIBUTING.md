@@ -53,6 +53,20 @@ Before opening a pull request:
 - Explain any preserved `MINIO_*`, `minio_*`, `x-minio-*`, `/minio/*`,
   `.minio.sys`, ARN, module/import-path, or serialized compatibility name.
 
+The maintenance branch retains existing storage timeouts, cancellation,
+object locking, read-quorum and healing behavior. The normal suite checks local
+and RPC timeout/cancellation, remote rollback options, and readability after a
+failed partial overwrite. A timeout does not prove that a disk worker stopped
+or that a write did not commit.
+
+Stronger mutation lifetime, rollback ownership, generation ordering, strict-read
+and cross-pool recovery diagnostics are preserved behind `consistency_strict`.
+Compile them with `go test -tags kqueue,dev,consistency_strict ./cmd -run '^$'`
+and run individual scenarios explicitly. They describe guarantees outside the
+maintenance contract and may fail; report their results separately from the
+normal suite. They must not be used to claim distributed fencing or repair of
+previously inconsistent objects.
+
 ### Commit changes
 
 After verification, commit your changes with a concise message and a DCO
@@ -151,8 +165,11 @@ license grant to SILO or upstream MinIO maintainers is required.
 
 ### How does Silo manage dependencies?
 
-Silo uses Go modules. Preserve the compatibility module and import paths in
-`go.mod`; downstream forks are selected with explicit `replace` directives.
+Silo uses Go modules. Shared packages in `github.com/pgsty/silo-pkg/v3` are
+required and imported directly under their own module path, upstream
+`github.com/minio/minio-go/v7` is pinned to a verified commit, and Console
+(`github.com/minio/console`) and MC (`github.com/minio/mc`) are selected with
+explicit `replace` directives in `go.mod`.
 
 - Run `go get foo/bar` in the source folder to add the dependency to `go.mod` file.
 

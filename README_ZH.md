@@ -24,7 +24,7 @@
 <p align="center">
   <a href="https://silo.pgsty.com/zh/"><img alt="官网" src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-silo.pgsty.com%2Fzh-1d588c"></a>
   <a href="https://github.com/pgsty/silo/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/pgsty/silo?include_prereleases&label=release&logo=github"></a>
-  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/minio?logo=docker"></a>
+  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/silo?logo=docker"></a>
   <a href="go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/pgsty/silo?logo=go"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPLv3-blue"></a>
 </p>
@@ -32,28 +32,25 @@
 > [!IMPORTANT]
 > **PGSTY Silo**（以下简称 Silo）是由 [Pigsty](https://pigsty.cc) 独立维护、从 [`pgsty/silo`](https://github.com/pgsty/silo) 发布的开源 MinIO 社区分支。本项目与 MinIO, Inc. 不存在隶属、背书或赞助关系；文中使用 “MinIO” 仅用于说明上游项目及兼容谱系。
 
-> [!NOTE]
-> 2026-08-06，本仓库由 `pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 更名为 `main`。以原 MinIO 形态维持的归档构件仍位于归档的 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支，以及截止 [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) 的历次发布中。
-
-## SILO 20261018000000
-
-[SILO 20261018000000](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z) 已正式发布，提供各平台归档包、Linux 软件包，以及 amd64／arm64 标准版和 distroless Docker 镜像。版本标签为 `RELEASE.2026-10-18T00-00-00Z`，包版本为 `20261018000000.0.0`。
-
-本版加强 Object Lock 与 IAM 鉴权，实现跨进程和站点的持久 STS 撤销，保护多池迁移中的并发更新，并改进 LIST 恢复、分片清理与 S3 错误处理。内置 Console v2.4.2、silo-pkg v3.14.3，使用 Go 1.27.2 构建，配套管理客户端为 mcli 20261018。
-
-升级前请阅读[发行说明](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z)，特别是 strict 分片列表的移除、服务端协调升级要求与实测性能成本。代码、问题报告和文档贡献者见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
-
 ## 概述
 
 上游停止社区发行后，Silo 为开源 MinIO 服务端维护一条持续可用的版本线：构建、软件包、多架构镜像、安全修复与完整 Web 控制台。Pigsty 在生产环境中用它承载 PostgreSQL 备份存储。
 
-它只遵循一条原则：**改名的是产品与交付物，不是协议与你的数据。** 其余内容都在 [silo.pgsty.com](https://silo.pgsty.com/zh/)。
+它只遵循一条原则：**改名的是产品与交付物，不是协议与你的数据。** 完整文档发布在 [silo.pgsty.com](https://silo.pgsty.com/zh/)。
 
-**相关项目：**[`pgsty/mc`](https://github.com/pgsty/mc) 客户端（以 `mcli` 发行） · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
+**相关项目：**[`pgsty/mc`](https://github.com/pgsty/mc) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/kes`](https://github.com/pgsty/kes) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
 
 <p align="center">
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo 控制台">
 </p>
+
+### SILO 20261112
+
+> [!WARNING]
+> [SILO 20261112](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-12T00-00-00Z)（包版本 `20261112000000.0.0`，源码 `44e848fedf8c`）修复了 S3 批量删除路径校验与对象锁边界、服务账号内联策略保留与 IAM 导入状态、双活标签代理鉴权、无签名尾标流重放窗口、`GetObjectAttributes` 与 ZIP 归档标签鉴权、压缩加密区间读取、生命周期旧头部修订匹配以及存储池多轮退役等缺陷，内嵌 Console `v2.7.2` 并配套 `mcli 20261112`、`silo-pkg v3.16.1` 与 Go `1.27.4`。升级前请阅读[发布说明与升级要求](https://silo.pgsty.com/zh/blog/release/silo-20261112/)。
+
+> [!NOTE]
+> 2026-08-06，`pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 改为 `main`。最后一个 MinIO 品牌发布是 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支上的 [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z)。
 
 ## 快速上手
 
@@ -62,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">
@@ -101,9 +98,9 @@ Silo 保留 S3 与存储格式兼容性，包括既有 `MINIO_*` 环境变量、
 
 ### TLS 与 Go 升级
 
-Server 20260916 已恢复 Go 默认密钥交换策略，20261018 在 Go 1.27.2 下保留该行为。
-`GODEBUG=tlsmlkem=0`、`tlssecpmlkem=0` 的适用范围、macOS 根证书来源变化，
-以及 OIDC discovery 的诊断方法见 [Go 1.27 TLS 与 OIDC 指南](https://silo.pgsty.com/zh/blog/design/go127-tls-oidc-discovery/)。
+Server 20260916 恢复了 Go 默认密钥交换策略，Server 20261112 在 Go 1.27.4 下保留该行为。S3 监听端口、节点间连接、站点与桶复制、身份提供方、etcd 及外部 HTTP 服务均使用 Go 默认 TLS 密钥交换。若对端无法接受 ML-KEM，设置 `GODEBUG=tlsmlkem=0` 可在当前进程禁用默认混合密钥交换（证书校验保持开启）；该选项不会禁用 ML-DSA 签名，也不能解决所有 TLS 连接重置问题，建议在升级不兼容对端后移除该临时配置。若仅新增的 SecP 混合组引发问题，可设置 `GODEBUG=tlssecpmlkem=0` 仅禁用这些组并保留 `X25519MLKEM768`。
+
+在 Go 1.27 构建中，macOS 上设置 `SSL_CERT_FILE` 或 `SSL_CERT_DIR` 会以磁盘根证书和 Go 验证器替代系统钥匙串信任；陈旧或不完整的 CA 路径可能导致原先受信任的连接失败，清除继承的环境变量即可恢复钥匙串信任。配置的 `CAs` 目录中的显式证书仍会叠加加入所选根证书池。Go 1.27 二进制要求 macOS 13 或更高版本。详见 [Go 1.27 发行说明](https://go.dev/doc/go1.27)与 [Go 1.27 TLS 与 OIDC 发现指南](https://silo.pgsty.com/zh/blog/design/go127-tls-oidc-discovery/)。
 
 ## 文档归属
 

@@ -399,12 +399,15 @@ func getCompleteMultipartMD5(parts []CompletePart) string {
 	return s3MD5
 }
 
-// Clean unwanted fields from metadata
+// Keep metadata written by pre-release builds out of public object metadata.
+const rollbackIDKey = ReservedMetadataPrefixLower + "rollback-id"
+
+// Clean unwanted fields from metadata.
 func cleanMetadata(metadata map[string]string) map[string]string {
 	// Remove STANDARD StorageClass
 	metadata = removeStandardStorageClass(metadata)
 	// Clean meta etag keys 'md5Sum', 'etag', "expires", "x-amz-tagging".
-	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey)
+	return cleanMetadataKeys(metadata, "md5Sum", "etag", "expires", xhttp.AmzObjectTagging, "last-modified", VersionPurgeStatusKey, rollbackIDKey)
 }
 
 // Filter X-Amz-Storage-Class field only if it is set to STANDARD.
@@ -913,7 +916,7 @@ func NewGetObjectReader(rs *HTTPRangeSpec, oi ObjectInfo, opts ObjectOptions, h 
 			}
 			// Decompression reader.
 			var dopts []s2.ReaderOption
-			if off > 0 || decOff > 0 {
+			if off > 0 || decOff > 0 || decryptSkip > 0 {
 				// We are not starting at the beginning, so ignore stream identifiers.
 				dopts = append(dopts, s2.ReaderIgnoreStreamIdentifier())
 			}

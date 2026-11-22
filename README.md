@@ -24,7 +24,7 @@
 <p align="center">
   <a href="https://silo.pgsty.com/"><img alt="Website" src="https://img.shields.io/badge/Website-silo.pgsty.com-1d588c"></a>
   <a href="https://github.com/pgsty/silo/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/pgsty/silo?include_prereleases&label=release&logo=github"></a>
-  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/minio?logo=docker"></a>
+  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/silo?logo=docker"></a>
   <a href="go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/pgsty/silo?logo=go"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPLv3-blue"></a>
 </p>
@@ -32,28 +32,25 @@
 > [!IMPORTANT]
 > **PGSTY Silo** (hereinafter “Silo”) is an independent, community-maintained fork of the open-source MinIO server, published by [Pigsty](https://pigsty.io) from [`pgsty/silo`](https://github.com/pgsty/silo). It is not affiliated with, endorsed by, or sponsored by MinIO, Inc. “MinIO” is used only to identify the upstream project and compatibility lineage.
 
-> [!NOTE]
-> Renamed from `pgsty/minio` to `pgsty/silo`, default branch `master` → `main`, on 2026-08-06. Artifacts under the original MinIO identity stay published on the archived [`minio`](https://github.com/pgsty/silo/tree/minio) branch and in releases up to [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z).
-
-## SILO 20261018000000
-
-[SILO 20261018000000](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z) is available as platform archives, Linux packages, and standard or distroless Docker images for amd64 and arm64. The release tag is `RELEASE.2026-10-18T00-00-00Z`; the package version is `20261018000000.0.0`.
-
-This release strengthens Object Lock and IAM authorization, makes scoped STS revocation durable across processes and sites, protects concurrent updates during pool migration, and improves LIST recovery, multipart cleanup, and S3 error handling. It includes Console v2.4.2 and silo-pkg v3.14.3, and is built with Go 1.27.2. Use mcli 20261018 for administration.
-
-Read the [release notes](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z) before upgrading, especially the removal of strict multipart listing, coordinated server upgrades, and measured performance costs. See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the people behind the code, reports, and documentation.
-
 ## Overview
 
 PGSTY SILO keeps one maintained release line of the open-source MinIO server alive after upstream ended community distribution: builds, packages, multi-arch images, security fixes, and the full web console. Pigsty runs it in production as its PostgreSQL backup repository.
 
-It follows one rule — **the product and its delivery surfaces are renamed; the protocol and your data are not.** Everything else lives on [silo.pgsty.com](https://silo.pgsty.com/).
+It follows one rule: **the product and its delivery surfaces are renamed; the protocol and your data are not.** Full documentation is published at [silo.pgsty.com](https://silo.pgsty.com/).
 
-**Related:** [`pgsty/mc`](https://github.com/pgsty/mc) client (shipped as `mcli`) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
+**Related:** [`pgsty/mc`](https://github.com/pgsty/mc) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/kes`](https://github.com/pgsty/kes) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
 
 <p align="center">
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo Console">
 </p>
+
+### SILO 20261112
+
+> [!WARNING]
+> [SILO 20261112](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-12T00-00-00Z) (`20261112000000.0.0`, source `44e848fedf8c`) fixes S3 bulk-delete path validation and Object Lock boundaries, service-account inline-policy preservation and IAM import status, active-active tagging proxy authorization, streaming trailer replay windows, `GetObjectAttributes` and ZIP archive tag authorization, compressed encrypted range reads, lifecycle old-header revision matching, and multi-pass pool decommissioning, embedding Console `v2.7.2` with `mcli 20261112`, `silo-pkg v3.16.1`, and Go `1.27.4`. Review the [release notes and upgrade requirements](https://silo.pgsty.com/blog/release/silo-20261112/) before upgrading.
+
+> [!NOTE]
+> On 2026-08-06, `pgsty/minio` became `pgsty/silo`, and the default branch changed from `master` to `main`. The last MinIO-branded release is [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) on the [`minio`](https://github.com/pgsty/silo/tree/minio) branch.
 
 ## Quick Start
 
@@ -62,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">
@@ -89,7 +86,7 @@ docker exec silo mcli mb local/demo && docker exec silo mcli ls local
 | Kubernetes | Helm chart, see [Download & Install](https://silo.pgsty.com/download/) |
 | Source | `go build -o silo . && ./silo --version` |
 
-Every release ships checksums, SPDX SBOMs, Sigstore-signed manifests, and GitHub build attestations. Installation methods and verification commands are documented at [Download & Install](https://silo.pgsty.com/download/); migrating from upstream MinIO — taking over an existing `minio.service` and its `/etc/default/minio`, and keeping data ownership stable with a `/etc/systemd/system/silo.service.d/10-legacy-user.conf` drop-in — is covered by the [migration guide](https://silo.pgsty.com/compatibility/migration/) and the [binary & service notes](https://silo.pgsty.com/compatibility/binary/).
+Every release ships checksums, SPDX SBOMs, Sigstore-signed manifests, and GitHub build attestations. Installation methods and verification commands are documented at [Download & Install](https://silo.pgsty.com/download/). To migrate from upstream MinIO, take over `minio.service` and `/etc/default/minio`, and preserve data ownership with a `/etc/systemd/system/silo.service.d/10-legacy-user.conf` drop-in. See the [migration guide](https://silo.pgsty.com/compatibility/migration/) and [binary & service notes](https://silo.pgsty.com/compatibility/binary/).
 
 ## Compatibility
 
@@ -101,7 +98,7 @@ Every divergence from upstream is listed in the code-verified [compatibility aud
 
 ### TLS and Go upgrades
 
-Server 20260916 restored Go's default key exchange; Server 20261018 retains it with Go 1.27.2.
+Server 20260916 restored Go's default key exchange; Server 20261112 retains it with Go 1.27.4.
 TLS key exchange follows Go's defaults across the S3 listener, node links,
 replication, identity providers, etcd, and external HTTP services. If an endpoint
 cannot accept ML-KEM, `GODEBUG=tlsmlkem=0` disables the default hybrid exchanges
